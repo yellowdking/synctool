@@ -10,17 +10,21 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	synccrypto "github.com/yellowdking/synctool/sdk/go/crypto"
 )
 
 const (
-	EnvelopeVersion       = 1
-	MaxInlinePayloadBytes = 65536
-	MaxManifestBytes      = synccrypto.ManifestMaxRawBytes // 131072
-	MaxBlobs              = synccrypto.MaxPartID           // 63
-	MaxBlobMetaBytes      = 2048
-	MaxSafeIntJS          = int64(9007199254740991)
+	EnvelopeVersion           = 1
+	MaxInlinePayloadBytes     = 65536
+	MaxManifestBytes          = synccrypto.ManifestMaxRawBytes // 131072
+	MaxPaddedManifestBytes    = 135168                         // ceil((4 + 131072) / 4096) * 4096
+	MaxEncryptedManifestBytes = 135216                         // 135168 + 3 * 16B AEAD tags
+	MaxManifestChunks         = 4                              // At most 3 64KiB blocks (capped at 4 chunks)
+	MaxBlobs                  = synccrypto.MaxPartID           // 63
+	MaxBlobMetaBytes          = 2048
+	MaxSafeIntJS              = int64(9007199254740991)
 )
 
 var (
@@ -107,11 +111,170 @@ type ParcelInput struct {
 	Blobs         []BlobInput
 }
 
+// Parcel is a convenient alias for ParcelInput.
+type Parcel = ParcelInput
+
+// BlobFromFile constructs a streaming BlobInput backed by a local file path (never loads file into RAM).
+func BlobFromFile(role, filePath string, mimeType ...string) BlobInput {
+	if role == "" {
+		role = "file"
+	}
+	mt := ""
+	if len(mimeType) > 0 {
+		mt = mimeType[0]
+	}
+	if mt == "" {
+		mt = inferBasicMIME(filePath)
+	}
+	return BlobInput{
+		Role:     role,
+		Name:     filepath.Base(filePath),
+		MIME:     mt,
+		FilePath: filePath,
+	}
+}
+
+// BlobFromReader constructs a streaming BlobInput from a repeatable stream factory with known plaintext byte size.
+func BlobFromReader(role, name, mimeType string, size int64, open func() (io.ReadCloser, error)) BlobInput {
+	if role == "" {
+		role = "file"
+	}
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	return BlobInput{
+		Role: role,
+		Name: name,
+		MIME: mimeType,
+		Open: func() (io.ReadCloser, int64, error) {
+			rc, err := open()
+			return rc, size, err
+		},
+	}
+}
+
+// ParcelText constructs a zero-boilerplate UTF-8 text parcel (`schema = "clip.text.v1"`).
+func ParcelText(appID, text string) ParcelInput {
+	return ParcelInput{
+		AppID:         appID,
+		Schema:        "clip.text.v1",
+		InlinePayload: map[string]any{"text": text},
+	}
+}
+
+// ParcelJSON constructs a structured parcel with optional streaming blob attachments.
+func ParcelJSON(appID, schema string, payload map[string]any, blobs ...BlobInput) ParcelInput {
+	return ParcelInput{
+		AppID:         appID,
+		Schema:        schema,
+		InlinePayload: payload,
+		Blobs:         blobs,
+	}
+}
+
+func inferBasicMIME(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".txt", ".md", ".log":
+		return "text/plain; charset=utf-8"
+	case ".json":
+		return "application/json"
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".webp":
+		return "image/webp"
+	case ".gif":
+		return "image/gif"
+	case ".mp4":
+		return "video/mp4"
+	case ".m4a":
+		return "audio/mp4"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".pdf":
+		return "application/pdf"
+	default:
+		return "application/octet-stream"
+	}
+}
+
 // ReceivedBlob describes a verified, locally persisted attachment handed to ParcelHandler.
 type ReceivedBlob struct {
 	Descriptor BlobDescriptor
-	SafePath   string // Safe local file path under TempDir/<msg_id>/part_<part_id>.tmp (mode 0600)
-	SafeName   string // Sanitized filename stripped of traversal/control characters
+	SafePath   string // Verified local file path under TempDir/<msg_id>/part_<part_id>.verified (mode 0600)
+	SafeName   string // Sanitized filename stripped of traversal/control/reserved device names
+}
+
+// SaveToDir safely moves/copies the verified attachment into outDir with mode 0600,
+// refusing symlinks and never overwriting existing files (auto-suffixing _1, _2 on collision).
+func (b ReceivedBlob) SaveToDir(outDir string) (string, error) {
+	if outDir == "" {
+		return "", NewError(ErrCodeStorageIO, false, 0, "empty output directory", nil)
+	}
+	if fi, err := os.Lstat(outDir); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+			return "", NewError(ErrCodeStorageIO, false, 0, "output directory must be a real directory, not a symlink or file", nil)
+		}
+	} else if !os.IsNotExist(err) {
+		return "", WrapError(ErrCodeStorageIO, false, 0, "lstat output directory", err)
+	} else if err := os.MkdirAll(outDir, 0o700); err != nil {
+		return "", WrapError(ErrCodeStorageIO, false, 0, "create output directory", err)
+	}
+
+	baseName := b.SafeName
+	if baseName == "" {
+		baseName = b.Descriptor.Name
+	}
+	safeName := SanitizeFilename(baseName)
+	ext := filepath.Ext(safeName)
+	stem := strings.TrimSuffix(safeName, ext)
+
+	in, err := os.Open(b.SafePath)
+	if err != nil {
+		return "", WrapError(ErrCodeStorageIO, false, 0, "open verified blob", err)
+	}
+	defer in.Close()
+
+	var dst string
+	var out *os.File
+	for i := 0; i < 10000; i++ {
+		candName := safeName
+		if i > 0 {
+			candName = fmt.Sprintf("%s_%d%s", stem, i, ext)
+		}
+		cand := filepath.Join(outDir, candName)
+		f, openErr := os.OpenFile(cand, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if openErr == nil {
+			dst = cand
+			out = f
+			break
+		}
+		if !os.IsExist(openErr) {
+			return "", WrapError(ErrCodeStorageIO, false, 0, "create destination file", openErr)
+		}
+	}
+	if out == nil {
+		return "", NewError(ErrCodeStorageIO, false, 0, "too many filename collisions in output directory", nil)
+	}
+
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dst)
+		return "", WrapError(ErrCodeStorageIO, false, 0, "write destination file", err)
+	}
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dst)
+		return "", WrapError(ErrCodeStorageIO, false, 0, "sync destination file", err)
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(dst)
+		return "", WrapError(ErrCodeStorageIO, false, 0, "close destination file", err)
+	}
+	_ = in.Close()
+	_ = os.Remove(b.SafePath)
+	return dst, nil
 }
 
 // ReceivedParcel is delivered to the application only after full AEAD + SHA-256 verification.
@@ -211,6 +374,12 @@ type RelayCertExpiringEvent struct {
 func (m *Manifest) Validate() error {
 	if m == nil {
 		return NewError(ErrCodeManifestInvalid, false, 0, "manifest is nil", nil)
+	}
+	if m.EnvelopeVersion > EnvelopeVersion {
+		return NewError(ErrCodeUnsupportedVersion, false, 0, fmt.Sprintf("unsupported envelope_version %d (supported: %d)", m.EnvelopeVersion, EnvelopeVersion), map[string]any{
+			"envelope_version":  m.EnvelopeVersion,
+			"supported_version": EnvelopeVersion,
+		})
 	}
 	if m.EnvelopeVersion != EnvelopeVersion {
 		return NewError(ErrCodeManifestInvalid, false, 0, fmt.Sprintf("unsupported envelope_version %d", m.EnvelopeVersion), nil)
@@ -331,24 +500,95 @@ func ParseManifest(raw []byte) (*Manifest, error) {
 	return &m, nil
 }
 
-// SanitizeFilename strips directory separators, traversal segments, NUL, and control runes.
+func isBidiOrControlRune(r rune) bool {
+	if r == 0 || unicode.IsControl(r) {
+		return true
+	}
+	// Unicode Bidi override/isolate runes (defeats Right-to-Left Override extension spoofing).
+	return (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069) || r == 0x200E || r == 0x200F || r == 0x061C
+}
+
+func isWindowsReservedDeviceStem(stem string) bool {
+	switch strings.ToUpper(strings.TrimSpace(stem)) {
+	case "CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "COM\u00B9", "COM\u00B2", "COM\u00B3",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "LPT\u00B9", "LPT\u00B2", "LPT\u00B3":
+		return true
+	default:
+		return false
+	}
+}
+
+func truncateUTF8Safe(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	ext := filepath.Ext(s)
+	if len(ext) > 16 || len(ext) >= maxBytes {
+		ext = ""
+	}
+	stem := strings.TrimSuffix(s, ext)
+	budget := maxBytes - len(ext)
+	var b strings.Builder
+	for _, r := range stem {
+		rl := utf8.RuneLen(r)
+		if rl < 0 {
+			continue
+		}
+		if b.Len()+rl > budget {
+			break
+		}
+		b.WriteRune(r)
+	}
+	trimmedStem := strings.TrimRightFunc(b.String(), func(r rune) bool {
+		return r == '.' || unicode.IsSpace(r)
+	})
+	if trimmedStem == "" {
+		return "blob.bin"
+	}
+	return trimmedStem + ext
+}
+
+// SanitizeFilename strips directory separators, traversal segments, NUL/control/Bidi runes,
+// leading/trailing dots & spaces, UTF-8 byte-split hazards, and Windows reserved device names.
 func SanitizeFilename(name string) string {
 	name = strings.ReplaceAll(name, "\\", "/")
-	name = filepath.Base(name)
+	if idx := strings.LastIndexByte(name, '/'); idx >= 0 {
+		name = name[idx+1:]
+	}
 	var b strings.Builder
 	for _, r := range name {
-		if r == 0 || unicode.IsControl(r) || r == '/' || r == '\\' || r == ':' || r == '*' || r == '?' || r == '"' || r == '<' || r == '>' || r == '|' {
+		if r == utf8.RuneError {
+			continue
+		}
+		if (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069) || r == 0x200E || r == 0x200F || r == 0x061C {
+			continue
+		}
+		if isBidiOrControlRune(r) || r == '/' || r == '\\' || r == ':' || r == '*' || r == '?' || r == '"' || r == '<' || r == '>' || r == '|' {
 			b.WriteByte('_')
 			continue
 		}
 		b.WriteRune(r)
 	}
-	out := strings.TrimSpace(strings.Trim(b.String(), "."))
+	out := strings.TrimFunc(b.String(), func(r rune) bool {
+		return r == '.' || unicode.IsSpace(r)
+	})
+	if out == "" || strings.Trim(out, "._") == "" {
+		return "blob.bin"
+	}
+	out = truncateUTF8Safe(out, 199)
+	out = strings.TrimFunc(out, func(r rune) bool {
+		return r == '.' || unicode.IsSpace(r)
+	})
 	if out == "" || out == "." || out == ".." {
 		return "blob.bin"
 	}
-	if len(out) > 200 {
-		out = out[:200]
+	stem := out
+	if dot := strings.IndexByte(out, '.'); dot >= 0 {
+		stem = out[:dot]
+	}
+	if isWindowsReservedDeviceStem(stem) {
+		out = "_" + out
 	}
 	return out
 }
