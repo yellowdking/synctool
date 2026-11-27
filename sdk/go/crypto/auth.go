@@ -115,8 +115,12 @@ func SignRelayRequest(accessKey, method, pathAndRawQuery, ts, nonce, bodyBinding
 }
 
 // VerifyRelayRequest verifies X-Sync-Sig in constant time.
+// Per CRYPTO_AND_AUTH.md §2.3 & §7.1, sigHex MUST be exact 64-char lowercase hex.
 func VerifyRelayRequest(accessKey, method, pathAndRawQuery, ts, nonce, bodyBinding, extraTokenBinding, sigHex string) bool {
-	got, err := hex.DecodeString(strings.ToLower(sigHex))
+	if !isLowerHex(sigHex, 64) {
+		return false
+	}
+	got, err := hex.DecodeString(sigHex)
 	if err != nil || len(got) != 32 {
 		return false
 	}
@@ -126,6 +130,19 @@ func VerifyRelayRequest(accessKey, method, pathAndRawQuery, ts, nonce, bodyBindi
 	mac := hmac.New(sha256.New, hmacKey[:])
 	mac.Write([]byte(canon))
 	return hmac.Equal(mac.Sum(nil), got)
+}
+
+func isLowerHex(s string, wantLen int) bool {
+	if len(s) != wantLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 // BuildMailboxSigInput constructs the exact 7-line "\n"-delimited Ed25519 signing input
@@ -174,6 +191,7 @@ func GenerateNonceHex() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	defer clear(b)
 	return hex.EncodeToString(b), nil
 }
 
@@ -183,5 +201,6 @@ func GenerateTokenB64U() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	defer clear(b)
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
