@@ -26,6 +26,7 @@ export interface BlobSink<T = unknown> {
 
 export interface ReceivedBlob<T = unknown> {
   descriptor: BlobDescriptor;
+  safeName: string;
   bytes?: Uint8Array;
   sinkResult?: T;
 }
@@ -104,7 +105,10 @@ export declare function blobFromBytes(
   },
 ): BlobInput;
 
+export declare function resolveDeviceCard(keyStore: KeyStore, query: string): Promise<DeviceCard>;
+
 export declare class SyncClient {
+  static fromEnv(overrides?: Partial<SyncClientConfig>): SyncClient;
   readonly relay: { origin: string; tlsMode: 'system_ca' | 'spki_pin'; spkiPin: string | null; accessKey: string };
   readonly keyStore: KeyStore;
   readonly appId: string;
@@ -119,6 +123,9 @@ export declare class SyncClient {
 
   ping(opts?: { signal?: AbortSignal }): Promise<{
     proto_v: number;
+    min_proto_v?: number;
+    max_proto_v?: number;
+    server_version?: string;
     server_ts: number;
     profile: string;
     spool_backend: string;
@@ -130,6 +137,7 @@ export declare class SyncClient {
 
   capabilities(opts?: { refresh?: boolean; signal?: AbortSignal }): Promise<any>;
   registerMailbox(opts?: { signal?: AbortSignal }): Promise<{ mailbox_id: string; registered: boolean; deposit_token_count: number }>;
+  syncMailbox(opts?: { signal?: AbortSignal }): Promise<{ mailbox_id: string; registered: boolean; deposit_token_count: number }>;
 
   startDeviceBind(opts?: {
     mode?: 1 | 2;
@@ -196,10 +204,32 @@ export declare class SyncClient {
     },
   ): Promise<{ mode: 'spool' | 'pipe'; itemId?: string; roomId?: string; msgId: string; totalBytes: number; expiresAt?: number }>;
 
+  sendText(
+    targetDeviceOrLabel: string,
+    text: string,
+    opts?: {
+      deliveryMode?: 'auto' | 'spool' | 'pipe';
+      ttlSec?: number;
+      signal?: AbortSignal;
+    },
+  ): Promise<{ mode: 'spool' | 'pipe'; itemId?: string; roomId?: string; msgId: string; totalBytes: number; expiresAt?: number }>;
+
   receiveDirect<T = unknown>(
     pairInput: string,
     handler: (received: { manifest: Manifest; senderCard: DeviceCard; blobs: ReceivedBlob<T>[] }) => Promise<void> | void,
     opts?: {
+      createBlobSink?: (desc: BlobDescriptor) => Promise<BlobSink<T>> | BlobSink<T>;
+      timeoutMs?: number;
+      preferPoll?: boolean;
+      signal?: AbortSignal;
+    },
+  ): Promise<Manifest>;
+
+  receiveFromRoom<T = unknown>(
+    pairInput: string,
+    handler: (received: { manifest: Manifest; senderCard?: DeviceCard; blobs: ReceivedBlob<T>[] }) => Promise<void> | void,
+    opts?: {
+      onSASDisplay?: (info: { sas: string; formatted: string }) => Promise<void> | void;
       createBlobSink?: (desc: BlobDescriptor) => Promise<BlobSink<T>> | BlobSink<T>;
       timeoutMs?: number;
       preferPoll?: boolean;
