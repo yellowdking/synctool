@@ -1,0 +1,198 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - main
+    paths:
+      - "VERSION"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional SemVer override (e.g. 0.1.0); defaults to VERSION file"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  prepare:
+    name: Prepare Release Tag & Metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      should_release: ${{ steps.meta.outputs.should_release }}
+      image_name: ${{ steps.meta.outputs.image_name }}
+      image_tags: ${{ steps.meta.outputs.image_tags }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version and ensure git tag exists
+        id: meta
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          SHOULD_RELEASE="false"
+          TAG=""
+          VER=""
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            VER="${TAG#v}"
+            SHOULD_RELEASE="true"
+          else
+            if [[ -n "${INPUT_VERSION}" ]]; then
+              VER="$(printf '%s' "${INPUT_VERSION}" | tr -d '[:space:]')"
+              VER="${VER#v}"
+            else
+              if [[ ! -f VERSION ]]; then
+                echo "VERSION file not found; skipping release."
+                echo "should_release=false" >> "${GITHUB_OUTPUT}"
+                exit 0
+              fi
+              VER="$(tr -d '[:space:]' < VERSION)"
+              VER="${VER#v}"
+            fi
+
+            if [[ ! "${VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "ERROR: invalid SemVer '${VER}'" >&2
+              exit 1
+            fi
+
+            TAG="v${VER}"
+
+            if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+              echo "Tag ${TAG} already exists on origin; skipping idempotently."
+              echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+              echo "version=${VER}" >> "${GITHUB_OUTPUT}"
+              echo "should_release=false" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "${TAG}" -m "Release ${TAG}"
+            git push origin "refs/tags/${TAG}"
+            SHOULD_RELEASE="true"
+          fi
+
+          OWNER_LOWER="$(printf '%s' "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          VER_LOWER="$(printf '%s' "${VER}" | tr '[:upper:]' '[:lower:]')"
+          TAG_LOWER="v${VER_LOWER}"
+          IMAGE_NAME="ghcr.io/${OWNER_LOWER}/synctool"
+
+          MAJOR_MINOR="$(printf '%s' "${VER_LOWER}" | cut -d. -f1,2)"
+          TAGS="${IMAGE_NAME}:${TAG_LOWER},${IMAGE_NAME}:${VER_LOWER}"
+          if [[ "${VER_LOWER}" != *-* ]]; then
+            TAGS="${TAGS},${IMAGE_NAME}:${MAJOR_MINOR},${IMAGE_NAME}:latest"
+          fi
+
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "version=${VER}" >> "${GITHUB_OUTPUT}"
+          echo "should_release=${SHOULD_RELEASE}" >> "${GITHUB_OUTPUT}"
+          echo "image_name=${IMAGE_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "image_tags=${TAGS}" >> "${GITHUB_OUTPUT}"
+
+  build-binaries:
+    name: Build Multi-Arch Static Binaries & GitHub Release
+    needs: [prepare]
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Build static binaries
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          VERSION="${RELEASE_TAG}"
+          COMMIT="${GITHUB_SHA::8}"
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}"
+
+          for target in "linux/amd64" "linux/arm64" "darwin/amd64" "darwin/arm64" "windows/amd64"; do
+            GOOS="${target%/*}"
+            GOARCH="${target#*/}"
+            EXT=""
+            if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
+
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+              go build -trimpath -ldflags="$LDFLAGS" \
+              -o "dist/synctool-relay_${GOOS}_${GOARCH}${EXT}" ./cmd/synctool-relay
+
+            if [ -d ./cmd/synctool ]; then
+              CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+                go build -trimpath -ldflags="$LDFLAGS" \
+                -o "dist/synctool_${GOOS}_${GOARCH}${EXT}" ./cmd/synctool
+            fi
+          done
+
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          generate_release_notes: true
+          files: dist/*
+
+  publish-ghcr:
+    name: Publish Multi-Arch Docker Image to GHCR
+    needs: [prepare]
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push linux/amd64,linux/arm64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ needs.prepare.outputs.image_tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.tag }}
+            COMMIT=${{ github.sha }}

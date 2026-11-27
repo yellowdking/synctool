@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  go-test:
+    name: Go Vet, Zero-Dep Check & Race Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Verify zero third-party Go dependencies
+        run: |
+          if grep -E '^\s*require\b' go.mod; then
+            echo "ERROR: go.mod must have zero third-party dependencies"
+            exit 1
+          fi
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Go test (with race detector)
+        run: go test -race -count=1 ./...
+
+      - name: Cross-compile static binaries (linux amd64/arm64)
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /tmp/synctool-relay-amd64 ./cmd/synctool-relay
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o /tmp/synctool-relay-arm64 ./cmd/synctool-relay
+          if [ -d ./cmd/synctool ]; then
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /tmp/synctool-amd64 ./cmd/synctool
+          fi
+
+  ts-test:
+    name: TypeScript / WebCrypto SDK Golden Vectors & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Verify zero runtime dependencies in sdk/ts/package.json
+        run: |
+          node -e '
+            const pkg = JSON.parse(require("fs").readFileSync("sdk/ts/package.json", "utf8"));
+            const deps = Object.keys(pkg.dependencies || {});
+            if (deps.length > 0) {
+              console.error("ERROR: sdk/ts must have zero runtime dependencies, found:", deps);
+              process.exit(1);
+            }
+          '
+
+      - name: Run WebCrypto SDK tests & golden vectors
+        working-directory: sdk/ts
+        run: node --test test/*.test.mjs
+
+  cross-lang-e2e:
+    name: Cross-Language E2E (Go <-> Relay <-> TS)
+    needs: [go-test, ts-test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run Go E2E suite
+        run: |
+          if [ -d ./e2e ]; then
+            go test -race -v ./e2e/...
+          fi
+
+      - name: Run Cross-Language Go <-> TS E2E script
+        run: |
+          if [ -f ./e2e/cross_lang.mjs ]; then
+            node ./e2e/cross_lang.mjs
+          fi
+
+  docker-build:
+    name: Docker Scratch Image Build Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build multi-stage scratch image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: synctool-relay:ci-test
+
+      - name: Smoke test container init subcommand
+        run: |
+          docker run --rm --read-only --tmpfs /data:uid=65532,gid=65532 synctool-relay:ci-test init --public-host 127.0.0.1 >/dev/null
