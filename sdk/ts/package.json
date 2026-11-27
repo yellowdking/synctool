@@ -1,0 +1,45 @@
+{
+  "name": "@yellowdking/synctool",
+  "version": "0.1.0",
+  "description": "Zero-dependency WebCrypto TypeScript/JavaScript SDK for synctool v1 end-to-end encrypted relay sync",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./crypto": {
+      "types": "./src/crypto.d.ts",
+      "default": "./src/crypto.js"
+    },
+    "./crockford": {
+      "types": "./src/crockford.d.ts",
+      "default": "./src/crockford.js"
+    },
+    "./envelope": {
+      "types": "./src/envelope.d.ts",
+      "default": "./src/envelope.js"
+    },
+    "./keystore": {
+      "types": "./src/keystore.d.ts",
+      "default": "./src/keystore.js"
+    },
+    "./client": {
+      "types": "./src/client.d.ts",
+      "default": "./src/client.js"
+    }
+  },
+  "files": [
+    "src"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {},
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "license": "MIT"
+}
