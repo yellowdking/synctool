@@ -18,33 +18,23 @@ import (
 )
 
 func (c *Client) EnsureMailboxRegistered(ctx context.Context) error {
-	path := "/v1/mailboxes/" + c.mailboxKeys.MailboxID
-	body := map[string]string{
-		"auth_pk_b64": base64.RawURLEncoding.EncodeToString(c.mailboxKeys.AuthPub),
-	}
-	_, err := c.doControl(ctx, http.MethodPut, path, body, reqOptions{
-		MailboxID:     c.mailboxKeys.MailboxID,
-		MailboxAuthSK: c.mailboxKeys.AuthPriv,
-	})
-	if envelope.IsCode(err, envelope.ErrCodeSpoolDisabled) {
-		return nil
-	}
-	return err
+	return c.SyncMailbox(ctx)
 }
 
-func (c *Client) registerPeerDepositToken(ctx context.Context) (tokenID string, rawToken string, err error) {
+func (c *Client) registerPeerDepositToken(ctx context.Context) (tokenID string, tokenHashHex string, rawToken string, err error) {
 	rawToken, err = synccrypto.GenerateTokenB64U()
 	if err != nil {
-		return "", "", envelope.WrapError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, "generate deposit token", err)
+		return "", "", "", envelope.WrapError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, "generate deposit token", err)
 	}
 	idBytes, err := synccrypto.GenerateRandomBytes(8)
 	if err != nil {
-		return "", "", envelope.WrapError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, "generate token id", err)
+		return "", "", "", envelope.WrapError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, "generate token id", err)
 	}
 	tokenID = "dt_" + hex.EncodeToString(idBytes)
+	tokenHashHex = synccrypto.HashDepositToken(rawToken)
 	body := map[string]string{
 		"token_id":       tokenID,
-		"token_hash_hex": synccrypto.HashDepositToken(rawToken),
+		"token_hash_hex": tokenHashHex,
 	}
 	path := "/v1/mailboxes/" + c.mailboxKeys.MailboxID + "/deposit-tokens"
 	_, err = c.doControl(ctx, http.MethodPost, path, body, reqOptions{
@@ -52,9 +42,9 @@ func (c *Client) registerPeerDepositToken(ctx context.Context) (tokenID string, 
 		MailboxAuthSK: c.mailboxKeys.AuthPriv,
 	})
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
-	return tokenID, rawToken, nil
+	return tokenID, tokenHashHex, rawToken, nil
 }
 
 // RevokeDevice removes a lost/retired peer DeviceCard locally and, if a mailbox deposit token
@@ -269,10 +259,13 @@ func (c *Client) SendToDevice(ctx context.Context, targetDeviceID string, parcel
 		})
 		_ = rc.Close()
 		clear(encKey[:])
+		_ = c.keyStore.DeleteCheckpoint("send", prep.MsgID, b.PartID)
 		if upErr != nil {
+			abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			_, _ = c.doControl(abortCtx, http.MethodDelete, "/v1/spool/"+initOut.ItemID, nil, reqOptions{UploadToken: initOut.UploadToken})
+			cancel()
 			return nil, upErr
 		}
-		_ = c.keyStore.DeleteCheckpoint("send", prep.MsgID, b.PartID)
 	}
 
 	commitResp, err := c.doControl(ctx, http.MethodPost, "/v1/spool/"+initOut.ItemID+"/commit", map[string]any{}, reqOptions{
@@ -302,10 +295,18 @@ func (c *Client) SendToDevice(ctx context.Context, targetDeviceID string, parcel
 
 func (c *Client) listRawInboxItems(ctx context.Context) ([]InboxItemMeta, error) {
 	path := "/v1/mailboxes/" + c.mailboxKeys.MailboxID + "/items"
-	resp, err := c.doControl(ctx, http.MethodGet, path, nil, reqOptions{
+	opts := reqOptions{
 		MailboxID:     c.mailboxKeys.MailboxID,
 		MailboxAuthSK: c.mailboxKeys.AuthPriv,
-	})
+	}
+	resp, err := c.doControl(ctx, http.MethodGet, path, nil, opts)
+	// Self-healing: if memory-spool relay restarted and returned 404 ERR_NOT_FOUND for our mailbox,
+	// transparently re-register the mailbox + peer deposit_tokens once and retry!
+	if envelope.IsCode(err, envelope.ErrCodeNotFound) {
+		if healErr := c.SyncMailbox(ctx); healErr == nil {
+			resp, err = c.doControl(ctx, http.MethodGet, path, nil, opts)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -370,7 +371,7 @@ func (c *Client) ListInbox(ctx context.Context, filterAppID string) ([]InboxPrev
 			opened.Zero()
 			continue
 		}
-		manifest, err := c.pullAndVerifyManifest(opened.MsgIDRaw, opened.MsgID, opened.Part0Key, opened.Part0NoncePrefix, p0Layout, opened, func(txIdx int) ([]byte, error) {
+		manifest, manifestSHA, err := c.pullAndVerifyManifest(opened.MsgIDRaw, opened.MsgID, opened.Part0Key, opened.Part0NoncePrefix, p0Layout, opened, func(txIdx int) ([]byte, error) {
 			return c.getSpoolChunk(ctx, it.ItemID, 0, txIdx)
 		})
 		opened.Zero()
@@ -379,10 +380,11 @@ func (c *Client) ListInbox(ctx context.Context, filterAppID string) ([]InboxPrev
 		}
 
 		_ = c.keyStore.PutCachedManifest(envelope.CachedManifestEntry{
-			ItemID:    it.ItemID,
-			CachedAt:  time.Now().Unix(),
-			ExpiresAt: it.ExpiresAt,
-			Manifest:  *manifest,
+			ItemID:         it.ItemID,
+			CachedAt:       time.Now().Unix(),
+			ExpiresAt:      it.ExpiresAt,
+			ManifestSHA256: hex.EncodeToString(manifestSHA[:]),
+			Manifest:       *manifest,
 		})
 		if filterAppID == "" || manifest.AppID == filterAppID {
 			previews = append(previews, InboxPreview{
@@ -435,15 +437,20 @@ func (c *Client) FetchParcel(ctx context.Context, itemID string, handler ParcelH
 	}
 
 	var manifest *envelope.Manifest
+	wantManifestSHA := hex.EncodeToString(opened.ManifestSHA256[:])
 	if cached, _ := c.keyStore.GetCachedManifest(itemID); cached != nil && cached.Manifest.MsgID == opened.MsgID {
-		// Re-verify cached manifest matches signed manifest_sha256 before trusting.
-		if raw, err := envelope.MarshalManifest(&cached.Manifest); err == nil && sha256.Sum256(raw) == opened.ManifestSHA256 {
+		if cached.ManifestSHA256 != "" {
+			if cached.ManifestSHA256 == wantManifestSHA {
+				m := cached.Manifest
+				manifest = &m
+			}
+		} else if raw, err := envelope.MarshalManifest(&cached.Manifest); err == nil && sha256.Sum256(raw) == opened.ManifestSHA256 {
 			m := cached.Manifest
 			manifest = &m
 		}
 	}
 	if manifest == nil {
-		manifest, err = c.pullAndVerifyManifest(opened.MsgIDRaw, opened.MsgID, opened.Part0Key, opened.Part0NoncePrefix, p0Layout, opened, func(txIdx int) ([]byte, error) {
+		manifest, _, err = c.pullAndVerifyManifest(opened.MsgIDRaw, opened.MsgID, opened.Part0Key, opened.Part0NoncePrefix, p0Layout, opened, func(txIdx int) ([]byte, error) {
 			return c.getSpoolChunk(ctx, itemID, 0, txIdx)
 		})
 		if err != nil {
@@ -487,10 +494,16 @@ func (c *Client) FetchParcel(ctx context.Context, itemID string, handler ParcelH
 }
 
 // WatchInbox subscribes to GET /v1/mailboxes/{mailbox_id}/events via SSE (reopening cleanly
-// on 90s reconnect events and falling back to 20s Long-Poll if SSE is unavailable).
+// on 90s reconnect events, falling back to 20s Long-Poll if SSE is unavailable, and self-healing
+// automatically if a memory-spool relay restarts).
 func (c *Client) WatchInbox(ctx context.Context, onEvent func(InboxWatchEvent) error) error {
-	sinceTS := c.effectiveUnixNow()
+	sinceTS := c.effectiveUnixNow() - 1
+	if sinceTS < 0 {
+		sinceTS = 0
+	}
+	seenItems := make(map[string]struct{})
 	usePoll := false
+	healed404 := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return envelope.WrapError(envelope.ErrCodeCancelled, false, 0, "watch inbox cancelled", err)
@@ -503,12 +516,19 @@ func (c *Client) WatchInbox(ctx context.Context, onEvent func(InboxWatchEvent) e
 				AcceptSSE:     true,
 			})
 			if err != nil {
-				if envelope.IsCode(err, envelope.ErrCodeSpoolDisabled) || envelope.IsCode(err, envelope.ErrCodeAuthFailed) || envelope.IsCode(err, envelope.ErrCodeUnauthorizedToken) {
+				if envelope.IsCode(err, envelope.ErrCodeNotFound) && !healed404 {
+					healed404 = true
+					if healErr := c.SyncMailbox(ctx); healErr == nil {
+						continue
+					}
+				}
+				if envelope.IsCode(err, envelope.ErrCodeSpoolDisabled) || envelope.IsCode(err, envelope.ErrCodeAuthFailed) || envelope.IsCode(err, envelope.ErrCodeUnauthorizedToken) || envelope.IsCode(err, envelope.ErrCodeNotFound) {
 					return err
 				}
 				usePoll = true
 				continue
 			}
+			healed404 = false
 			var cbErr error
 			parseErr := parseSSEStream(httpResp.Body, func(ev sseEvent) error {
 				switch ev.Event {
@@ -520,6 +540,10 @@ func (c *Client) WatchInbox(ctx context.Context, onEvent func(InboxWatchEvent) e
 					if item.CreatedAt > sinceTS {
 						sinceTS = item.CreatedAt
 					}
+					if _, dup := seenItems[item.ItemID]; dup {
+						return nil
+					}
+					seenItems[item.ItemID] = struct{}{}
 					if onEvent != nil {
 						if err := onEvent(item); err != nil {
 							cbErr = err
@@ -548,8 +572,15 @@ func (c *Client) WatchInbox(ctx context.Context, onEvent func(InboxWatchEvent) e
 			MailboxAuthSK: c.mailboxKeys.AuthPriv,
 		})
 		if err != nil {
+			if envelope.IsCode(err, envelope.ErrCodeNotFound) && !healed404 {
+				healed404 = true
+				if healErr := c.SyncMailbox(ctx); healErr == nil {
+					continue
+				}
+			}
 			return err
 		}
+		healed404 = false
 		var out struct {
 			Items    []InboxWatchEvent `json:"items"`
 			ServerTS int64             `json:"server_ts"`
@@ -561,6 +592,10 @@ func (c *Client) WatchInbox(ctx context.Context, onEvent func(InboxWatchEvent) e
 			if item.CreatedAt > sinceTS {
 				sinceTS = item.CreatedAt
 			}
+			if _, dup := seenItems[item.ItemID]; dup {
+				continue
+			}
+			seenItems[item.ItemID] = struct{}{}
 			if onEvent != nil {
 				if err := onEvent(item); err != nil {
 					return err
