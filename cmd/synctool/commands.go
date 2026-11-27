@@ -67,13 +67,19 @@ func cmdSend(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 	if *inlineJSON != "" {
 		var raw []byte
 		var err error
+		exceedMsg := fmt.Sprintf("inline_payload exceeds %d bytes", envelope.MaxInlinePayloadBytes)
 		if *inlineJSON == "-" {
-			raw, err = io.ReadAll(io.LimitReader(stdin, envelope.MaxInlinePayloadBytes+1))
+			raw, err = readBoundedBytes(stdin, envelope.MaxInlinePayloadBytes, exceedMsg)
 		} else {
-			raw, err = os.ReadFile(*inlineJSON)
+			f, oerr := os.Open(*inlineJSON)
+			if oerr != nil {
+				return envelope.WrapError(envelope.ErrCodeStorageIO, false, 0, "read inline json", oerr)
+			}
+			raw, err = readBoundedBytes(f, envelope.MaxInlinePayloadBytes, exceedMsg)
+			_ = f.Close()
 		}
 		if err != nil {
-			return envelope.WrapError(envelope.ErrCodeStorageIO, false, 0, "read inline json", err)
+			return err
 		}
 		if err := json.Unmarshal(raw, &inline); err != nil {
 			return envelope.WrapError(envelope.ErrCodeManifestInvalid, false, 0, "parse inline json", err)
@@ -171,48 +177,6 @@ func cmdSend(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 	return nil
 }
 
-func saveReceivedParcelToOutDir(outDir string, p envelope.ReceivedParcel) ([]string, error) {
-	if err := os.MkdirAll(outDir, 0o700); err != nil {
-		return nil, envelope.WrapError(envelope.ErrCodeStorageIO, false, 0, "create out dir", err)
-	}
-	saved := make([]string, 0, len(p.Blobs))
-	for _, b := range p.Blobs {
-		dst := filepath.Join(outDir, b.SafeName)
-		if _, err := os.Stat(dst); err == nil {
-			dst = filepath.Join(outDir, fmt.Sprintf("%d_%s", b.Descriptor.PartID, b.SafeName))
-		}
-		if err := moveOrCopyFile(b.SafePath, dst); err != nil {
-			return nil, envelope.WrapError(envelope.ErrCodeStorageIO, false, 0, "save received blob", err)
-		}
-		saved = append(saved, dst)
-	}
-	return saved, nil
-}
-
-func moveOrCopyFile(src, dst string) error {
-	if err := os.Rename(src, dst); err == nil {
-		return nil
-	}
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
-		return err
-	}
-	if err := out.Close(); err != nil {
-		return err
-	}
-	_ = os.Remove(src)
-	return nil
-}
-
 func cmdRecv(ctx context.Context, opts globalOpts, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("recv", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -258,15 +222,19 @@ func cmdRecv(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 	}
 
 	var pairIn string
-	if *useStdin {
+	switch {
+	case *useStdin:
 		pairIn, err = readSecretLine(stdin)
 		if err != nil {
 			return err
 		}
-	} else if fs.NArg() > 0 {
+	case fs.NArg() > 0:
 		pairIn = strings.TrimSpace(fs.Arg(0))
-	} else {
-		return envelope.NewError(envelope.ErrCodeBadRequest, false, 0, "recv requires <pair_uri_or_room_code>, --stdin, or --item <id>", nil)
+		warnSecretOnArgv(opts, stderr, pairIn)
+	case strings.TrimSpace(os.Getenv(envPairURI)) != "":
+		pairIn = strings.TrimSpace(os.Getenv(envPairURI))
+	default:
+		return envelope.NewError(envelope.ErrCodeBadRequest, false, 0, "recv requires <pair_uri_or_room_code>, --stdin, SYNCTOOL_PAIR_URI, or --item <id>", nil)
 	}
 
 	var overrideProf *envelope.RelayProfile
@@ -403,17 +371,37 @@ func cmdInbox(ctx context.Context, opts globalOpts, args []string, stdout, stder
 				_, _ = fmt.Fprintf(stdout, "new_item %s (%d bytes)\n", ev.ItemID, ev.TotalBytes)
 			}
 			if *autoPull {
-				m, err := cli.FetchParcel(ctx, ev.ItemID, func(p envelope.ReceivedParcel) error {
-					if *appFilter != "" && p.Manifest.AppID != *appFilter {
+				// CRITICAL: When filtering by --app, verify Manifest.AppID via Phase 1 ListInbox BEFORE
+				// calling FetchParcel, because FetchParcel sends signed ACK burn as soon as handler returns nil!
+				if *appFilter != "" {
+					previews, err := cli.ListInbox(ctx, *appFilter)
+					if err != nil {
+						return err
+					}
+					matched := false
+					for _, pv := range previews {
+						if pv.ItemID == ev.ItemID {
+							matched = true
+							break
+						}
+					}
+					if !matched {
 						return nil
 					}
-					_, err := saveReceivedParcelToOutDir(*outDir, p)
-					return err
+				}
+				var files []string
+				m, err := cli.FetchParcel(ctx, ev.ItemID, func(p envelope.ReceivedParcel) error {
+					saved, err := saveReceivedParcelToOutDir(*outDir, p)
+					if err != nil {
+						return err
+					}
+					files = saved
+					return nil
 				}, client.ReceiveOptions{})
 				if err != nil {
 					return err
 				}
-				emitEvent(opts, stdout, map[string]any{"type": "event", "event": "auto_pulled", "item_id": ev.ItemID, "msg_id": m.MsgID})
+				emitEvent(opts, stdout, map[string]any{"type": "event", "event": "auto_pulled", "item_id": ev.ItemID, "msg_id": m.MsgID, "files": files})
 			}
 			return nil
 		})
@@ -449,7 +437,7 @@ func cmdDevice(ctx context.Context, opts globalOpts, args []string, stdout, stde
 		defer dk.Zero()
 		label, _ := ks.GetLocalLabel()
 		var mbID string
-		if prof, _ := ks.GetDefaultRelayProfile(); prof != nil {
+		if prof, _ := resolveRelayProfile(opts, ks, stderr); prof != nil {
 			if mk, err := dk.DeriveMailboxKeys(prof.RelayID); err == nil {
 				mbID = mk.MailboxID
 				mk.Zero()
@@ -562,19 +550,19 @@ func cmdVersion(opts globalOpts, args []string, stdout io.Writer) error {
 func printUsage(w io.Writer) {
 	_, _ = fmt.Fprintln(w, `synctool — zero-trust on-demand encrypted sync CLI (v1)
 
-Global flags:
-  --config <dir>     Keystore/state directory (0700)
-  --relay <id|alias> Active relay profile
-  --app <app_id>     Application namespace (default: synctool.cli)
+Global flags & environment variables:
+  --config <dir>     Keystore/state directory (0700; env: SYNCTOOL_CONFIG)
+  --relay <id|alias> Active relay profile or URI (env: SYNCTOOL_RELAY / SYNCTOOL_RELAY_URI)
+  --app <app_id>     Application namespace (default: synctool.cli; env: SYNCTOOL_APP)
   --json             Machine-readable JSON/NDJSON output on stdout
   --quiet, -q        Suppress non-essential stderr messages
 
 Subcommands:
-  init               Initialize device identity and connect to a relay (--stdin recommended)
+  init               Initialize device identity and connect to a relay (--stdin / --relay-stdin / SYNCTOOL_RELAY)
   ping               Check relay RTT, profile, spool switch, clock skew, and cert expiry
-  pair offer|accept  Pair two devices (QR OOB or 6-digit Commit-Reveal SAS)
+  pair offer|accept  Pair two devices (--stdin or SYNCTOOL_PAIR_URI recommended for accept)
   send               Send encrypted parcel (--to <device> | --oneshot, --text/--inline-json/--file)
-  recv               Receive Mode A room transfer (<uri|code>) or spool parcel (--item <id>)
+  recv               Receive Mode A room transfer (--stdin / SYNCTOOL_PAIR_URI) or spool parcel (--item <id>)
   inbox list|pull|watch  Inspect, pull & burn, or watch Mode B encrypted inbox
   device whoami|list|rename|revoke  Manage local identity and trusted devices
   version            Print CLI version and git commit`)
