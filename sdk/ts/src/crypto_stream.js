@@ -22,6 +22,7 @@ import {
   sha256,
   u32be,
   utf8Encode,
+  zeroBytes,
 } from './crypto_primitives.js';
 
 const EMPTY_SHA256_HEX = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
@@ -89,6 +90,9 @@ export async function sealStreamBlock(encKey32, noncePrefix7, msgId16, partId, b
   if (plaintextBlock.length > CHUNK_PLAINTEXT_MAX) {
     throw new RangeError(`plaintext block exceeds ${CHUNK_PLAINTEXT_MAX} bytes`);
   }
+  if (!isFinal && plaintextBlock.length !== CHUNK_PLAINTEXT_MAX) {
+    throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, `non-final STREAM block must be ${CHUNK_PLAINTEXT_MAX} bytes`);
+  }
   const nonce = buildChunkNonce(noncePrefix7, blockIdx, isFinal);
   const aad = buildChunkAAD(msgId16, partId, blockIdx, isFinal, plaintextBlock.length);
   return aesGcmSeal(encKey32, nonce, plaintextBlock, aad);
@@ -102,6 +106,9 @@ export async function openStreamBlock(encKey32, noncePrefix7, msgId16, partId, b
     throw new SyncError(ErrorCode.ERR_CRYPTO_DECRYPT_FAILED, `invalid ciphertext block length: ${ciphertextBlock.length}`);
   }
   const plaintextLen = ciphertextBlock.length - AEAD_TAG_LEN;
+  if (!isFinal && plaintextLen !== CHUNK_PLAINTEXT_MAX) {
+    throw new SyncError(ErrorCode.ERR_STREAM_TRUNCATED, `non-final STREAM ciphertext block must be ${CHUNK_CIPHERTEXT_MAX} bytes`);
+  }
   const nonce = buildChunkNonce(noncePrefix7, blockIdx, isFinal);
   const aad = buildChunkAAD(msgId16, partId, blockIdx, isFinal, plaintextLen);
   return aesGcmOpen(encKey32, nonce, ciphertextBlock, aad);
@@ -325,7 +332,12 @@ export async function signRelayRequest(params) {
     extraTokenBinding,
   });
   const hmacKey = await deriveRelayHmacKey(params.accessKey);
-  const sigBytes = await hmacSha256(hmacKey, utf8Encode(canonical));
+  let sigBytes;
+  try {
+    sigBytes = await hmacSha256(hmacKey, utf8Encode(canonical));
+  } finally {
+    zeroBytes(hmacKey);
+  }
   return {
     canonical,
     bodyBinding,
