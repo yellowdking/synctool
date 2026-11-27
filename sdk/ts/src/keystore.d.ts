@@ -22,6 +22,7 @@ export interface DeviceCard {
   mailbox_id?: string | null;
   outbound_deposit_token?: string | null;
   inbound_token_id?: string | null;
+  inbound_token_hash?: string | null;
   paired_at: number;
   revoked: boolean;
 }
@@ -48,6 +49,29 @@ export declare class MemoryKeyStore implements KeyStore {
     seenRetentionSec?: number;
     seenMinCapacity?: number;
   });
+  loadOrCreateMasterSeed(): Promise<Uint8Array>;
+  getRelayProfile(relayId: string): Promise<RelayProfile | null>;
+  saveRelayProfile(profile: RelayProfile): Promise<void>;
+  listDevices(): Promise<DeviceCard[]>;
+  getDevice(deviceId: string): Promise<DeviceCard | null>;
+  putDevice(card: DeviceCard): Promise<void>;
+  deleteDevice(deviceId: string): Promise<void>;
+  hasSeenMsgID(msgId: string): Promise<boolean>;
+  markSeenMsgID(msgId: string, createdAt: number, seenAt?: number): Promise<void>;
+  getCachedManifestPreview(itemId: string): Promise<unknown | null>;
+  putCachedManifestPreview(itemId: string, preview: unknown): Promise<void>;
+  deleteCachedManifestPreview(itemId: string): Promise<void>;
+  pruneCachedManifestPreviews(activeItemIds: Set<string>): Promise<void>;
+}
+
+export declare class NodeFileKeyStore implements KeyStore {
+  constructor(
+    dirPath: string,
+    options?: {
+      seenRetentionSec?: number;
+      seenMinCapacity?: number;
+    },
+  );
   loadOrCreateMasterSeed(): Promise<Uint8Array>;
   getRelayProfile(relayId: string): Promise<RelayProfile | null>;
   saveRelayProfile(profile: RelayProfile): Promise<void>;

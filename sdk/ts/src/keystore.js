@@ -146,3 +146,5 @@ export class MemoryKeyStore {
     }
   }
 }
+
+export { NodeFileKeyStore } from './keystore_node.js';
