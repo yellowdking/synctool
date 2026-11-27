@@ -25,12 +25,12 @@ func TestVerifySAS(t *testing.T) {
 
 func TestCanonicalRelayOriginRules(t *testing.T) {
 	okCases := map[string]string{
-		"https://relay.example.com":        "https://relay.example.com:443",
-		"HTTPS://Relay.Example.COM:8443/":  "https://relay.example.com:8443",
-		"https://1.2.3.4:54843":            "https://1.2.3.4:54843",
-		"http://127.0.0.1:8080":            "http://127.0.0.1:8080",
-		"http://localhost":                 "http://localhost:80",
-		"http://[::1]:9000":                "http://[::1]:9000",
+		"https://relay.example.com":       "https://relay.example.com:443",
+		"HTTPS://Relay.Example.COM:8443/": "https://relay.example.com:8443",
+		"https://1.2.3.4:54843":           "https://1.2.3.4:54843",
+		"http://127.0.0.1:8080":           "http://127.0.0.1:8080",
+		"http://localhost":                "http://localhost:80",
+		"http://[::1]:9000":               "http://[::1]:9000",
 	}
 	for in, want := range okCases {
 		got, err := CanonicalRelayOrigin(in)
