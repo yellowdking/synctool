@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 )
 
 const (
@@ -100,6 +101,7 @@ func Seal0RTTHeader(
 	}
 	ephPriv, err := GenerateEphemeralX25519()
 	if err != nil {
+		clear(msgIDRaw[:])
 		return
 	}
 	return Seal0RTTHeaderDeterministic(senderKeys, ephPriv, msgIDRaw, recipientIDRaw, recipientKEMPub, createdAt, manifestSHA256)
@@ -139,12 +141,17 @@ func Seal0RTTHeaderDeterministic(
 
 	hdrKey, hdrNonce, p0Key, p0NP, err := derive0RTTKeys(clearHdr[:], dh)
 	if err != nil {
+		clear(outMsgID[:])
 		return
 	}
 	defer clear(hdrKey[:])
+	defer clear(hdrNonce[:])
 
 	sigInput, err := BuildZeroRTTSigInput(clearHdr[:], senderKeys.DeviceIDRaw, recipientIDRaw, createdAt, manifestSHA256)
 	if err != nil {
+		clear(p0Key[:])
+		clear(p0NP[:])
+		clear(outMsgID[:])
 		return
 	}
 	senderSig := ed25519.Sign(senderKeys.SignPriv, sigInput[:])
@@ -159,6 +166,9 @@ func Seal0RTTHeaderDeterministic(
 
 	sealedBox, err := aesGCMSeal(hdrKey[:], hdrNonce[:], boxPT[:], clearHdr[:])
 	if err != nil {
+		clear(p0Key[:])
+		clear(p0NP[:])
+		clear(outMsgID[:])
 		return
 	}
 	copy(sealedHeader[0:ClearHeaderSize], clearHdr[:])
@@ -218,37 +228,47 @@ func Open0RTTHeader(
 		return nil, err
 	}
 	defer clear(hdrKey[:])
+	defer clear(hdrNonce[:])
+	wipePart0 := func() {
+		clear(p0Key[:])
+		clear(p0NP[:])
+	}
 
 	boxPT, err := aesGCMOpen(hdrKey[:], hdrNonce[:], sealedBox, clearHdr)
 	if err != nil {
-		clear(p0Key[:])
+		wipePart0()
 		return nil, err
 	}
 	defer clear(boxPT)
 
 	if len(boxPT) != SealedBoxPlaintextSize {
-		clear(p0Key[:])
+		wipePart0()
 		return nil, ErrInvalidSealedHeader
 	}
 
 	var senderIDRaw, recipIDRaw [16]byte
 	copy(senderIDRaw[:], boxPT[0:16])
 	copy(recipIDRaw[:], boxPT[16:32])
-	createdAt := int64(binary.BigEndian.Uint64(boxPT[32:40]))
+	rawCreatedAt := binary.BigEndian.Uint64(boxPT[32:40])
+	if rawCreatedAt > math.MaxInt64 {
+		wipePart0()
+		return nil, ErrInvalidSealedHeader
+	}
+	createdAt := int64(rawCreatedAt)
 	var manifestSHA [32]byte
 	copy(manifestSHA[:], boxPT[40:72])
 	var senderSig [64]byte
 	copy(senderSig[:], boxPT[72:136])
 
 	if subtle.ConstantTimeCompare(recipIDRaw[:], recipientKeys.DeviceIDRaw[:]) != 1 {
-		clear(p0Key[:])
+		wipePart0()
 		return nil, ErrRecipientMismatch
 	}
 
 	senderIDHex := hex.EncodeToString(senderIDRaw[:])
 	senderSignPK, err := lookupSender(senderIDHex)
 	if err != nil || len(senderSignPK) != ed25519.PublicKeySize {
-		clear(p0Key[:])
+		wipePart0()
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrUntrustedSender, err)
 		}
@@ -257,11 +277,11 @@ func Open0RTTHeader(
 
 	sigInput, err := BuildZeroRTTSigInput(clearHdr, senderIDRaw, recipIDRaw, createdAt, manifestSHA)
 	if err != nil {
-		clear(p0Key[:])
+		wipePart0()
 		return nil, err
 	}
 	if !ed25519.Verify(senderSignPK, sigInput[:], senderSig[:]) {
-		clear(p0Key[:])
+		wipePart0()
 		return nil, ErrInvalidSignature
 	}
 
@@ -299,6 +319,7 @@ func derive0RTTKeys(clearHdr, dh []byte) (hdrKey [32]byte, hdrNonce [12]byte, pa
 	if err != nil {
 		return
 	}
+	defer clear(hn)
 	pk, err := hkdfExpand(prk, []byte(info0RTTPart0Key), 32)
 	if err != nil {
 		return
@@ -309,6 +330,7 @@ func derive0RTTKeys(clearHdr, dh []byte) (hdrKey [32]byte, hdrNonce [12]byte, pa
 	if err != nil {
 		return
 	}
+	defer clear(pn)
 	copy(hdrKey[:], hk)
 	copy(hdrNonce[:], hn)
 	copy(part0Key[:], pk)
@@ -320,16 +342,20 @@ func derive0RTTKeys(clearHdr, dh []byte) (hdrKey [32]byte, hdrNonce [12]byte, pa
 // to prevent a malicious relay from forging Mode A direct completion acknowledgements.
 func ComputeDirectAckMAC(part0Key [32]byte, msgIDRaw [16]byte) [32]byte {
 	msg := make([]byte, len(prefixDirectAck)+MsgIDRawSize)
+	defer clear(msg)
 	copy(msg, prefixDirectAck)
 	copy(msg[len(prefixDirectAck):], msgIDRaw[:])
+	mac := computeHMACSHA256(part0Key[:], msg)
+	defer clear(mac)
 	var out [32]byte
-	copy(out[:], computeHMACSHA256(part0Key[:], msg))
+	copy(out[:], mac)
 	return out
 }
 
 // VerifyDirectAckMAC checks a Mode A direct_ack MAC in constant time.
 func VerifyDirectAckMAC(part0Key [32]byte, msgIDRaw [16]byte, got []byte) error {
 	expected := ComputeDirectAckMAC(part0Key, msgIDRaw)
+	defer clear(expected[:])
 	if len(got) != 32 || subtle.ConstantTimeCompare(expected[:], got) != 1 {
 		return ErrMACMismatch
 	}
