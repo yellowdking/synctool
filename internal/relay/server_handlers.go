@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
@@ -8,13 +9,51 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
+
+func (s *Server) serverVersion() string {
+	v := strings.TrimSpace(s.cfg.ServerVersion)
+	if v == "" || len(v) > 64 || !isValidClientHeader(v) {
+		return "dev"
+	}
+	return v
+}
+
+func (s *Server) featureList() []string {
+	feats := []string{
+		"pipe_v1",
+		"sse_events",
+		"long_poll",
+		"clock_skew_sync",
+		"mailbox_rebind_merge",
+	}
+	if s.spool.Enabled() {
+		feats = append(feats, "spool_v1")
+	}
+	return feats
+}
+
+func validateOptionalJSONObject(raw []byte) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return true
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(trimmed, &obj); err != nil || obj == nil {
+		return false
+	}
+	return true
+}
 
 func (s *Server) handlePing(w http.ResponseWriter, ac reqAuthContext) {
 	exp, rot := s.certs.Status(ac.now)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"proto_v":                 ProtoVersion,
+		"min_proto_v":             MinProtoVersion,
+		"max_proto_v":             MaxProtoVersion,
+		"server_version":          s.serverVersion(),
 		"server_ts":               ac.now.Unix(),
 		"profile":                 string(s.cfg.Preset.Name),
 		"spool_backend":           string(s.spool.Backend()),
@@ -59,6 +98,10 @@ func (s *Server) handleCaps(w http.ResponseWriter, ac reqAuthContext) {
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"proto_v":                      ProtoVersion,
+		"min_proto_v":                  MinProtoVersion,
+		"max_proto_v":                  MaxProtoVersion,
+		"server_version":               s.serverVersion(),
+		"features":                     s.featureList(),
 		"profile":                      string(p.Name),
 		"server_ts":                    ac.now.Unix(),
 		"cert_expires_at":              exp,
@@ -170,10 +213,12 @@ func (s *Server) handleRoomEvents(w http.ResponseWriter, r *http.Request, roomID
 			writeJSON(w, http.StatusOK, snap)
 			return
 		}
+		_ = ac.rc.SetWriteDeadline(time.Time{})
 		timer := time.NewTimer(time.Duration(waitSec) * time.Second)
 		defer timer.Stop()
 		select {
 		case <-ch:
+			_ = ac.rc.SetWriteDeadline(time.Now().Add(ControlDeadline))
 			snap, _, err = s.rooms.SnapshotAndWatch(roomID, ac.roomTok, since, s.cfg.NowFunc())
 			if err != nil {
 				writeHandlerError(w, err)
@@ -181,6 +226,7 @@ func (s *Server) handleRoomEvents(w http.ResponseWriter, r *http.Request, roomID
 			}
 			writeJSON(w, http.StatusOK, snap)
 		case <-timer.C:
+			_ = ac.rc.SetWriteDeadline(time.Now().Add(ControlDeadline))
 			writeJSON(w, http.StatusOK, snap)
 		case <-r.Context().Done():
 		}
@@ -196,43 +242,49 @@ func (s *Server) handleRoomEvents(w http.ResponseWriter, r *http.Request, roomID
 
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream; charset=utf-8")
-	h.Set("Cache-Control", "no-cache, no-transform")
+	h.Set("Cache-Control", "no-store, no-cache, no-transform")
+	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("X-Accel-Buffering", "no")
+	_ = ac.rc.SetWriteDeadline(time.Now().Add(ControlDeadline))
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 
 	lastSeq := since
-	emitSnapshot := func(sn RoomEventsSnapshot) (done bool) {
+	emitSnapshot := func(sn RoomEventsSnapshot) (done bool, writeErr bool) {
+		_ = ac.rc.SetWriteDeadline(time.Now().Add(ControlDeadline))
 		for _, m := range sn.Messages {
 			b, _ := json.Marshal(m)
-			fmt.Fprintf(w, "id: %d\nevent: message\ndata: %s\n\n", m.Seq, b)
+			if _, werr := fmt.Fprintf(w, "id: %d\nevent: message\ndata: %s\n\n", m.Seq, b); werr != nil {
+				return false, true
+			}
 			if m.Seq > lastSeq {
 				lastSeq = m.Seq
 			}
 		}
 		if sn.State == RoomBurned {
 			b, _ := json.Marshal(map[string]string{"reason": sn.Reason})
-			fmt.Fprintf(w, "event: burned\ndata: %s\n\n", b)
+			_, werr := fmt.Fprintf(w, "event: burned\ndata: %s\n\n", b)
 			if flusher != nil {
 				flusher.Flush()
 			}
-			return true
+			return true, werr != nil
 		}
 		if sn.State == RoomClosed {
 			b, _ := json.Marshal(map[string]string{"reason": sn.Reason})
-			fmt.Fprintf(w, "event: closed\ndata: %s\n\n", b)
+			_, werr := fmt.Fprintf(w, "event: closed\ndata: %s\n\n", b)
 			if flusher != nil {
 				flusher.Flush()
 			}
-			return true
+			return true, werr != nil
 		}
 		if flusher != nil {
 			flusher.Flush()
 		}
-		return false
+		_ = ac.rc.SetWriteDeadline(time.Time{})
+		return false, false
 	}
 
-	if emitSnapshot(snap) {
+	if done, werr := emitSnapshot(snap); done || werr {
 		return
 	}
 
@@ -246,22 +298,28 @@ func (s *Server) handleRoomEvents(w http.ResponseWriter, r *http.Request, roomID
 		case <-ch:
 			snap, ch, err = s.rooms.SnapshotAndWatch(roomID, ac.roomTok, lastSeq, s.cfg.NowFunc())
 			if err != nil {
-				fmt.Fprintf(w, "event: closed\ndata: {\"reason\":\"expired\"}\n\n")
+				_ = ac.rc.SetWriteDeadline(time.Now().Add(ControlDeadline))
+				_, _ = fmt.Fprintf(w, "event: closed\ndata: {\"reason\":\"expired\"}\n\n")
 				if flusher != nil {
 					flusher.Flush()
 				}
 				return
 			}
-			if emitSnapshot(snap) {
+			if done, werr := emitSnapshot(snap); done || werr {
 				return
 			}
 		case <-keepalive.C:
-			fmt.Fprint(w, ": ping\n\n")
+			_ = ac.rc.SetWriteDeadline(time.Now().Add(ControlDeadline))
+			if _, werr := fmt.Fprint(w, ": ping\n\n"); werr != nil {
+				return
+			}
 			if flusher != nil {
 				flusher.Flush()
 			}
+			_ = ac.rc.SetWriteDeadline(time.Time{})
 		case <-maxTimer.C:
-			fmt.Fprintf(w, "event: reconnect\ndata: {\"since\":%d}\n\n", lastSeq)
+			_ = ac.rc.SetWriteDeadline(time.Now().Add(ControlDeadline))
+			_, _ = fmt.Fprintf(w, "event: reconnect\ndata: {\"since\":%d}\n\n", lastSeq)
 			if flusher != nil {
 				flusher.Flush()
 			}
@@ -293,14 +351,17 @@ func (s *Server) handleRoomClose(w http.ResponseWriter, roomID string, ac reqAut
 
 func (s *Server) handlePipePut(w http.ResponseWriter, r *http.Request, rt matchedRoute, ac reqAuthContext) {
 	if rt.partID < 0 || rt.partID >= MaxPartsPerItem {
+		abortUnreadUploadBody(w, r, ac.rc)
 		writeAPIError(w, newAPIError(400, "ERR_BAD_REQUEST", "part_id must be in 0..63 and tx_idx valid uint32", false))
 		return
 	}
 	if r.ContentLength <= 0 {
+		abortUnreadUploadBody(w, r, ac.rc)
 		writeAPIError(w, newAPIError(400, "ERR_BAD_REQUEST", "Content-Length must be positive", false))
 		return
 	}
 	if r.ContentLength > s.cfg.Preset.MaxTransportChunkBytes {
+		abortUnreadUploadBody(w, r, ac.rc)
 		writeAPIError(w, &apiError{
 			Status:                 413,
 			Code:                   "ERR_CHUNK_TOO_LARGE",
@@ -312,11 +373,17 @@ func (s *Server) handlePipePut(w http.ResponseWriter, r *http.Request, rt matche
 	}
 	roomCtx, err := s.rooms.AuthorizePipe(rt.param1, ac.roomTok, true, ac.now)
 	if err != nil {
+		abortUnreadUploadBody(w, r, ac.rc)
 		writeHandlerError(w, err)
 		return
 	}
+	_ = ac.rc.SetWriteDeadline(time.Time{})
 	n, err := s.pipes.PutChunk(r.Context(), roomCtx, rt.param1, rt.partID, rt.txIdx, r.ContentLength, r.Body, ac.rc, ac.clientIP)
+	_ = ac.rc.SetWriteDeadline(time.Now().Add(ControlDeadline))
 	if err != nil {
+		if n < r.ContentLength {
+			abortUnreadUploadBody(w, r, ac.rc)
+		}
 		writeHandlerError(w, err)
 		return
 	}
@@ -338,10 +405,12 @@ func (s *Server) handlePipeGet(w http.ResponseWriter, r *http.Request, rt matche
 		writeHandlerError(w, err)
 		return
 	}
+	_ = ac.rc.SetWriteDeadline(time.Time{})
 	if err := s.pipes.GetChunk(r.Context(), roomCtx, rt.param1, rt.partID, rt.txIdx, w, ac.rc, ac.clientIP); err != nil {
-		// Only write error JSON if headers were not already written by streaming start.
+		// streamBridge only returns *apiError when response headers have NOT been written yet.
 		var ae *apiError
 		if errors.As(err, &ae) {
+			_ = ac.rc.SetWriteDeadline(time.Now().Add(ControlDeadline))
 			writeHandlerError(w, ae)
 		}
 	}
@@ -353,7 +422,8 @@ func (s *Server) handleMailboxPut(w http.ResponseWriter, mailboxID string, ac re
 		return
 	}
 	var req struct {
-		AuthPKB64 string `json:"auth_pk_b64"`
+		AuthPKB64     string              `json:"auth_pk_b64"`
+		DepositTokens []DepositTokenEntry `json:"deposit_tokens"`
 	}
 	if err := json.Unmarshal(ac.rawBody, &req); err != nil {
 		writeAPIError(w, newAPIError(400, "ERR_BAD_REQUEST", "invalid JSON body", false))
@@ -372,7 +442,7 @@ func (s *Server) handleMailboxPut(w http.ResponseWriter, mailboxID string, ac re
 		writeAPIError(w, newAPIError(401, "ERR_UNAUTHORIZED_TOKEN", "invalid X-Sync-Mailbox-Sig", false))
 		return
 	}
-	count, err := s.spool.RegisterMailbox(mailboxID, ed25519.PublicKey(pk))
+	count, err := s.spool.RegisterMailboxWithTokens(mailboxID, ed25519.PublicKey(pk), req.DepositTokens)
 	if err != nil {
 		writeHandlerError(w, err)
 		return
@@ -492,10 +562,12 @@ func (s *Server) handleMailboxEvents(w http.ResponseWriter, r *http.Request, mai
 			writeJSON(w, http.StatusOK, map[string]any{"items": items, "server_ts": s.cfg.NowFunc().Unix()})
 			return
 		}
+		_ = ac.rc.SetWriteDeadline(time.Time{})
 		timer := time.NewTimer(time.Duration(waitSec) * time.Second)
 		defer timer.Stop()
 		select {
 		case <-ch:
+			_ = ac.rc.SetWriteDeadline(time.Now().Add(ControlDeadline))
 			items, _, err = s.spool.SnapshotMailboxEvents(mailboxID, sinceTS, s.cfg.NowFunc())
 			if err != nil {
 				writeHandlerError(w, err)
@@ -503,6 +575,7 @@ func (s *Server) handleMailboxEvents(w http.ResponseWriter, r *http.Request, mai
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"items": items, "server_ts": s.cfg.NowFunc().Unix()})
 		case <-timer.C:
+			_ = ac.rc.SetWriteDeadline(time.Now().Add(ControlDeadline))
 			writeJSON(w, http.StatusOK, map[string]any{"items": []MailboxEventItem{}, "server_ts": s.cfg.NowFunc().Unix()})
 		case <-r.Context().Done():
 		}
@@ -517,13 +590,16 @@ func (s *Server) handleMailboxEvents(w http.ResponseWriter, r *http.Request, mai
 	}
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream; charset=utf-8")
-	h.Set("Cache-Control", "no-cache, no-transform")
+	h.Set("Cache-Control", "no-store, no-cache, no-transform")
+	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("X-Accel-Buffering", "no")
+	_ = ac.rc.SetWriteDeadline(time.Now().Add(ControlDeadline))
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 
 	seen := make(map[string]bool)
-	emitItems := func(list []MailboxEventItem) {
+	emitItems := func(list []MailboxEventItem) bool {
+		_ = ac.rc.SetWriteDeadline(time.Now().Add(ControlDeadline))
 		for _, it := range list {
 			if seen[it.ItemID] {
 				continue
@@ -533,14 +609,20 @@ func (s *Server) handleMailboxEvents(w http.ResponseWriter, r *http.Request, mai
 				sinceTS = it.CreatedAt
 			}
 			b, _ := json.Marshal(it)
-			fmt.Fprintf(w, "event: new_item\ndata: %s\n\n", b)
+			if _, werr := fmt.Fprintf(w, "event: new_item\ndata: %s\n\n", b); werr != nil {
+				return true
+			}
 		}
 		if flusher != nil {
 			flusher.Flush()
 		}
+		_ = ac.rc.SetWriteDeadline(time.Time{})
+		return false
 	}
 
-	emitItems(items)
+	if emitItems(items) {
+		return
+	}
 
 	keepalive := time.NewTicker(s.cfg.SSEKeepaliveInterval)
 	defer keepalive.Stop()
@@ -554,14 +636,21 @@ func (s *Server) handleMailboxEvents(w http.ResponseWriter, r *http.Request, mai
 			if err != nil {
 				return
 			}
-			emitItems(items)
+			if emitItems(items) {
+				return
+			}
 		case <-keepalive.C:
-			fmt.Fprint(w, ": ping\n\n")
+			_ = ac.rc.SetWriteDeadline(time.Now().Add(ControlDeadline))
+			if _, werr := fmt.Fprint(w, ": ping\n\n"); werr != nil {
+				return
+			}
 			if flusher != nil {
 				flusher.Flush()
 			}
+			_ = ac.rc.SetWriteDeadline(time.Time{})
 		case <-maxTimer.C:
-			fmt.Fprintf(w, "event: reconnect\ndata: {\"since_ts\":%d}\n\n", sinceTS)
+			_ = ac.rc.SetWriteDeadline(time.Now().Add(ControlDeadline))
+			_, _ = fmt.Fprintf(w, "event: reconnect\ndata: {\"since_ts\":%d}\n\n", sinceTS)
 			if flusher != nil {
 				flusher.Flush()
 			}
@@ -588,19 +677,31 @@ func (s *Server) handleSpoolInit(w http.ResponseWriter, ac reqAuthContext) {
 
 func (s *Server) handleSpoolPutChunk(w http.ResponseWriter, r *http.Request, rt matchedRoute, ac reqAuthContext) {
 	if rt.partID < 0 || rt.partID >= MaxPartsPerItem {
+		abortUnreadUploadBody(w, r, ac.rc)
 		writeAPIError(w, newAPIError(400, "ERR_BAD_REQUEST", "part_id must be in 0..63 and tx_idx valid uint32", false))
+		return
+	}
+	if err := s.spool.PrecheckPutChunk(rt.param1, ac.uploadTok, rt.partID, rt.txIdx, r.ContentLength, ac.now); err != nil {
+		abortUnreadUploadBody(w, r, ac.rc)
+		writeHandlerError(w, err)
 		return
 	}
 	release, ok := s.gate.Acquire(r.Context(), ac.clientIP, TransferSemWait)
 	if !ok {
+		abortUnreadUploadBody(w, r, ac.rc)
 		w.Header().Set("Retry-After", "5")
 		writeAPIError(w, newAPIError(429, "ERR_RATE_LIMITED", "concurrent transfer stream limit reached", true))
 		return
 	}
 	defer release()
 
+	_ = ac.rc.SetWriteDeadline(time.Time{})
 	n, err := s.spool.PutChunk(r.Context(), rt.param1, ac.uploadTok, rt.partID, rt.txIdx, r.ContentLength, r.Body, ac.rc, ac.now)
+	_ = ac.rc.SetWriteDeadline(time.Now().Add(ControlDeadline))
 	if err != nil {
+		if n < r.ContentLength {
+			abortUnreadUploadBody(w, r, ac.rc)
+		}
 		writeHandlerError(w, err)
 		return
 	}
@@ -613,6 +714,10 @@ func (s *Server) handleSpoolPutChunk(w http.ResponseWriter, r *http.Request, rt 
 }
 
 func (s *Server) handleSpoolCommit(w http.ResponseWriter, itemID string, ac reqAuthContext) {
+	if !validateOptionalJSONObject(ac.rawBody) {
+		writeAPIError(w, newAPIError(400, "ERR_BAD_REQUEST", "invalid JSON body", false))
+		return
+	}
 	exp, err := s.spool.Commit(itemID, ac.uploadTok, ac.now)
 	if err != nil {
 		writeHandlerError(w, err)
@@ -658,12 +763,21 @@ func (s *Server) handleSpoolGetChunk(w http.ResponseWriter, r *http.Request, rt 
 	}
 	defer release()
 
-	if err := s.spool.ServeChunk(w, r, rt.param1, rt.partID, rt.txIdx, ac.now); err != nil {
-		writeHandlerError(w, err)
+	_ = ac.rc.SetWriteDeadline(time.Time{})
+	if err := s.spool.ServeChunk(w, r, ac.rc, rt.param1, rt.partID, rt.txIdx, ac.now); err != nil {
+		var ae *apiError
+		if errors.As(err, &ae) {
+			_ = ac.rc.SetWriteDeadline(time.Now().Add(ControlDeadline))
+			writeHandlerError(w, ae)
+		}
 	}
 }
 
 func (s *Server) handleSpoolAck(w http.ResponseWriter, itemID string, ac reqAuthContext) {
+	if !validateOptionalJSONObject(ac.rawBody) {
+		writeAPIError(w, newAPIError(400, "ERR_BAD_REQUEST", "invalid JSON body", false))
+		return
+	}
 	mbID, authPK, err := s.spool.ResolveItemOwner(itemID, ac.now)
 	if err != nil {
 		writeHandlerError(w, err)
