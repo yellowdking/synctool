@@ -53,12 +53,12 @@ type Room struct {
 	ExpiresAt      time.Time
 	TombstoneUntil time.Time
 
-	Seq            int
-	HandshakeMsgs  []storedRoomMsg
-	ControlMsgs    []storedRoomMsg
-	NotifyCh       chan struct{}
-	PipeCtx        context.Context
-	PipeCancel     context.CancelFunc
+	Seq           int
+	HandshakeMsgs []storedRoomMsg
+	ControlMsgs   []storedRoomMsg
+	NotifyCh      chan struct{}
+	PipeCtx       context.Context
+	PipeCancel    context.CancelFunc
 }
 
 type RoomCreateResult struct {
