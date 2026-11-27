@@ -37,8 +37,15 @@ import {
   sendToDeviceImpl,
   watchInboxImpl,
 } from './client_spool.js';
+import {
+  createClientFromEnv,
+  receiveFromRoomImpl,
+  resolveDeviceCard,
+  sendTextImpl,
+  syncMailboxImpl,
+} from './client_heal.js';
 
-export { StreamingSha256, blobFromWebBlob, blobFromSliceReader, blobFromBytes };
+export { StreamingSha256, blobFromWebBlob, blobFromSliceReader, blobFromBytes, resolveDeviceCard };
 
 const CLIENT_UA = 'synctool-ts/1.0';
 
@@ -91,6 +98,10 @@ export class SyncClient {
     this._mailboxIdentityPromise = null;
   }
 
+  static fromEnv(overrides = {}) {
+    return createClientFromEnv(SyncClient, overrides);
+  }
+
   async getRelayId() {
     if (!this._relayIdPromise) {
       this._relayIdPromise = deriveRelayId(this.relay.origin);
@@ -132,7 +143,13 @@ export class SyncClient {
       } catch (err) {
         if (err instanceof SyncError) throw err;
         if (init.signal?.aborted) throw new SyncError(ErrorCode.ERR_CANCELLED, 'request aborted', { cause: err });
-        throw new SyncError(ErrorCode.ERR_RELAY_UNREACHABLE, `fetch failed: ${err.message}`, { retryable: true, cause: err });
+        const errDesc = `${err?.message || ''} ${err?.cause?.message || ''}`;
+        const isRedirectBlock = init.redirect === 'error' && /redirect/i.test(errDesc);
+        throw new SyncError(
+          ErrorCode.ERR_RELAY_UNREACHABLE,
+          isRedirectBlock ? 'relay HTTP redirect blocked for credential safety' : `fetch failed: ${err.message}`,
+          { retryable: !isRedirectBlock, cause: err },
+        );
       }
     }
     if (this.relay.tlsMode === 'spki_pin' && this.relay.spkiPin) {
@@ -148,7 +165,13 @@ export class SyncClient {
       return await globalThis.fetch(url, init);
     } catch (err) {
       if (init.signal?.aborted) throw new SyncError(ErrorCode.ERR_CANCELLED, 'request aborted', { cause: err });
-      throw new SyncError(ErrorCode.ERR_RELAY_UNREACHABLE, `relay unreachable: ${err.message}`, { retryable: true, cause: err });
+      const errDesc = `${err?.message || ''} ${err?.cause?.message || ''}`;
+      const isRedirectBlock = init.redirect === 'error' && /redirect/i.test(errDesc);
+      throw new SyncError(
+        ErrorCode.ERR_RELAY_UNREACHABLE,
+        isRedirectBlock ? 'relay HTTP redirect blocked for credential safety' : `relay unreachable: ${err.message}`,
+        { retryable: !isRedirectBlock, cause: err },
+      );
     }
   }
 
@@ -220,11 +243,18 @@ export class SyncClient {
       method,
       headers,
       body: bodyBytes && bodyBytes.byteLength > 0 ? bodyBytes : undefined,
+      redirect: 'error',
       signal: opts.signal,
     });
 
     if (res.status >= 200 && res.status < 300) {
       return res;
+    }
+    if (res.status >= 300 && res.status < 400) {
+      throw new SyncError(ErrorCode.ERR_RELAY_UNREACHABLE, 'relay HTTP redirect blocked for credential and SPKI pin safety', {
+        retryable: false,
+        httpStatus: res.status,
+      });
     }
 
     // Parse error response
@@ -306,16 +336,11 @@ export class SyncClient {
   }
 
   async registerMailbox(opts = {}) {
-    const mb = await this.getMailboxIdentity();
-    const res = await this._signedRequest({
-      method: 'PUT',
-      path: `/v1/mailboxes/${mb.mailboxId}`,
-      jsonBody: { auth_pk_b64: bytesToB64u(mb.mailboxAuthPk) },
-      signMailbox: true,
-      mailboxId: mb.mailboxId,
-      signal: opts.signal,
-    });
-    return res.json();
+    return syncMailboxImpl(this, { ...opts, throwOnDisabled: true });
+  }
+
+  async syncMailbox(opts = {}) {
+    return syncMailboxImpl(this, opts);
   }
 
   // --------------------------------------------------------------------------
@@ -342,8 +367,16 @@ export class SyncClient {
     return sendToDeviceImpl(this, targetDeviceId, parcel, opts);
   }
 
+  sendText(targetDeviceOrLabel, text, opts = {}) {
+    return sendTextImpl(this, targetDeviceOrLabel, text, opts);
+  }
+
   receiveDirect(pairInput, handler, opts = {}) {
     return receiveDirectImpl(this, pairInput, handler, opts);
+  }
+
+  receiveFromRoom(pairInput, handler, opts = {}) {
+    return receiveFromRoomImpl(this, pairInput, handler, opts);
   }
 
   listInbox(opts = {}) {
