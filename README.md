@@ -147,7 +147,7 @@ synctool device revoke <lost_device_id>
 ```
 > 所有子命令支持 `--json`（`stdout` 纯 JSON/NDJSON 进度与结果，`stderr` 人类提示与 QR），任何 Python / Shell / AutoHotkey / Raycast 工具均可 5 分钟子进程接入。
 
-### 2. Go SDK 嵌入示例（不到 20 行组装任意桌面/后端应用）
+### 2. Go SDK 嵌入示例（不到 25 行组装任意桌面/后端应用）
 
 ```go
 package main
@@ -158,8 +158,15 @@ import (
     "github.com/yellowdking/synctool/sdk/go/envelope"
 )
 
-func pushNote(ctx context.Context, cli *client.Client, targetDeviceID string) error {
-    // 1. 构造通用密文包裹（大附件强制走文件路径/流，杜绝手机或电脑 OOM）
+func pushNote(ctx context.Context, targetDeviceID string) error {
+    // 1. 从环境变量 SYNCTOOL_RELAY + SYNCTOOL_CONFIG 一键加载客户端（避免命令行暴露 #k=）
+    cli, err := client.NewFromEnv(client.Config{AppID: "com.yellowdking.notes"})
+    if err != nil {
+        return err
+    }
+    defer cli.Close()
+
+    // 2. 构造通用密文包裹（大附件强制走文件路径/流，杜绝手机或电脑 OOM）
     parcel := envelope.Parcel{
         AppID:         "com.yellowdking.notes",
         Schema:        "note.item.v1",
@@ -169,8 +176,8 @@ func pushNote(ctx context.Context, cli *client.Client, targetDeviceID string) er
             envelope.BlobFromFile("video", "./clip.mp4", "video/mp4"),
         },
     }
-    // 2. 一键定向加密推送（0-RTT Sealed Sender + 64KiB STREAM AEAD 分片）
-    _, err := cli.SendToDevice(ctx, targetDeviceID, parcel, client.WithDeliveryMode(client.DeliveryAuto))
+    // 3. 一键定向加密推送（0-RTT Sealed Sender + 64KiB STREAM AEAD 分片）
+    _, err = cli.SendToDevice(ctx, targetDeviceID, parcel, client.WithDeliveryMode(client.DeliveryAuto))
     return err
 }
 ```
@@ -178,29 +185,46 @@ func pushNote(ctx context.Context, cli *client.Client, targetDeviceID string) er
 ### 3. TypeScript / JavaScript SDK（零依赖 WebCrypto，通吃浏览器 / Node / Electron / Tauri）
 
 ```js
-import { SyncClient, MemoryKeyStore, parseRelayURI, blobFromBytes } from './sdk/ts/src/index.js';
+import { SyncClient, NodeFileKeyStore, parseRelayURI, suggestPipeMode } from './sdk/ts/src/index.js';
 
-const store = new MemoryKeyStore();
-const relay = parseRelayURI('synctool://relay?v=1&u=https%3A%2F%2Fsync.example.com%3A443#k=...');
+// Node / Electron 本地持久化使用 NodeFileKeyStore（0700 目录 + 0600 原子重命名）；浏览器可用 IndexedDB 适配 KeyStore 接口
+const store = new NodeFileKeyStore('./.synctool-state');
+const relay = parseRelayURI(process.env.SYNCTOOL_RELAY);
 const cli = new SyncClient({
   relay,
   keyStore: store,
   appId: 'com.yellowdking.clipboard',
-  label: 'Web 轻量端',
-  platform: 'web',
+  label: '桌面轻量端',
 });
 
-// 拉取并解密所有待收包裹 Manifest 预览（本地按 item_id 缓存，不重复消耗下载配额）
+// 拉取并解密所有待收包裹 Manifest 预览（本地按 item_id 缓存；nano 内存信箱重启后自动无感自愈！）
 const previews = await cli.listInbox({ appId: 'com.yellowdking.clipboard' });
 
 // 按需下载具体包裹附件，校验全部 SHA-256 落盘后自动发送签名 ACK 焚毁中继副本
 for (const item of previews) {
   await cli.fetchParcel(item.item_id, async ({ manifest, blobs }) => {
-    console.log('收到加密消息:', manifest.inline_payload, blobs.length);
+    console.log('收到加密消息:', manifest.inline_payload, blobs.map((b) => b.safeName));
   });
 }
 ```
-> 无需 `npm install` 即可直接运行测试：`cd sdk/ts && node --test test/*.test.mjs`。
+> 无需 `npm install` 即可直接运行测试：`cd sdk/ts && node --test test/*.test.mjs`。更多可直接复制运行的最小模板见 [`examples/`](./examples/)（含 `go-minimal`、`ts-minimal` 与任意语言通用的 `cli-subprocess` NDJSON 示例）。
+
+---
+
+## 下游应用接入与平滑升级契约（v1.x 长期免维护指南）
+
+为确保跨端记事本、GravitySSH 及各类简易传输小工具接入后**默认安全且随 `synctool` 升级零改造**：
+
+1. **命名空间与业务演进解耦**：每个应用使用独立 `app_id`（如 `com.yellowdking.notes`）并在 `schema` 中携带业务版本号（如 `note.item.v1`）。中继与传输层对业务内容完全无知，中继升级永远不影响业务载荷。
+2. **前向兼容铁律（忽略未知字段 + 明确版本边界）**：
+   - 当中继或对端升级至 `v1.1+` 在 `Manifest`、`/v1/caps`、`DeviceCard` 或 SSE 事件中新增可选扩展字段时，旧版 Go/TS SDK **100% 自动忽略未知字段，绝不崩溃或破坏 `SealedHeader` 签名缓存**。
+   - 仅当未来遇到不兼容更高主版本（如 `envelope_version > 1`、URI `v > 1`、握手 `proto_v > 1`）时，SDK 稳定返回 `ERR_UNSUPPORTED_VERSION`，应用仅需用 `envelope.IsVersionMismatch(err)` / `isVersionMismatch(err)` 提示用户更新客户端。
+3. **稳定错误分类器（告别硬编码 `switch code`）**：Go 与 TS SDK 双端同步提供 `IsRetryable`、`IsQuotaExceeded`、`SuggestPipeMode`、`IsAuthError`、`IsSecurityAlert`、`IsVersionMismatch`。下游程序只需按分类器分支（例如 `SuggestPipeMode(err) == true` 时引导切换双方在线 Mode A 直传），SDK 内部细分错误码演进时下游零改动。
+4. **`nano` 内存暂存重启全自动自愈（Self-Healing）**：当 256MB 小鸡（`spool=memory`）重启清空内存信箱后，已绑定接收端调用 `ListInbox` / `FetchParcel` / `WatchInbox` 遇到 `404 ERR_NOT_FOUND` 时，SDK 会**自动幂等重注册盲化信箱并恢复本地 `DeviceCard` 中记录的所有未吊销对端 `deposit_token` 哈希**，无需用户重新扫码配对。
+5. **端侧默认防坑保护**：
+   - **禁 HTTP 重定向**：双端 SDK 强制阻断所有 `3xx` 重定向，杜绝恶意网关诱导泄露 `X-Sync-*` 鉴权头或绕过 SPKI Pinning；
+   - **安全落盘与文件名清洗**：`SanitizeFilename` / `sanitizeFileName` 默认拦截路径穿越、控制符、RLO 扩展名伪装及 Windows 保留设备名（`CON`/`NUL`/`COM1` 等），Go SDK 提供 `ReceivedBlob.SaveToDir`（防软链、`0600` 独占原子落盘）；
+   - **自动凭据脱敏**：推荐使用 `SYNCTOOL_RELAY` / `SYNCTOOL_PAIR_URI` 环境变量或 `--stdin` 传递含密 URI；`SyncError` 自动剥离脱敏任何意外混入错误信息的 `#k=` / `#s=` 机密片段。
 
 ---
 
@@ -208,11 +232,12 @@ for (const item of previews) {
 
 - `spec/CRYPTO_AND_AUTH.md` —— 冻结 `v1` 密码套件、单种子 HKDF、流 1/流 2 帧格式、STREAM AEAD 与请求签名规范
 - `spec/PROTOCOL.md` —— 冻结中继 16 个 HTTP/SSE 端点、7 步鉴权流水线、三档 VPS 预设与部署规范
-- `spec/ENVELOPE_AND_SDK.md` —— 冻结通用密文信封 Schema、统一 `synctool://` URI、34 项错误码与 SDK/CLI 契约
+- `spec/ENVELOPE_AND_SDK.md` —— 冻结通用密文信封 Schema、统一 `synctool://` URI、35 项错误码与 SDK/CLI 契约
 - `spec/test-vectors/` —— 7 份跨语言黄金测试向量（Go 生成 + TS 交叉逐字节校验）
 - `internal/relay/` & `cmd/synctool-relay/` —— 纯 Go 零依赖中继服务端
 - `sdk/go/` & `cmd/synctool/` —— 纯 Go 标准库参考 SDK 与万能 CLI
 - `sdk/ts/` —— 零第三方依赖 WebCrypto ESM SDK + `.d.ts` 类型声明
+- `examples/` —— Go / Node WebCrypto / 跨语言 CLI `--json` 最小可运行接入模板
 - `deploy/` —— Docker `scratch` 镜像、Caddy HTTPS 反代配置与 256MB 小鸡 `systemd` 脚本
 - `e2e/` —— Go ↔ TS 真实中继跨语言端到端集成测试
 
