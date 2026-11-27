@@ -209,9 +209,26 @@ func GenerateSelfSignedCert(publicHosts string, now time.Time, certPath, keyPath
 }
 
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, perm); err != nil {
+	var rnd [8]byte
+	_, _ = rand.Read(rnd[:])
+	tmp := fmt.Sprintf("%s.%x.tmp", path, rnd[:])
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
+	if err != nil {
 		return err
+	}
+	_ = f.Chmod(perm)
+	_, werr := f.Write(data)
+	serr := f.Sync()
+	cerr := f.Close()
+	if werr != nil || serr != nil || cerr != nil {
+		_ = os.Remove(tmp)
+		if werr != nil {
+			return werr
+		}
+		if serr != nil {
+			return serr
+		}
+		return cerr
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)

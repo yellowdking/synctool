@@ -179,6 +179,22 @@ func isValidClientHeader(s string) bool {
 	return true
 }
 
+func isValidAuthHeaderToken(s string) bool {
+	if s == "" {
+		return true
+	}
+	if len(s) > MaxAuthHeaderBytes {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x21 || c > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
 func isValidRoomID(s string) bool {
 	if len(s) != 8 {
 		return false
