@@ -95,9 +95,14 @@ func (r *HandshakeResult) Zero() {
 	clear(r.ConfirmKeyB[:])
 }
 
-// GenerateEphemeralX25519 creates a fresh ephemeral X25519 keypair.
+// GenerateEphemeralX25519 creates a fresh ephemeral X25519 keypair and wipes the raw seed buffer.
 func GenerateEphemeralX25519() (*ecdh.PrivateKey, error) {
-	return ecdh.X25519().GenerateKey(rand.Reader)
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return nil, err
+	}
+	defer clear(raw[:])
+	return ecdh.X25519().NewPrivateKey(raw[:])
 }
 
 // GenerateRandomBytes fills a newly allocated slice of n CSPRNG bytes.
@@ -280,6 +285,7 @@ func DeriveSASSession(
 		res.Zero()
 		return nil, err
 	}
+	defer clear(sasBytes)
 	copy(res.SASBytes[:], sasBytes)
 	res.SASInt = binary.BigEndian.Uint32(sasBytes) % 1_000_000
 	res.SASStr = fmt.Sprintf("%06d", res.SASInt)
@@ -309,8 +315,12 @@ func fillSessionAndConfirm(res *HandshakeResult, prk, th []byte) error {
 	clear(ckA)
 	clear(ckB)
 
-	copy(res.MacA[:], computeHMACSHA256(res.ConfirmKeyA[:], th))
-	copy(res.MacB[:], computeHMACSHA256(res.ConfirmKeyB[:], th))
+	macA := computeHMACSHA256(res.ConfirmKeyA[:], th)
+	macB := computeHMACSHA256(res.ConfirmKeyB[:], th)
+	copy(res.MacA[:], macA)
+	copy(res.MacB[:], macB)
+	clear(macA)
+	clear(macB)
 	return nil
 }
 
@@ -376,6 +386,7 @@ func DeriveOneshotPart0Keys(sessionKey, msgID []byte) ([32]byte, [7]byte, error)
 	if err != nil {
 		return key, np, err
 	}
+	defer clear(n)
 	copy(key[:], k)
 	copy(np[:], n)
 	return key, np, nil
@@ -404,9 +415,26 @@ func DerivePipeCtrlKeys(th, sessionKey []byte) ([32]byte, [7]byte, error) {
 	if err != nil {
 		return key, np, err
 	}
+	defer clear(n)
 	copy(key[:], k)
 	copy(np[:], n)
 	return key, np, nil
+}
+
+// ValidatePipeCtrlSeq enforces CRYPTO_AND_AUTH.md §4.3 role parity (even 0,2,4... for initiator/sender;
+// odd 1,3,5... for responder/receiver) and strict monotonicity (ctrlSeq > lastSeenSeq; pass -1 initially).
+func ValidatePipeCtrlSeq(ctrlSeq uint32, fromInitiator bool, lastSeenSeq int64) error {
+	wantParity := uint32(1)
+	if fromInitiator {
+		wantParity = 0
+	}
+	if (ctrlSeq & 1) != wantParity {
+		return ErrInvalidCtrlSeq
+	}
+	if int64(ctrlSeq) <= lastSeenSeq {
+		return ErrInvalidCtrlSeq
+	}
+	return nil
 }
 
 // BuildPipeCtrlAAD builds the exact 57-byte AAD:
@@ -430,6 +458,7 @@ func SealPipeCtrl(ctrlKey [32]byte, ctrlNP [7]byte, th []byte, ctrlSeq uint32, p
 		return nil, err
 	}
 	var nonce [12]byte
+	defer clear(nonce[:])
 	copy(nonce[:7], ctrlNP[:])
 	binary.BigEndian.PutUint32(nonce[7:11], ctrlSeq)
 	nonce[11] = 0x00
@@ -444,11 +473,20 @@ func OpenPipeCtrl(ctrlKey [32]byte, ctrlNP [7]byte, th []byte, ctrlSeq uint32, c
 		return nil, err
 	}
 	var nonce [12]byte
+	defer clear(nonce[:])
 	copy(nonce[:7], ctrlNP[:])
 	binary.BigEndian.PutUint32(nonce[7:11], ctrlSeq)
 	nonce[11] = 0x00
 
 	return aesGCMOpen(ctrlKey[:], nonce[:], ciphertext, aad[:])
+}
+
+// OpenPipeCtrlVerified validates ctrl_seq parity and monotonicity before AEAD decryption.
+func OpenPipeCtrlVerified(ctrlKey [32]byte, ctrlNP [7]byte, th []byte, ctrlSeq uint32, fromInitiator bool, lastSeenSeq int64, ciphertext []byte) ([]byte, error) {
+	if err := ValidatePipeCtrlSeq(ctrlSeq, fromInitiator, lastSeenSeq); err != nil {
+		return nil, err
+	}
+	return OpenPipeCtrl(ctrlKey, ctrlNP, th, ctrlSeq, ciphertext)
 }
 
 // DerivePairBindNonces derives the 12-byte AES-GCM nonces for PairBindPayload exchange (a & b).
@@ -461,10 +499,12 @@ func DerivePairBindNonces(prk []byte) ([12]byte, [12]byte, error) {
 	if err != nil {
 		return na, nb, err
 	}
+	defer clear(a)
 	b, err := hkdfExpand(prk, []byte(infoPairNonceB), 12)
 	if err != nil {
 		return na, nb, err
 	}
+	defer clear(b)
 	copy(na[:], a)
 	copy(nb[:], b)
 	return na, nb, nil
@@ -479,7 +519,10 @@ func SealPairBind(sessionKey [32]byte, prk, th []byte, isInitiator bool, plainte
 	if err != nil {
 		return nil, err
 	}
+	defer clear(na[:])
+	defer clear(nb[:])
 	var nonce [12]byte
+	defer clear(nonce[:])
 	var aad []byte
 	if isInitiator {
 		nonce = na
@@ -500,7 +543,10 @@ func OpenPairBind(sessionKey [32]byte, prk, th []byte, fromInitiator bool, ciphe
 	if err != nil {
 		return nil, err
 	}
+	defer clear(na[:])
+	defer clear(nb[:])
 	var nonce [12]byte
+	defer clear(nonce[:])
 	var aad []byte
 	if fromInitiator {
 		nonce = na
