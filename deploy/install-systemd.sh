@@ -76,6 +76,16 @@ set +a
 chown -R synctool:synctool "$STATE_DIR"
 chmod 0700 "$STATE_DIR"
 
+# 按宿主机物理内存自适应默认 systemd MemoryMax（与 auto 档位对齐，防 standard/media 误触发 OOM）
+MEM_KB="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 524288)"
+DEFAULT_MEM_MAX="64M"
+if [ "${MEM_KB:-0}" -ge 2097152 ]; then
+  DEFAULT_MEM_MAX="512M"
+elif [ "${MEM_KB:-0}" -ge 786432 ]; then
+  DEFAULT_MEM_MAX="224M"
+fi
+SYSTEMD_MEM_MAX="${SYNCTOOL_MEMORY_MAX:-$DEFAULT_MEM_MAX}"
+
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=synctool zero-trust on-demand encrypted sync relay
@@ -92,8 +102,8 @@ ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=3s
 
-# 低配 256MB 小鸡硬保护与最小权限隔离
-MemoryMax=64M
+# 自适应内存上限（256MB/512MB 小鸡默认 64M）与最小权限隔离
+MemoryMax=${SYSTEMD_MEM_MAX}
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict

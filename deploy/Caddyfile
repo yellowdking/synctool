@@ -6,5 +6,7 @@
 		# Disable response buffering so Mode A chunk streams and SSE deliver immediately.
 		flush_interval -1
 		header_up X-Forwarded-For {remote_host}
+		header_up -CF-Connecting-IP
+		header_up -X-Real-IP
 	}
 }
