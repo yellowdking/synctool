@@ -1,0 +1,37 @@
+{
+  "e_a_pk_hex": "392d174a38b3b1beafaf1fe824870841c5fa531bc6eafdb6402c124664488c1c",
+  "e_a_sk_hex": "505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f",
+  "e_b_pk_hex": "23b7bb8c91ae008711fb12846780bcdf1e065f821bdfec49f57e7c7dcd4c4823",
+  "e_b_sk_hex": "707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f",
+  "expected": {
+    "commit_a_b64u": "EZswNKfAmHvuCWpm6h71IUuJOVqvZHYSEYk30xEYBWY",
+    "commit_a_hex": "119b3034a7c0987bee096a66ea1ef5214b89395aaf647612118937d311180566",
+    "confirm_key_a_hex": "c97942c18604ba8ec117145484c1905a26c11594dd1bbe16ffea0eacb0ab5118",
+    "confirm_key_b_hex": "d51d9502f24e319d5215abee62f817f4fe98f4147d564132833a1399be621b1e",
+    "mac_a_b64u": "zK0Y5p65L6TCGiIYJ5JKi1V7-ZbBkTYOkvZJ-F2uYt4",
+    "mac_b_b64u": "kg8joRwZ32mQak1uAn6_LCRe0m7dcR6fzTkUEJ1yvrw",
+    "pipe_ctrl_key_hex": "00d6a766c39e156757ece4097b2d7ea55fc4b25d5e3d469cec40261f2b37676a",
+    "pipe_ctrl_np_hex": "72b7eee1071c97",
+    "pipe_ctrl_seq0_ct_b64u": "LMzPD2QB_TmlFwegd__3V_7YvwGD5TXpfU3-q7jJe6RxVrzHAH4wY6hsQka_u8xHzjARO8BI7QSno4P99DZ3pnbqsdMpzRQMmE_XnVEEK94bonnRrFty2ljF8xiBC4isd7einFPJBWivaDaEVfzluRQJfSqxMjiUAXcCPwSinkZep8QOEtKwKW40KCsPVNDLrD-kORjHAg7u7_9SuOJs",
+    "pipe_ctrl_seq0_pt_utf8": "{\"op\":\"pipe_start\",\"msg_id\":\"00112233445566778899aabbccddeeff\",\"blocks_per_chunk\":4,\"parts\":[{\"part_id\":0,\"total_bytes\":4112,\"chunk_count\":1}]}",
+    "prk_hex": "349040bc91c7ea77c28208f2584f885ee57b9ae177a3a4d1d43e4426ac1a0169",
+    "sas_bytes_hex": "ac1426cf",
+    "sas_int": 1807,
+    "sas_str": "001807",
+    "session_key_hex": "57180fbac56b4c0f704430d982525c421e3c2797b5c26659fc94761cffa83e83",
+    "shared_hex": "006c14a7f1faeb7d6a36a8bfa03008a8e09a98639dea63b71b325b11fe38cb0f",
+    "th_hex": "25ad168fe782ea9e003d0ef1a7985b0290e2521537db97913b884d1e014fe10e",
+    "transcript_2_hex": "73796e63746f6f6c2d76312f68732d736173023946325734433848119b3034a7c0987bee096a66ea1ef5214b89395aaf647612118937d311180566392d174a38b3b1beafaf1fe824870841c5fa531bc6eafdb6402c124664488c1c005c5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b23b7bb8c91ae008711fb12846780bcdf1e065f821bdfec49f57e7c7dcd4c4823d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeef"
+  },
+  "mode": 2,
+  "n_a_hex": "005c5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b",
+  "n_b_hex": "d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeef",
+  "negative_cases": {
+    "tampered_e_a_pk_hex": "b92d174a38b3b1beafaf1fe824870841c5fa531bc6eafdb6402c124664488c1c"
+  },
+  "proto_v": 1,
+  "purpose": "pair",
+  "purpose_code": 2,
+  "room_id": "9F2W4C8H",
+  "vector": "04_handshake_commit_sas"
+}

@@ -1,0 +1,31 @@
+{
+  "created_at": 1764246000,
+  "ephemeral_pk_hex": "5869aff450549732cbaaed5e5df9b30a6da31cb0e5742bad5ad4a1a768f1a67b",
+  "ephemeral_sk_hex": "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40",
+  "expected": {
+    "clear_header_hex": "53543031020000009f86d081884c7d659a2feaa0c55ad0155869aff450549732cbaaed5e5df9b30a6da31cb0e5742bad5ad4a1a768f1a67b",
+    "direct_ack_mac_b64u": "zBt3w0u7VfM3Slwusz7MHB7SPyNEVK3WjS8GlY0i1BU",
+    "part0_key_hex": "b7e82df3372471827a8ce70e9e1f8800df5f17f56759d507db87ab318f8e0007",
+    "part0_nonce_prefix_hex": "e9210018e76aa5",
+    "recipient_device_id": "da0d1c8f217fb1d0eabaa3ad180c5860",
+    "recipient_kem_pk_b64u": "ynM5FkzXbSLMSzRlOJ9yt2vt-RIpCGtWP_pAe7syNg4",
+    "sealed_header_b64u": "U1QwMQIAAACfhtCBiEx9ZZov6qDFWtAVWGmv9FBUlzLLqu1eXfmzCm2jHLDldCutWtShp2jxpnt_249yyS7Fgz4YsAHP6vTOdYURtmDHp5YuKKzi8lOOib8Z5uC6nQ8H9mYrupg1r65smi3ChCz22PO8A0dRL99HBQu8qOXZkeJxkPZsjmDp5ea8a78OVpreN4mwbSIXa7dxpOaST5Rlnqs4kbxUboILtDwAbvBqXTOi4h9awDoI4cGXxwUkJxm8wmyDTA-E7BTwhRVg2iPXjw",
+    "sealed_header_hex": "53543031020000009f86d081884c7d659a2feaa0c55ad0155869aff450549732cbaaed5e5df9b30a6da31cb0e5742bad5ad4a1a768f1a67b7fdb8f72c92ec5833e18b001cfeaf4ce758511b660c7a7962e28ace2f2538e89bf19e6e0ba9d0f07f6662bba9835afae6c9a2dc2842cf6d8f3bc0347512fdf47050bbca8e5d991e27190f66c8e60e9e5e6bc6bbf0e569ade3789b06d22176bb771a4e6924f94659eab3891bc546e820bb43c006ef06a5d33a2e21f5ac03a08e1c197c705242719bcc26c834c0f84ec14f0851560da23d78f",
+    "sender_device_id": "e09fc64072cd3e37d1d37208e75866e2",
+    "sender_sig_b64u": "S62hQ9spHOWzBkN-LFPlPkJnSwW877UOYDtc1OKMiuIjDSagWjpvO6vKAZ9yFD9mzk9kUR4nKYuan_U_FC9LCA",
+    "sender_sign_pk_b64u": "sFNSrC7aUNSV_2uqWiM38tnGo_7VtUZiiyY6yDfjvLA",
+    "sig_input_hex": "73796e63746f6f6c2d76312f307274742d7369670a53543031020000009f86d081884c7d659a2feaa0c55ad0155869aff450549732cbaaed5e5df9b30a6da31cb0e5742bad5ad4a1a768f1a67be09fc64072cd3e37d1d37208e75866e2da0d1c8f217fb1d0eabaa3ad180c586000000000692841f0330226c8237c0ed3465a0dfd3e7c1f6783e2f92ad112491ee06929bfb04732b6"
+  },
+  "manifest_sha256_hex": "330226c8237c0ed3465a0dfd3e7c1f6783e2f92ad112491ee06929bfb04732b6",
+  "manifest_utf8": "{\"envelope_version\":1,\"msg_id\":\"9f86d081884c7d659a2feaa0c55ad015\",\"app_id\":\"synctool.system\",\"schema\":\"device.ping.v1\",\"created_at\":1764246000,\"sender\":{\"device_id\":\"placeholder\",\"label\":\"Phone\"},\"inline_payload\":{\"echo\":\"ok\"},\"blobs\":[]}",
+  "msg_id_hex": "9f86d081884c7d659a2feaa0c55ad015",
+  "negative_cases": {
+    "tampered_clear_header_b64u": "U1QwMQIAAACfhtGBiEx9ZZov6qDFWtAVWGmv9FBUlzLLqu1eXfmzCm2jHLDldCutWtShp2jxpnt_249yyS7Fgz4YsAHP6vTOdYURtmDHp5YuKKzi8lOOib8Z5uC6nQ8H9mYrupg1r65smi3ChCz22PO8A0dRL99HBQu8qOXZkeJxkPZsjmDp5ea8a78OVpreN4mwbSIXa7dxpOaST5Rlnqs4kbxUboILtDwAbvBqXTOi4h9awDoI4cGXxwUkJxm8wmyDTA-E7BTwhRVg2iPXjw",
+    "tampered_direct_ack_mac_b64u": "zRt3w0u7VfM3Slwusz7MHB7SPyNEVK3WjS8GlY0i1BU",
+    "wrong_recipient_master_seed_hex": "f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f10"
+  },
+  "proto_v": 1,
+  "recipient_master_seed_hex": "a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0",
+  "sender_master_seed_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+  "vector": "05_paired_0rtt_envelope"
+}

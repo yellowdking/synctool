@@ -1,0 +1,53 @@
+{
+  "alphabet": "0123456789ABCDEFGHJKMNPQRSTVWXYZ",
+  "encode_decode_cases": [
+    {
+      "canonical": "00000000",
+      "display": "0000-0000",
+      "raw_hex": "0000000000"
+    },
+    {
+      "canonical": "ZZZZZZZZ",
+      "display": "ZZZZ-ZZZZ",
+      "raw_hex": "ffffffffff"
+    },
+    {
+      "canonical": "JEMSP2YQ",
+      "display": "JEMS-P2YQ",
+      "raw_hex": "93a99b0bd7"
+    },
+    {
+      "canonical": "04HMASW9",
+      "display": "04HM-ASW9",
+      "raw_hex": "0123456789"
+    },
+    {
+      "canonical": "MNDAAPN5",
+      "display": "MNDA-APN5",
+      "raw_hex": "a55aa55aa5"
+    }
+  ],
+  "invalid_cases": [
+    "",
+    "1234567",
+    "123456789",
+    "K7M9P2XU",
+    "K7M9P2X!",
+    "K7M9P2X中"
+  ],
+  "normalize_cases": [
+    {
+      "expected": "K7M9P2XQ",
+      "input": "k7m9-p2xq"
+    },
+    {
+      "expected": "01101111",
+      "input": " oilO-iIlL "
+    },
+    {
+      "expected": "0000ZZZZ",
+      "input": "0000-zzzz"
+    }
+  ],
+  "vector": "07_crockford_room_id"
+}

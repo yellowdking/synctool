@@ -1,0 +1,123 @@
+{
+  "access_key": "SYNCTOOL-TEST-ACCESS-KEY-0123456789ABCDEF",
+  "cases": [
+    {
+      "name": "control_empty_get_ping",
+      "method": "GET",
+      "path_and_raw_query": "/v1/ping",
+      "ts": "1764246000",
+      "nonce": "0102030405060708090a0b0c0d0e0f10",
+      "is_stream": false,
+      "expected_body_binding": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "expected_extra_token_binding": "",
+      "expected_canonical_req": "GET\n/v1/ping\n1764246000\n0102030405060708090a0b0c0d0e0f10\nsha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n",
+      "expected_sig_hex": "e287d26d4a493ec4fffb06ecfcc68de5e3480c8ca270eabd385b7142f5e31a55"
+    },
+    {
+      "name": "control_query_get_events",
+      "method": "GET",
+      "path_and_raw_query": "/v1/mailboxes/9f8e7d6c5b4a39281706f5e4d3c2b1a0/events?since_ts=0",
+      "ts": "1764246005",
+      "nonce": "1112131415161718191a1b1c1d1e1f20",
+      "is_stream": false,
+      "expected_body_binding": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "expected_extra_token_binding": "",
+      "expected_canonical_req": "GET\n/v1/mailboxes/9f8e7d6c5b4a39281706f5e4d3c2b1a0/events?since_ts=0\n1764246005\n1112131415161718191a1b1c1d1e1f20\nsha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n",
+      "expected_sig_hex": "b746be19d20f3227dfd82b8d1888292257b460a61a63dbeed7535d89e82ff197"
+    },
+    {
+      "name": "control_post_spool_init_with_deposit",
+      "method": "POST",
+      "path_and_raw_query": "/v1/spool/init",
+      "ts": "1764246010",
+      "nonce": "2122232425262728292a2b2c2d2e2f30",
+      "is_stream": false,
+      "raw_body_utf8": "{\"mailbox_id\":\"9f8e7d6c5b4a39281706f5e4d3c2b1a0\",\"declared_total_bytes\":4112}",
+      "deposit_token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "expected_body_binding": "sha256:4a5b1297f84cb84aca1400381d012dbd8b21ca4570764d77886200fccec226c7",
+      "expected_extra_token_binding": "deposit:bf9d9a12a8f409c365eb2aaabc2a6f9a628e9cf3adb10f2d854a397e2ac2779d",
+      "expected_canonical_req": "POST\n/v1/spool/init\n1764246010\n2122232425262728292a2b2c2d2e2f30\nsha256:4a5b1297f84cb84aca1400381d012dbd8b21ca4570764d77886200fccec226c7\ndeposit:bf9d9a12a8f409c365eb2aaabc2a6f9a628e9cf3adb10f2d854a397e2ac2779d",
+      "expected_sig_hex": "ddd60adb13b28ae24d3fe25052521bf005872defc01bc5e6d3cf4a811c26b52f"
+    },
+    {
+      "name": "data_stream_put_spool_with_upload",
+      "method": "PUT",
+      "path_and_raw_query": "/v1/spool/itm_11223344556677889900aabbccddeeff/parts/1/chunks/0",
+      "ts": "1764246015",
+      "nonce": "3132333435363738393a3b3c3d3e3f40",
+      "is_stream": true,
+      "stream_content_length": 1048832,
+      "upload_token": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "expected_body_binding": "stream:1048832",
+      "expected_extra_token_binding": "upload:9e1a214aee91c93ac9dd17b42eff1239de18deb935ee9682d3f0a5922d5f8c8a",
+      "expected_canonical_req": "PUT\n/v1/spool/itm_11223344556677889900aabbccddeeff/parts/1/chunks/0\n1764246015\n3132333435363738393a3b3c3d3e3f40\nstream:1048832\nupload:9e1a214aee91c93ac9dd17b42eff1239de18deb935ee9682d3f0a5922d5f8c8a",
+      "expected_sig_hex": "903b555203c3711af64332e3a1ac0b6a0a4b0560ceba4d77fd78ac529297e693"
+    },
+    {
+      "name": "data_stream_put_pipe_no_extra_token",
+      "method": "PUT",
+      "path_and_raw_query": "/v1/pipe/a1b2c3d4e5f60718293a4b5c6d7e8f90/parts/0/chunks/0",
+      "ts": "1764246020",
+      "nonce": "4142434445464748494a4b4c4d4e4f50",
+      "is_stream": true,
+      "stream_content_length": 4112,
+      "expected_body_binding": "stream:4112",
+      "expected_extra_token_binding": "",
+      "expected_canonical_req": "PUT\n/v1/pipe/a1b2c3d4e5f60718293a4b5c6d7e8f90/parts/0/chunks/0\n1764246020\n4142434445464748494a4b4c4d4e4f50\nstream:4112\n",
+      "expected_sig_hex": "8851e8d806579d7343d316dcd8c0e9c7fd82f3ac113eb5b8fd95719463e02589"
+    },
+    {
+      "name": "control_delete_spool_with_upload",
+      "method": "DELETE",
+      "path_and_raw_query": "/v1/spool/itm_11223344556677889900aabbccddeeff",
+      "ts": "1764246025",
+      "nonce": "5152535455565758595a5b5c5d5e5f60",
+      "is_stream": false,
+      "upload_token": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "expected_body_binding": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "expected_extra_token_binding": "upload:9e1a214aee91c93ac9dd17b42eff1239de18deb935ee9682d3f0a5922d5f8c8a",
+      "expected_canonical_req": "DELETE\n/v1/spool/itm_11223344556677889900aabbccddeeff\n1764246025\n5152535455565758595a5b5c5d5e5f60\nsha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nupload:9e1a214aee91c93ac9dd17b42eff1239de18deb935ee9682d3f0a5922d5f8c8a",
+      "expected_sig_hex": "30280edc8b65f512d28d95758fae975853e041ab7cbbfb94f0d20a3f38ec3ae5"
+    }
+  ],
+  "clock_skew_cases": {
+    "cases": [
+      {
+        "expect_clock_skew_409": false,
+        "ts": 1764245940
+      },
+      {
+        "expect_clock_skew_409": false,
+        "ts": 1764246060
+      },
+      {
+        "expect_clock_skew_409": true,
+        "ts": 1764245939
+      },
+      {
+        "expect_clock_skew_409": true,
+        "ts": 1764246061
+      }
+    ],
+    "max_skew_sec": 60,
+    "server_ts": 1764246000
+  },
+  "deposit_token_sample_hash": "bf9d9a12a8f409c365eb2aaabc2a6f9a628e9cf3adb10f2d854a397e2ac2779d",
+  "expected_relay_hmac_key_hex": "cf2fa9afcb58fcdc5442a77adb35b2f4e3d221db2c73327f6cf3cda72abf1905",
+  "mailbox_sig_case": {
+    "expected_body_binding": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "expected_mailbox_sig_b64u": "_Sr8vH3jjNnqWQsvWPuOnJa-dvdpP5MXC013-Glco5tW6oR9ojRUqF9GmjGZ8MelSguDguoJZuGCzuTY4T6KAA",
+    "expected_sig_input": "synctool-v1/mailbox-auth\nPOST\n/v1/spool/itm_11223344556677889900aabbccddeeff/ack\n23ac4c8ef70fd04382436e5d1c5d724b\n1764246030\n6162636465666768696a6b6c6d6e6f70\nsha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "mailbox_auth_pk_b64u": "FdCa_Frew3EnZqFRNlQz9nwgldFYmeYpoo6-MJxzZv8",
+    "mailbox_auth_seed_hex": "923d54d3f998375926ba25ef783f2787c896565a14d6f47778a184db8b75300c",
+    "mailbox_id": "23ac4c8ef70fd04382436e5d1c5d724b",
+    "method": "POST",
+    "nonce": "6162636465666768696a6b6c6d6e6f70",
+    "path_and_raw_query": "/v1/spool/itm_11223344556677889900aabbccddeeff/ack",
+    "raw_body_utf8": "{}",
+    "ts": "1764246030"
+  },
+  "proto_v": 1,
+  "upload_token_sample_hash": "9e1a214aee91c93ac9dd17b42eff1239de18deb935ee9682d3f0a5922d5f8c8a",
+  "vector": "02_relay_auth_sig"
+}

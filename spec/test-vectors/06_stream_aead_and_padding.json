@@ -1,0 +1,149 @@
+{
+  "manifest_padding": {
+    "bucket_bytes": 4096,
+    "cases": [
+      {
+        "expected_padded_len": 4096,
+        "expected_padded_sha256": "0089eeda361fdd32b9bf314005060fb2e37d8e6e49f31296a83d2b242a8216eb",
+        "expected_prefix_16_hex": "00000001070000000000000000000000",
+        "name": "len_1",
+        "pattern": "byte((i*31 + 7) \u0026 0xff)",
+        "raw_len": 1
+      },
+      {
+        "expected_padded_len": 4096,
+        "expected_padded_sha256": "db4fab98abf17226902a875eb9a315d06336e0b095d25299a4726c9fe5cae640",
+        "expected_prefix_16_hex": "00000ffc0726456483a2c1e0ff1e3d5c",
+        "name": "len_4092_exact_1_bucket",
+        "pattern": "byte((i*31 + 7) \u0026 0xff)",
+        "raw_len": 4092
+      },
+      {
+        "expected_padded_len": 8192,
+        "expected_padded_sha256": "9203f14e0f504eb2d69d2a75bb61f9d943fa4206701aa11a75b1226316927119",
+        "expected_prefix_16_hex": "00000ffd0726456483a2c1e0ff1e3d5c",
+        "name": "len_4093_rolls_2_buckets",
+        "pattern": "byte((i*31 + 7) \u0026 0xff)",
+        "raw_len": 4093
+      },
+      {
+        "expected_padded_len": 65536,
+        "expected_padded_sha256": "374a00a13d4095c7dd1369fba3b4d5418071f69d75ffa373083ae98a52645a59",
+        "expected_prefix_16_hex": "0000fffc0726456483a2c1e0ff1e3d5c",
+        "name": "len_65532_exact_16_buckets",
+        "pattern": "byte((i*31 + 7) \u0026 0xff)",
+        "raw_len": 65532
+      }
+    ],
+    "negative_cases": [
+      {
+        "first_4_hex": "00000000",
+        "name": "len_zero_rejected",
+        "padded_len": 4096
+      },
+      {
+        "last_byte_hex": "01",
+        "name": "non_zero_tail_rejected",
+        "raw_len": 1
+      },
+      {
+        "name": "misaligned_len_rejected",
+        "padded_len": 4095
+      }
+    ]
+  },
+  "proto_v": 1,
+  "stream_aead": {
+    "blob_key_hex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+    "cases": [
+      {
+        "ciphertext_hex": "1d4dfe6f0ede71d5c2f013d02cf13d42",
+        "expected_ciphertext_len": 16,
+        "expected_ciphertext_sha256": "6b7e8165027f0898d8baf33cbcb733b5cb21e832ee94f852bf7345aedf45f59d",
+        "expected_nano_chunk_count": 1,
+        "expected_std_chunk_count": 1,
+        "expected_total_blocks": 1,
+        "first_block_aad_hex": "73796e63746f6f6c2d6368756e6b2d76319f86d081884c7d659a2feaa0c55ad01500000001000000000100000000",
+        "first_block_nonce_hex": "f329154614c4060000000001",
+        "last_block_aad_hex": "73796e63746f6f6c2d6368756e6b2d76319f86d081884c7d659a2feaa0c55ad01500000001000000000100000000",
+        "last_block_nonce_hex": "f329154614c4060000000001",
+        "name": "empty_0B",
+        "pattern": "byte((i*31 + 7) \u0026 0xff)",
+        "plaintext_len": 0,
+        "plaintext_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "ciphertext_hex": "089beb6d8ab8ae2b4a359185a98535b2b585cd89df763ceecc175eda96ee846e0fd15ede271b772cee90c8f182aba3107297b4b8f43fae9346dcfe4d332e25d4ce64a4d5c100a881203dbc491d8482c44e16a0fbd319252a4bb16deac9575d6d90b2e47000054d076bda350b8237f527a72dc4c6",
+        "expected_ciphertext_len": 116,
+        "expected_ciphertext_sha256": "62263239f9d2ca7826d31ec797920afcecd46804437a8fd9fba8f12533be5e86",
+        "expected_nano_chunk_count": 1,
+        "expected_std_chunk_count": 1,
+        "expected_total_blocks": 1,
+        "first_block_aad_hex": "73796e63746f6f6c2d6368756e6b2d76319f86d081884c7d659a2feaa0c55ad01500000001000000000100000064",
+        "first_block_nonce_hex": "f329154614c4060000000001",
+        "last_block_aad_hex": "73796e63746f6f6c2d6368756e6b2d76319f86d081884c7d659a2feaa0c55ad01500000001000000000100000064",
+        "last_block_nonce_hex": "f329154614c4060000000001",
+        "name": "small_100B",
+        "pattern": "byte((i*31 + 7) \u0026 0xff)",
+        "plaintext_len": 100,
+        "plaintext_sha256": "c22e490daa445fb2fba44278c022df135310fd278cabca4ad7919eddcccd1dce"
+      },
+      {
+        "ciphertext_first_32_hex": "089beb6d8ab8ae2b4a359185a98535b2b585cd89df763ceecc175eda96ee846e",
+        "ciphertext_last_32_hex": "9ef600878649b21675776f5ec1be40b8ce4c11889b950b7d2dce716164e9e5cc",
+        "expected_ciphertext_len": 65552,
+        "expected_ciphertext_sha256": "f9cbd8dfde854c99718439ca95ba8269793b8392189820f08d078d96ea97125b",
+        "expected_nano_chunk_count": 1,
+        "expected_std_chunk_count": 1,
+        "expected_total_blocks": 1,
+        "first_block_aad_hex": "73796e63746f6f6c2d6368756e6b2d76319f86d081884c7d659a2feaa0c55ad01500000001000000000100010000",
+        "first_block_nonce_hex": "f329154614c4060000000001",
+        "last_block_aad_hex": "73796e63746f6f6c2d6368756e6b2d76319f86d081884c7d659a2feaa0c55ad01500000001000000000100010000",
+        "last_block_nonce_hex": "f329154614c4060000000001",
+        "name": "exact_1block_65536B",
+        "pattern": "byte((i*31 + 7) \u0026 0xff)",
+        "plaintext_len": 65536,
+        "plaintext_sha256": "ef4636928161808e87035fa51983821677527ccd9661991c5d0126a778b2268a"
+      },
+      {
+        "ciphertext_first_32_hex": "1f7dbe765934ada0572d6c5d2b4c693c87428b94fec90e0ee3c86993c9ddb323",
+        "ciphertext_last_32_hex": "1409c0c644fb4bad274896c88307670c2d21786eff52b1a380fc94cf89b6af5d",
+        "expected_ciphertext_len": 65569,
+        "expected_ciphertext_sha256": "3d14496262ae46441643c7dcc4f1a2c903b896e1f4a204f5773ff5f65481a20b",
+        "expected_nano_chunk_count": 1,
+        "expected_std_chunk_count": 1,
+        "expected_total_blocks": 2,
+        "first_block_aad_hex": "73796e63746f6f6c2d6368756e6b2d76319f86d081884c7d659a2feaa0c55ad01500000001000000000000010000",
+        "first_block_nonce_hex": "f329154614c4060000000000",
+        "last_block_aad_hex": "73796e63746f6f6c2d6368756e6b2d76319f86d081884c7d659a2feaa0c55ad01500000001000000010100000001",
+        "last_block_nonce_hex": "f329154614c4060000000101",
+        "name": "two_blocks_65537B",
+        "pattern": "byte((i*31 + 7) \u0026 0xff)",
+        "plaintext_len": 65537,
+        "plaintext_sha256": "74f3260f4a9adaf7271c910ba2d111dbae7a176afb487e1b7f655897eadf1093"
+      },
+      {
+        "ciphertext_first_32_hex": "1f7dbe765934ada0572d6c5d2b4c693c87428b94fec90e0ee3c86993c9ddb323",
+        "ciphertext_last_32_hex": "9f7a5ff075e71e92d040e6c80248521b833faba302f14f2d7522747becc17173",
+        "expected_ciphertext_len": 300080,
+        "expected_ciphertext_sha256": "e306ae9757919aef0e1e0b45917fa7c7ca7efb7a631ac1bf6436fbb20030edbb",
+        "expected_nano_chunk_count": 2,
+        "expected_std_chunk_count": 1,
+        "expected_total_blocks": 5,
+        "first_block_aad_hex": "73796e63746f6f6c2d6368756e6b2d76319f86d081884c7d659a2feaa0c55ad01500000001000000000000010000",
+        "first_block_nonce_hex": "f329154614c4060000000000",
+        "last_block_aad_hex": "73796e63746f6f6c2d6368756e6b2d76319f86d081884c7d659a2feaa0c55ad015000000010000000401000093e0",
+        "last_block_nonce_hex": "f329154614c4060000000401",
+        "name": "multi_chunk_300000B",
+        "pattern": "byte((i*31 + 7) \u0026 0xff)",
+        "plaintext_len": 300000,
+        "plaintext_sha256": "1bb182f649a789fda17412a4839e9d5dd50b4068089bc334655f78e6db797370"
+      }
+    ],
+    "expected_enc_key_hex": "f5dc332d2bbd568bfee6af6d48a3afb81fdaaa9e9c22f1a87e49169db04c9c51",
+    "expected_nonce_prefix_hex": "f329154614c406",
+    "msg_id_hex": "9f86d081884c7d659a2feaa0c55ad015",
+    "part_id": 1
+  },
+  "vector": "06_stream_aead_and_padding"
+}
