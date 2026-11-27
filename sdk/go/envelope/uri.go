@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 
@@ -59,6 +60,12 @@ func ParseRelayURI(raw string) (*RelayProfile, error) {
 	}
 	q := u.Query()
 	if v := q.Get("v"); v != "" && v != "1" {
+		if vInt, verr := strconv.Atoi(v); verr == nil && vInt > 1 {
+			return nil, NewError(ErrCodeUnsupportedVersion, false, 0, fmt.Sprintf("unsupported relay URI version %d (supported: 1)", vInt), map[string]any{
+				"version":           vInt,
+				"supported_version": 1,
+			})
+		}
 		return nil, NewError(ErrCodeURIInvalid, false, 0, fmt.Sprintf("unsupported relay URI version %q", v), nil)
 	}
 	rawOrigin := q.Get("u")
@@ -151,6 +158,12 @@ func ParsePairURI(raw string) (*PairOffer, error) {
 		return nil, NewError(ErrCodeURIInvalid, false, 0, "secrets s/k must be in #fragment, not query", nil)
 	}
 	if v := q.Get("v"); v != "" && v != "1" {
+		if vInt, verr := strconv.Atoi(v); verr == nil && vInt > 1 {
+			return nil, NewError(ErrCodeUnsupportedVersion, false, 0, fmt.Sprintf("unsupported pair URI version %d (supported: 1)", vInt), map[string]any{
+				"version":           vInt,
+				"supported_version": 1,
+			})
+		}
 		return nil, NewError(ErrCodeURIInvalid, false, 0, fmt.Sprintf("unsupported pair URI version %q", v), nil)
 	}
 	roomID, err := synccrypto.NormalizeRoomID(q.Get("r"))
@@ -298,4 +311,26 @@ func FormatPairURI(o *PairOffer) (string, error) {
 		sb.WriteString(strings.Join(frags, "&"))
 	}
 	return sb.String(), nil
+}
+
+// RelayProfileFromEnv parses a RelayProfile from SYNCTOOL_RELAY (or fallback SYNCTOOL_RELAY_URI)
+// so scripts and services can connect without exposing #k= secrets in command-line arguments.
+func RelayProfileFromEnv() (*RelayProfile, error) {
+	raw := strings.TrimSpace(os.Getenv("SYNCTOOL_RELAY"))
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv("SYNCTOOL_RELAY_URI"))
+	}
+	if raw == "" {
+		return nil, NewError(ErrCodeURIInvalid, false, 0, "SYNCTOOL_RELAY environment variable is not set", nil)
+	}
+	return ParseRelayURI(raw)
+}
+
+// PairURIFromEnv reads a synctool://pair URI or 8-char room code from SYNCTOOL_PAIR_URI.
+func PairURIFromEnv() (string, error) {
+	raw := strings.TrimSpace(os.Getenv("SYNCTOOL_PAIR_URI"))
+	if raw == "" {
+		return "", NewError(ErrCodeURIInvalid, false, 0, "SYNCTOOL_PAIR_URI environment variable is not set", nil)
+	}
+	return raw, nil
 }
