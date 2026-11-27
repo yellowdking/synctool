@@ -1,5 +1,7 @@
 export declare const ENVELOPE_VERSION: 1;
 export declare const MAX_MANIFEST_BYTES: 131072;
+export declare const MAX_ENCRYPTED_MANIFEST_BYTES: 135216;
+export declare const MAX_MANIFEST_CHUNKS: 4;
 export declare const MAX_INLINE_PAYLOAD_BYTES: 65536;
 export declare const MAX_BLOBS: 63;
 export declare const MAX_BLOB_META_BYTES: 2048;
@@ -33,6 +35,7 @@ export declare const ErrorCode: Readonly<{
   ERR_MSG_REPLAY_DETECTED: 'ERR_MSG_REPLAY_DETECTED';
   ERR_HASH_MISMATCH: 'ERR_HASH_MISMATCH';
   ERR_MANIFEST_INVALID: 'ERR_MANIFEST_INVALID';
+  ERR_UNSUPPORTED_VERSION: 'ERR_UNSUPPORTED_VERSION';
   ERR_DEVICE_UNTRUSTED: 'ERR_DEVICE_UNTRUSTED';
   ERR_INTERRUPTED_RESUMABLE: 'ERR_INTERRUPTED_RESUMABLE';
   ERR_URI_INVALID: 'ERR_URI_INVALID';
@@ -185,3 +188,17 @@ export declare function formatPairURI(opts: {
   expiresAt?: number | null;
 }): string;
 export declare function redactURI(uri: string): string;
+export declare function redactMessage(msg: string): string;
+export declare function relayProfileFromEnv(): ParsedRelayURI;
+export declare function parcelText(text: string, appId?: string): {
+  appId?: string;
+  schema: string;
+  inlinePayload: { text: string };
+  blobs: never[];
+};
+export declare function isRetryable(err: unknown): boolean;
+export declare function isQuotaExceeded(err: unknown): boolean;
+export declare function suggestPipeMode(err: unknown): boolean;
+export declare function isAuthError(err: unknown): boolean;
+export declare function isSecurityAlert(err: unknown): boolean;
+export declare function isVersionMismatch(err: unknown): boolean;
