@@ -1,0 +1,10 @@
+{$SYNCTOOL_DOMAIN} {
+	request_body {
+		max_size 4MB
+	}
+	reverse_proxy synctool-relay:54843 {
+		# Disable response buffering so Mode A chunk streams and SSE deliver immediately.
+		flush_interval -1
+		header_up X-Forwarded-For {remote_host}
+	}
+}

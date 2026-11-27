@@ -1,0 +1,71 @@
+# synctool-relay + Caddy — 域名自动 HTTPS 反代一键部署
+#
+# 使用步骤：
+#   1. 将你的域名 A/AAAA 记录指向本机 VPS
+#   2. 导出环境变量并初始化随机私有 AccessKey：
+#        export SYNCTOOL_DOMAIN=sync.example.com
+#        docker compose -f docker-compose.caddy.yml run --rm synctool-relay init
+#   3. 启动服务：
+#        docker compose -f docker-compose.caddy.yml up -d
+
+services:
+  synctool-relay:
+    image: ghcr.io/yellowdking/synctool:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: synctool-relay
+    restart: unless-stopped
+    user: "65532:65532"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 192m
+    expose:
+      - "54843"
+    environment:
+      SYNCTOOL_LISTEN: ":54843"
+      SYNCTOOL_PUBLIC_HOST: "https://${SYNCTOOL_DOMAIN:?set SYNCTOOL_DOMAIN}:443"
+      SYNCTOOL_PROFILE: "${SYNCTOOL_PROFILE:-auto}"
+      # 可手动设为 off 彻底关闭离线暂存：SYNCTOOL_SPOOL=off
+      SYNCTOOL_SPOOL: "${SYNCTOOL_SPOOL:-auto}"
+      # 由前置 Caddy 终止 HTTPS，中继内网仅信任反代网段
+      SYNCTOOL_TLS: "off"
+      SYNCTOOL_TRUSTED_PROXIES: "127.0.0.1/32,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16"
+      SYNCTOOL_DATA_DIR: "/data"
+    volumes:
+      - synctool_data:/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: synctool-caddy
+    restart: unless-stopped
+    mem_limit: 96m
+    depends_on:
+      - synctool-relay
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SYNCTOOL_DOMAIN: "${SYNCTOOL_DOMAIN:?set SYNCTOOL_DOMAIN}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  synctool_data:
+  caddy_data:
+  caddy_config:
