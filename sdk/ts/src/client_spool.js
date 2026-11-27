@@ -16,11 +16,13 @@ import {
 } from './crypto.js';
 import {
   ErrorCode,
+  MAX_ENCRYPTED_MANIFEST_BYTES,
   SyncError,
   validateManifest,
 } from './envelope.js';
 import { iterateSSE } from './client_transport.js';
 import {
+  assertValidPart0Layout,
   downloadBlobStreaming,
   prepareParcel,
   sendDirectModeAImpl,
@@ -198,8 +200,9 @@ export async function sendToDeviceImpl(client, targetDeviceId, parcel, opts = {}
 
 async function fetchAndVerifyManifestPart0(client, itemMeta, header, mailboxId, signal) {
   const part0 = (itemMeta.parts || []).find((p) => p.part_id === 0);
-  if (!part0) throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, 'item missing part_id=0');
+  assertValidPart0Layout(part0);
   const chunks = [];
+  let p0Total = 0;
   for (let tx = 0; tx < part0.chunk_count; tx++) {
     const res = await client._signedRequest({
       method: 'GET',
@@ -208,7 +211,12 @@ async function fetchAndVerifyManifestPart0(client, itemMeta, header, mailboxId, 
       mailboxId,
       signal,
     });
-    chunks.push(new Uint8Array(await res.arrayBuffer()));
+    const ch = new Uint8Array(await res.arrayBuffer());
+    p0Total += ch.length;
+    if (p0Total > MAX_ENCRYPTED_MANIFEST_BYTES) {
+      throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, 'part_id=0 stream exceeded maximum manifest byte budget');
+    }
+    chunks.push(ch);
   }
   const padded = await decryptPartBytes(header.part0Key, header.part0NoncePrefix, header.msgIdRaw, 0, chunks);
   const manifestUtf8 = unpadManifest(padded);
@@ -224,20 +232,37 @@ async function fetchAndVerifyManifestPart0(client, itemMeta, header, mailboxId, 
   return manifest;
 }
 
+async function fetchRawMailboxItemsWithHeal(client, mb, signal) {
+  const doGet = () =>
+    client._signedRequest({
+      method: 'GET',
+      path: `/v1/mailboxes/${mb.mailboxId}/items`,
+      signMailbox: true,
+      mailboxId: mb.mailboxId,
+      signal,
+    });
+  try {
+    const res = await doGet();
+    return await res.json();
+  } catch (err) {
+    // Self-healing: if memory-spool relay restarted and returned 404 ERR_NOT_FOUND for our mailbox,
+    // transparently re-register mailbox + peer deposit_tokens once and retry!
+    if (err instanceof SyncError && err.code === ErrorCode.ERR_NOT_FOUND) {
+      await client.syncMailbox({ signal });
+      const retryRes = await doGet();
+      return await retryRes.json();
+    }
+    throw err;
+  }
+}
+
 /**
  * Two-phase inbox listing: decrypts and locally caches part_id=0 Manifest previews by item_id
  * so repeated refreshes do not consume the relay's 16-download part_id=0 quota.
  */
 export async function listInboxImpl(client, opts = {}) {
   const [selfId, mb] = await Promise.all([client.getIdentity(), client.getMailboxIdentity()]);
-  const res = await client._signedRequest({
-    method: 'GET',
-    path: `/v1/mailboxes/${mb.mailboxId}/items`,
-    signMailbox: true,
-    mailboxId: mb.mailboxId,
-    signal: opts.signal,
-  });
-  const data = await res.json();
+  const data = await fetchRawMailboxItemsWithHeal(client, mb, opts.signal);
   const items = data.items || [];
   const activeIds = new Set(items.map((it) => it.item_id));
   if (client.keyStore.pruneCachedManifestPreviews) {
@@ -295,14 +320,7 @@ export async function fetchParcelImpl(client, itemId, handler, opts = {}) {
   const [selfId, mb] = await Promise.all([client.getIdentity(), client.getMailboxIdentity()]);
   let itemMeta = opts.itemMeta ?? null;
   if (!itemMeta) {
-    const res = await client._signedRequest({
-      method: 'GET',
-      path: `/v1/mailboxes/${mb.mailboxId}/items`,
-      signMailbox: true,
-      mailboxId: mb.mailboxId,
-      signal: opts.signal,
-    });
-    const data = await res.json();
+    const data = await fetchRawMailboxItemsWithHeal(client, mb, opts.signal);
     itemMeta = (data.items || []).find((it) => it.item_id === itemId);
     if (!itemMeta) {
       throw new SyncError(ErrorCode.ERR_NOT_FOUND, `spooled item not found: ${itemId}`, { httpStatus: 404 });
@@ -321,7 +339,8 @@ export async function fetchParcelImpl(client, itemId, handler, opts = {}) {
     const cached = client.keyStore.getCachedManifestPreview
       ? await client.keyStore.getCachedManifestPreview(itemId)
       : null;
-    const manifest = cached?.manifest
+    const validCache = cached?.manifest && cached.manifest.msg_id === header.msgId && (!cached.sealed_header || cached.sealed_header === itemMeta.sealed_header);
+    const manifest = validCache
       ? cached.manifest
       : await fetchAndVerifyManifestPart0(client, itemMeta, header, mb.mailboxId, opts.signal);
 
@@ -409,10 +428,13 @@ export async function fetchParcelImpl(client, itemId, handler, opts = {}) {
 /**
  * Watch mailbox events on-demand via SSE (auto-reconnects cleanly on 90s rotation, falls back to 20s long-poll).
  */
-export async function watchInboxImpl(client, { onItem, preferPoll = false, sinceTs = 0, signal }) {
+export async function watchInboxImpl(client, { onItem, preferPoll = false, sinceTs, signal }) {
   const mb = await client.getMailboxIdentity();
-  let cursorTs = sinceTs;
+  const defaultSince = Math.max(0, Math.floor(Date.now() / 1000) + (client._clockOffsetSec ?? 0) - 1);
+  let cursorTs = typeof sinceTs === 'number' ? Math.max(0, sinceTs) : defaultSince;
   let usePoll = preferPoll;
+  let healed404 = false;
+  const seenItemIds = new Set();
 
   while (!signal?.aborted) {
     const path = usePoll
@@ -426,10 +448,13 @@ export async function watchInboxImpl(client, { onItem, preferPoll = false, since
         mailboxId: mb.mailboxId,
         signal,
       });
+      healed404 = false;
       if (usePoll) {
         const data = await res.json();
         for (const item of data.items || []) {
           if (typeof item.created_at === 'number') cursorTs = Math.max(cursorTs, item.created_at);
+          if (item.item_id && seenItemIds.has(item.item_id)) continue;
+          if (item.item_id) seenItemIds.add(item.item_id);
           await onItem(item);
         }
         if (typeof data.server_ts === 'number') cursorTs = Math.max(cursorTs, data.server_ts);
@@ -439,13 +464,20 @@ export async function watchInboxImpl(client, { onItem, preferPoll = false, since
           if (ev.event === 'new_item' && ev.data) {
             const item = JSON.parse(ev.data);
             if (typeof item.created_at === 'number') cursorTs = Math.max(cursorTs, item.created_at);
+            if (item.item_id && seenItemIds.has(item.item_id)) continue;
+            if (item.item_id) seenItemIds.add(item.item_id);
             await onItem(item);
           }
         }
       }
     } catch (err) {
       if (signal?.aborted) return;
-      if (err instanceof SyncError && (err.code === ErrorCode.ERR_SPOOL_DISABLED || err.code === ErrorCode.ERR_UNAUTHORIZED_TOKEN || err.code === ErrorCode.ERR_AUTH_FAILED)) {
+      if (err instanceof SyncError && err.code === ErrorCode.ERR_NOT_FOUND && !healed404) {
+        healed404 = true;
+        await client.syncMailbox({ signal });
+        continue;
+      }
+      if (err instanceof SyncError && (err.code === ErrorCode.ERR_SPOOL_DISABLED || err.code === ErrorCode.ERR_UNAUTHORIZED_TOKEN || err.code === ErrorCode.ERR_AUTH_FAILED || err.code === ErrorCode.ERR_NOT_FOUND)) {
         throw err;
       }
       usePoll = true;
