@@ -44,6 +44,8 @@ type mockRelay struct {
 	pipes     map[string]*mockPipe
 	mailboxes map[string]*mockMailbox
 	items     map[string]*mockSpoolItem
+
+	return404OnMissingMailbox bool
 }
 
 type mockRoom struct {
@@ -524,6 +526,14 @@ func (m *mockRelay) handleSpoolRoutes(w http.ResponseWriter, r *http.Request, bo
 			cnt := len(m.mailboxes[mbID].tokens)
 			m.mu.Unlock()
 			_ = json.NewEncoder(w).Encode(map[string]any{"mailbox_id": mbID, "registered": true, "deposit_token_count": cnt})
+			return
+		}
+		m.mu.Lock()
+		_, mbExists := m.mailboxes[mbID]
+		ret404 := m.return404OnMissingMailbox
+		m.mu.Unlock()
+		if !mbExists && ret404 {
+			m.writeErr(w, 404, envelope.ErrCodeNotFound, "mailbox not found", map[string]any{"scope": "mailbox"})
 			return
 		}
 		if !m.verifyMboxSig(r, mbID, ts, nonce, bodyBinding) {
