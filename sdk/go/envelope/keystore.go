@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,7 @@ type DeviceCard struct {
 	MailboxID            string `json:"mailbox_id,omitempty"`
 	OutboundDepositToken string `json:"outbound_deposit_token,omitempty"`
 	InboundTokenID       string `json:"inbound_token_id,omitempty"`
+	InboundTokenHash     string `json:"inbound_token_hash,omitempty"` // 64-char SHA-256 hex for self-healing
 	PairedAt             int64  `json:"paired_at"`
 	Revoked              bool   `json:"revoked"`
 }
@@ -49,10 +51,11 @@ type SeenMsgEntry struct {
 // CachedManifestEntry caches decrypted part_id=0 Manifest summaries by item_id
 // so repeated ListInbox refreshes do not exhaust the relay's 16-download limit.
 type CachedManifestEntry struct {
-	ItemID    string   `json:"item_id"`
-	CachedAt  int64    `json:"cached_at"`
-	ExpiresAt int64    `json:"expires_at"`
-	Manifest  Manifest `json:"manifest"`
+	ItemID         string   `json:"item_id"`
+	CachedAt       int64    `json:"cached_at"`
+	ExpiresAt      int64    `json:"expires_at"`
+	ManifestSHA256 string   `json:"manifest_sha256,omitempty"` // Verified raw manifest SHA-256 hex
+	Manifest       Manifest `json:"manifest"`
 }
 
 // TransferCheckpoint tracks resumable per-part upload/download progress.
@@ -118,9 +121,15 @@ type FileKeyStore struct {
 
 // NewFileKeyStore opens or initializes a FileKeyStore under dir (mode 0700).
 func NewFileKeyStore(dir string) (*FileKeyStore, error) {
+	if fi, err := os.Lstat(dir); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+			return nil, NewError(ErrCodeKeystoreError, false, 0, "keystore dir must be a real directory, not a symlink", nil)
+		}
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, WrapError(ErrCodeKeystoreError, false, 0, "create keystore dir", err)
 	}
+	_ = os.Chmod(dir, 0o700)
 	fs := &FileKeyStore{
 		dir:  dir,
 		path: filepath.Join(dir, "keystore.json"),
@@ -129,6 +138,14 @@ func NewFileKeyStore(dir string) (*FileKeyStore, error) {
 		return nil, err
 	}
 	return fs, nil
+}
+
+// Dir returns the backing directory path for disk-backed FileKeyStore (or empty for in-memory store).
+func (f *FileKeyStore) Dir() string {
+	if f == nil {
+		return ""
+	}
+	return f.dir
 }
 
 // NewMemoryKeyStore creates an in-memory KeyStore (convenient for tests and ephemeral tooling).
@@ -191,18 +208,41 @@ func (f *FileKeyStore) persistLocked() error {
 	if f.path == "" {
 		return nil
 	}
+	now := time.Now().Unix()
+	for k, cp := range f.st.Checkpoints {
+		if cp.ExpiresAt > 0 && cp.ExpiresAt < now {
+			delete(f.st.Checkpoints, k)
+		}
+	}
 	data, err := json.MarshalIndent(f.st, "", "  ")
 	if err != nil {
 		return WrapError(ErrCodeKeystoreError, false, 0, "marshal keystore", err)
 	}
-	tmp := f.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	tf, err := os.CreateTemp(f.dir, ".keystore-*.tmp")
+	if err != nil {
+		return WrapError(ErrCodeKeystoreError, false, 0, "create keystore tmp", err)
+	}
+	tmp := tf.Name()
+	_ = tf.Chmod(0o600)
+	if _, err := tf.Write(data); err != nil {
+		_ = tf.Close()
+		_ = os.Remove(tmp)
 		return WrapError(ErrCodeKeystoreError, false, 0, "write keystore tmp", err)
+	}
+	if err := tf.Sync(); err != nil {
+		_ = tf.Close()
+		_ = os.Remove(tmp)
+		return WrapError(ErrCodeKeystoreError, false, 0, "sync keystore tmp", err)
+	}
+	if err := tf.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return WrapError(ErrCodeKeystoreError, false, 0, "close keystore tmp", err)
 	}
 	if err := os.Rename(tmp, f.path); err != nil {
 		_ = os.Remove(tmp)
 		return WrapError(ErrCodeKeystoreError, false, 0, "rename keystore", err)
 	}
+	_ = os.Chmod(f.path, 0o600)
 	return nil
 }
 
@@ -423,7 +463,7 @@ func (f *FileKeyStore) PruneCachedManifests(activeItemIDs map[string]struct{}) e
 }
 
 func checkpointKey(direction, msgID string, partID uint32) string {
-	return direction + ":" + strings.ToLower(msgID) + ":" + string(rune('0'+partID/10)) + string(rune('0'+partID%10))
+	return direction + ":" + strings.ToLower(msgID) + ":" + strconv.FormatUint(uint64(partID), 10)
 }
 
 func (f *FileKeyStore) GetCheckpoint(direction, msgID string, partID uint32) (*TransferCheckpoint, error) {
