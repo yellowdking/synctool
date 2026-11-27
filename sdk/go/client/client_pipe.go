@@ -413,7 +413,15 @@ func (c *Client) ReceiveFromRoom(ctx context.Context, pairInput string, handler 
 		Mode    int    `json:"mode"`
 		Purpose string `json:"purpose"`
 	}
-	if err := json.Unmarshal(rawM1, &probe); err != nil || probe.ProtoV != 1 {
+	if err := json.Unmarshal(rawM1, &probe); err != nil {
+		c.closeRoom(ctx, roomID, joined.ReceiverToken, "verify_failed")
+		return nil, envelope.NewError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, "invalid room M1 frame", nil)
+	}
+	if probe.ProtoV > 1 {
+		c.closeRoom(ctx, roomID, joined.ReceiverToken, "verify_failed")
+		return nil, envelope.NewError(envelope.ErrCodeUnsupportedVersion, false, 0, fmt.Sprintf("unsupported room M1 proto_v %d", probe.ProtoV), map[string]any{"proto_v": probe.ProtoV, "supported_proto_v": 1})
+	}
+	if probe.ProtoV != 1 {
 		c.closeRoom(ctx, roomID, joined.ReceiverToken, "verify_failed")
 		return nil, envelope.NewError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, "invalid room M1 frame", nil)
 	}
@@ -591,7 +599,7 @@ func (c *Client) downloadAndDeliverPipeParcel(
 		}
 	}
 
-	manifest, err := c.pullAndVerifyManifest(msgIDRaw, msgIDHex, p0Key, p0NP, p0Layout, opened, func(txIdx int) ([]byte, error) {
+	manifest, _, err := c.pullAndVerifyManifest(msgIDRaw, msgIDHex, p0Key, p0NP, p0Layout, opened, func(txIdx int) ([]byte, error) {
 		return getPipeChunk(0, txIdx)
 	})
 	if err != nil {
@@ -746,7 +754,15 @@ func (c *Client) joinAndReadM1(ctx context.Context, roomID string) (*roomJoinRes
 		return nil, hsM1Wire{}, err
 	}
 	var m1 hsM1Wire
-	if err := json.Unmarshal(rawM1, &m1); err != nil || m1.ProtoV != 1 {
+	if err := json.Unmarshal(rawM1, &m1); err != nil {
+		c.closeRoom(ctx, roomID, joined.ReceiverToken, "verify_failed")
+		return nil, hsM1Wire{}, envelope.NewError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, "invalid M1 json", nil)
+	}
+	if m1.ProtoV > 1 {
+		c.closeRoom(ctx, roomID, joined.ReceiverToken, "verify_failed")
+		return nil, hsM1Wire{}, envelope.NewError(envelope.ErrCodeUnsupportedVersion, false, 0, fmt.Sprintf("unsupported M1 proto_v %d", m1.ProtoV), map[string]any{"proto_v": m1.ProtoV, "supported_proto_v": 1})
+	}
+	if m1.ProtoV != 1 {
 		c.closeRoom(ctx, roomID, joined.ReceiverToken, "verify_failed")
 		return nil, hsM1Wire{}, envelope.NewError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, "invalid M1 json", nil)
 	}
