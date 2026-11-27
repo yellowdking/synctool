@@ -235,10 +235,33 @@ func (ph *PipeHub) removeIfUnmatched(key pipeSlotKey, expected *pipeSlot) bool {
 }
 
 func (ph *PipeHub) streamBridge(roomCtx context.Context, sender *pipeSender, recv *pipeReceiver) error {
-	// Acquire L7 concurrency semaphore before copying bytes.
+	// Acquire L7 concurrency semaphore before copying bytes; abort early if either peer or room cancels.
 	if ph.gate != nil {
-		release, ok := ph.gate.Acquire(recv.ctx, sender.ip, TransferSemWait)
+		waitCtx, waitCancel := context.WithCancel(recv.ctx)
+		stopWatch := make(chan struct{})
+		go func() {
+			select {
+			case <-sender.ctx.Done():
+				waitCancel()
+			case <-roomCtx.Done():
+				waitCancel()
+			case <-stopWatch:
+			}
+		}()
+		release, ok := ph.gate.Acquire(waitCtx, sender.ip, TransferSemWait)
+		close(stopWatch)
+		waitCancel()
 		if !ok {
+			if roomCtx.Err() != nil {
+				burnErr := newAPIError(410, "ERR_ROOM_BURNED", "room closed while acquiring transfer slot", false)
+				sender.done <- pipeCopyResult{bytes: 0, err: burnErr}
+				return burnErr
+			}
+			if recv.ctx.Err() != nil || sender.ctx.Err() != nil {
+				abortErr := errors.New("peer cancelled before stream start")
+				sender.done <- pipeCopyResult{bytes: 0, err: abortErr}
+				return abortErr
+			}
 			rateErr := newAPIError(429, "ERR_RATE_LIMITED", "concurrent transfer stream limit reached", true)
 			sender.done <- pipeCopyResult{bytes: 0, err: rateErr}
 			return rateErr
@@ -258,7 +281,11 @@ func (ph *PipeHub) streamBridge(roomCtx context.Context, sender *pipeSender, rec
 	h.Set("Content-Type", "application/octet-stream")
 	h.Set("Content-Length", strconv.FormatInt(sender.contentLen, 10))
 	h.Set("Cache-Control", "no-store")
+	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("X-Accel-Buffering", "no")
+	if recv.rc != nil {
+		_ = recv.rc.SetWriteDeadline(time.Now().Add(ph.stallTimeout))
+	}
 	recv.w.WriteHeader(http.StatusOK)
 
 	var reader io.Reader = io.LimitReader(sender.body, sender.contentLen)
@@ -331,5 +358,10 @@ func (ph *PipeHub) streamBridge(roomCtx context.Context, sender *pipeSender, rec
 	}
 
 	sender.done <- pipeCopyResult{bytes: total, err: copyErr}
-	return copyErr
+	if copyErr != nil {
+		// Headers were already sent on recv.w (200 OK); never return an *apiError to GetChunk
+		// so handlePipeGet never corrupts the binary stream with a trailing JSON body.
+		return errors.New("pipe stream aborted after headers sent")
+	}
+	return nil
 }
