@@ -31,6 +31,7 @@ import {
   spawnCLIInteractive,
   startRelayProcess,
 } from './cross_lang_helpers.mjs';
+import { runHardeningAndSelfHealingScenarios } from './cross_lang_hardening.mjs';
 
 async function main() {
   const workDir = makeTempDir('synctool-cross-e2e-');
@@ -379,6 +380,13 @@ async function main() {
       payloadBytes: payload900K,
       payloadPath: payload900KPath,
       payloadSha: payload900KSha,
+    });
+
+    // Scenarios 8, 9, 10: nano memory-spool reboot self-healing, security hardening & examples verification
+    await runHardeningAndSelfHealingScenarios({
+      relayBin,
+      cliBin,
+      workDir,
     });
 
     log('ALL CROSS-LANGUAGE E2E SCENARIOS PASSED 100%!');
