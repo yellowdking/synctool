@@ -12,7 +12,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -228,25 +230,47 @@ func (k *DeviceKeys) DeriveMailboxKeys(relayID string) (*MailboxKeys, error) {
 }
 
 // CanonicalRelayOrigin normalizes a relay URL into lowercase "scheme://host:port"
-// with an explicit port and no path, query, or fragment.
+// with an explicit port (1..65535, no leading zeros), canonical IP literals, and no path,
+// query, userinfo, or fragment. Never echoes raw URLs (which might carry secrets) in errors.
 func CanonicalRelayOrigin(raw string) (string, error) {
-	u, err := url.Parse(strings.TrimSpace(raw))
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", fmt.Errorf("%w: empty URL", ErrInvalidRelayURL)
+	}
+	for i := 0; i < len(trimmed); i++ {
+		c := trimmed[i]
+		if c <= 0x20 || c >= 0x7f {
+			return "", fmt.Errorf("%w: URL contains control, whitespace, or non-ASCII characters", ErrInvalidRelayURL)
+		}
+	}
+	if strings.ContainsRune(trimmed, '#') {
+		return "", fmt.Errorf("%w: origin must not contain fragment", ErrInvalidRelayURL)
+	}
+	u, err := url.Parse(trimmed)
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrInvalidRelayURL, err)
+		return "", fmt.Errorf("%w: malformed URL", ErrInvalidRelayURL)
 	}
 	scheme := strings.ToLower(u.Scheme)
 	if scheme != "https" && scheme != "http" {
-		return "", fmt.Errorf("%w: unsupported scheme %q", ErrInvalidRelayURL, u.Scheme)
+		return "", fmt.Errorf("%w: unsupported scheme", ErrInvalidRelayURL)
 	}
-	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+	if u.Opaque != "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 		return "", fmt.Errorf("%w: origin must not contain userinfo, query, or fragment", ErrInvalidRelayURL)
 	}
 	if u.Path != "" && u.Path != "/" {
-		return "", fmt.Errorf("%w: origin must not contain path %q", ErrInvalidRelayURL, u.Path)
+		return "", fmt.Errorf("%w: origin must not contain path", ErrInvalidRelayURL)
+	}
+	if strings.HasSuffix(u.Host, ":") {
+		return "", fmt.Errorf("%w: empty port after colon", ErrInvalidRelayURL)
 	}
 	host := strings.ToLower(u.Hostname())
-	if host == "" {
-		return "", fmt.Errorf("%w: empty host", ErrInvalidRelayURL)
+	if host == "" || strings.ContainsAny(host, "%/\\") {
+		return "", fmt.Errorf("%w: invalid host", ErrInvalidRelayURL)
+	}
+	if addr, addrErr := netip.ParseAddr(host); addrErr == nil {
+		host = addr.String()
+	} else if strings.ContainsRune(host, ':') {
+		return "", fmt.Errorf("%w: invalid IPv6 literal", ErrInvalidRelayURL)
 	}
 	port := u.Port()
 	if port == "" {
@@ -255,6 +279,12 @@ func CanonicalRelayOrigin(raw string) (string, error) {
 		} else {
 			port = "80"
 		}
+	} else {
+		portNum, perr := strconv.Atoi(port)
+		if perr != nil || portNum < 1 || portNum > 65535 {
+			return "", fmt.Errorf("%w: port must be in 1..65535", ErrInvalidRelayURL)
+		}
+		port = strconv.Itoa(portNum)
 	}
 	// Plaintext http is only allowed for loopback hosts.
 	if scheme == "http" && !IsLoopbackHost(host) {
@@ -263,19 +293,24 @@ func CanonicalRelayOrigin(raw string) (string, error) {
 	return scheme + "://" + net.JoinHostPort(host, port), nil
 }
 
-// IsLoopbackHost reports whether host is localhost, 127.0.0.0/8, or ::1.
+// IsLoopbackHost reports whether host is localhost, 127.0.0.0/8, ::1, or IPv4-mapped loopback.
 func IsLoopbackHost(host string) bool {
 	h := strings.ToLower(strings.Trim(host, "[]"))
 	if h == "localhost" {
 		return true
 	}
-	ip := net.ParseIP(h)
-	return ip != nil && ip.IsLoopback()
+	addr, err := netip.ParseAddr(h)
+	return err == nil && addr.Unmap().IsLoopback()
 }
 
 // IsIPHost reports whether host is a literal IPv4 or IPv6 address.
 func IsIPHost(host string) bool {
-	return net.ParseIP(strings.Trim(host, "[]")) != nil
+	h := strings.Trim(host, "[]")
+	if idx := strings.IndexByte(h, '%'); idx >= 0 {
+		h = h[:idx]
+	}
+	_, err := netip.ParseAddr(h)
+	return err == nil
 }
 
 // DeriveRelayID computes relay_id = hex(SHA256("synctool-v1/relay-id:" || canonicalOrigin)[0:16]).
@@ -338,13 +373,16 @@ func SignDeviceCard(signSK ed25519.PrivateKey, kemPK []byte, issuedAt int64) ([]
 	return ed25519.Sign(signSK, input), nil
 }
 
-// VerifyDeviceCard verifies both device_id derivation and the Ed25519 card_sig binding.
+// VerifyDeviceCard verifies both canonical 32-lower-hex device_id derivation and the Ed25519 card_sig binding.
 func VerifyDeviceCard(deviceID string, signPK, kemPK []byte, issuedAt int64, cardSig []byte) error {
 	if len(signPK) != ed25519.PublicKeySize || len(kemPK) != 32 || len(cardSig) != ed25519.SignatureSize {
 		return ErrInvalidKeyLength
 	}
+	if !isLowerHex(deviceID, 32) {
+		return ErrDeviceIDMismatch
+	}
 	_, expectedID := DeriveDeviceID(signPK)
-	if subtle.ConstantTimeCompare([]byte(strings.ToLower(deviceID)), []byte(expectedID)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(deviceID), []byte(expectedID)) != 1 {
 		return ErrDeviceIDMismatch
 	}
 	input, err := DeviceCardSignInput(signPK, kemPK, issuedAt)
