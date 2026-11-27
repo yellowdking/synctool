@@ -3,10 +3,12 @@ package crypto
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 )
 
 const (
@@ -23,8 +25,14 @@ const (
 	ManifestPadBucket = 4096
 	// ManifestMaxRawBytes is the hard maximum UTF-8 byte length of Manifest JSON (128 KiB).
 	ManifestMaxRawBytes = 131072
+	// MaxManifestPaddedBytes is the maximum valid 4 KiB-padded Manifest plaintext length (135,168 bytes).
+	MaxManifestPaddedBytes = ((4 + ManifestMaxRawBytes + ManifestPadBucket - 1) / ManifestPadBucket) * ManifestPadBucket
+	// MaxManifestCiphertextBytes is the maximum valid STREAM ciphertext byte length for part_id=0 (135,216 bytes).
+	MaxManifestCiphertextBytes = MaxManifestPaddedBytes + 3*AEADTagLen
 	// MaxPartID is the maximum allowed part_id (0..63).
 	MaxPartID = 63
+	// MaxStreamPlaintextBytes is the maximum plaintext size representable by uint32 TotalBlocks (~256 TiB).
+	MaxStreamPlaintextBytes = int64(math.MaxUint32) * ChunkPlaintextMax
 
 	prefixChunkAAD   = "synctool-chunk-v1"
 	infoBlobEncKey   = "synctool-v1/blob-enc-key"
@@ -33,6 +41,7 @@ const (
 
 var (
 	ErrStreamTruncated  = errors.New("stream truncated: missing authenticated final block")
+	ErrStreamTooLarge   = errors.New("stream exceeds maximum 2^32 block limit")
 	ErrInvalidPadding   = errors.New("invalid manifest 4 KiB padding")
 	ErrInvalidBlockSize = errors.New("invalid ciphertext block length")
 	ErrInvalidPartID    = errors.New("part_id out of range 0..63")
@@ -69,6 +78,7 @@ func DeriveBlobPartKeys(msgIDRaw [16]byte, partID uint32, blobKey []byte) ([32]b
 	if err != nil {
 		return encKey, np, err
 	}
+	defer clear(p)
 	copy(encKey[:], ek)
 	copy(np[:], p)
 	return encKey, np, nil
@@ -107,33 +117,47 @@ func BuildChunkAAD(msgIDRaw [16]byte, partID, blockIdx uint32, isFinal bool, pla
 
 // TotalBlocks returns the exact number of STREAM AEAD atomic blocks for plaintextLen bytes.
 // Empty parts (0 bytes) produce 1 block (plaintext_len=0, is_final=0x01, ciphertext=16B).
+// Uses overflow-safe uint64 arithmetic and clamps at math.MaxUint32 rather than wrapping around.
 func TotalBlocks(plaintextLen int64) uint32 {
 	if plaintextLen <= 0 {
 		return 1
 	}
-	return uint32((plaintextLen + ChunkPlaintextMax - 1) / ChunkPlaintextMax)
+	blocks := (uint64(plaintextLen)-1)/ChunkPlaintextMax + 1
+	if blocks > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(blocks)
 }
 
-// EncryptedPartSize returns the exact ciphertext byte size for plaintextLen bytes.
+// EncryptedPartSize returns the exact ciphertext byte size for plaintextLen bytes
+// using overflow-safe arithmetic (saturating at math.MaxInt64 instead of wrapping negative).
 func EncryptedPartSize(plaintextLen int64) int64 {
 	if plaintextLen <= 0 {
 		return AEADTagLen
 	}
-	blocks := (plaintextLen + ChunkPlaintextMax - 1) / ChunkPlaintextMax
-	return plaintextLen + blocks*AEADTagLen
+	blocks := (uint64(plaintextLen)-1)/ChunkPlaintextMax + 1
+	overhead := blocks * AEADTagLen
+	if overhead > uint64(math.MaxInt64)-uint64(plaintextLen) {
+		return math.MaxInt64
+	}
+	return plaintextLen + int64(overhead)
 }
 
 // TransportChunkCount returns how many HTTP transport chunks are needed for encryptedSize
-// when each transport chunk packs blocksPerChunk atomic blocks.
+// when each transport chunk packs blocksPerChunk atomic blocks (overflow-safe).
 func TransportChunkCount(encryptedSize int64, blocksPerChunk int) int {
 	if blocksPerChunk <= 0 {
 		blocksPerChunk = 16
 	}
-	chunkCap := int64(blocksPerChunk) * ChunkCiphertextMax
 	if encryptedSize <= 0 {
 		return 1
 	}
-	return int((encryptedSize + chunkCap - 1) / chunkCap)
+	chunkCap := uint64(blocksPerChunk) * ChunkCiphertextMax
+	chunks := (uint64(encryptedSize)-1)/chunkCap + 1
+	if chunks > uint64(math.MaxInt) {
+		return math.MaxInt
+	}
+	return int(chunks)
 }
 
 // SealBlock encrypts a single STREAM AEAD atomic block (0..65536 bytes).
@@ -227,10 +251,15 @@ func EncryptPartStream(r io.Reader, w io.Writer, encKey [32]byte, noncePrefix [7
 	if err != nil {
 		return 0, 0, err
 	}
+	return encryptPartStreamFrom(r, w, sc, 0)
+}
+
+func encryptPartStreamFrom(r io.Reader, w io.Writer, sc *StreamCipher, startBlockIdx uint32) (ptTotal int64, ctTotal int64, err error) {
 	// Read up to 64 KiB + 1 byte lookahead to know whether EOF is reached on exact multiples of 64 KiB.
 	buf := make([]byte, ChunkPlaintextMax+1)
+	defer clear(buf)
 	ctBuf := make([]byte, 0, ChunkCiphertextMax)
-	var blockIdx uint32
+	blockIdx := startBlockIdx
 	carry := 0
 
 	for {
@@ -242,8 +271,8 @@ func EncryptPartStream(r io.Reader, w io.Writer, encKey [32]byte, noncePrefix [7
 		eof := rerr == io.EOF || rerr == io.ErrUnexpectedEOF
 
 		if have == 0 && eof {
-			// Only happens for a 0-byte empty part on blockIdx == 0.
-			ct, err := sc.SealBlockAt(0, true, nil, ctBuf[:0])
+			// Only happens for a 0-byte empty part on initial block.
+			ct, err := sc.SealBlockAt(blockIdx, true, nil, ctBuf[:0])
 			if err != nil {
 				return ptTotal, ctTotal, err
 			}
@@ -265,7 +294,10 @@ func EncryptPartStream(r io.Reader, w io.Writer, encKey [32]byte, noncePrefix [7
 			return ptTotal, ctTotal, werr
 		}
 
-		// have == ChunkPlaintextMax + 1: emit full non-final block and shift 1 lookahead byte.
+		// have == ChunkPlaintextMax + 1: hard-stop BEFORE uint32 wrap-around to prevent AES-GCM nonce reuse!
+		if blockIdx == math.MaxUint32 {
+			return ptTotal, ctTotal, ErrStreamTooLarge
+		}
 		pt := buf[:ChunkPlaintextMax]
 		ct, err := sc.SealBlockAt(blockIdx, false, pt, ctBuf[:0])
 		if err != nil {
@@ -290,9 +322,17 @@ func DecryptPartStream(r io.Reader, w io.Writer, encKey [32]byte, noncePrefix [7
 	if err != nil {
 		return 0, err
 	}
+	return decryptPartStreamFrom(r, w, sc, 0)
+}
+
+func decryptPartStreamFrom(r io.Reader, w io.Writer, sc *StreamCipher, startBlockIdx uint32) (ptTotal int64, err error) {
 	buf := make([]byte, ChunkCiphertextMax+1)
+	defer clear(buf)
 	ptBuf := make([]byte, 0, ChunkPlaintextMax)
-	var blockIdx uint32
+	defer func() {
+		clear(ptBuf[:cap(ptBuf)])
+	}()
+	blockIdx := startBlockIdx
 	carry := 0
 
 	for {
@@ -324,7 +364,10 @@ func DecryptPartStream(r io.Reader, w io.Writer, encKey [32]byte, noncePrefix [7
 			return ptTotal, nil
 		}
 
-		// have == ChunkCiphertextMax + 1: non-final full block.
+		// have == ChunkCiphertextMax + 1: hard-stop BEFORE uint32 wrap-around!
+		if blockIdx == math.MaxUint32 {
+			return ptTotal, ErrStreamTooLarge
+		}
 		pt, err := sc.OpenBlockAt(blockIdx, false, buf[:ChunkCiphertextMax], ptBuf[:0])
 		if err != nil {
 			return ptTotal, err
@@ -356,7 +399,7 @@ func PadManifest(raw []byte) ([]byte, error) {
 	return out, nil
 }
 
-// UnpadManifest validates 4 KiB alignment, length prefix, and strictly-zero trailing padding bytes.
+// UnpadManifest validates exact 4 KiB bucket alignment, length prefix, and strictly-zero trailing padding bytes.
 func UnpadManifest(padded []byte) ([]byte, error) {
 	if len(padded) < ManifestPadBucket || len(padded)%ManifestPadBucket != 0 {
 		return nil, ErrInvalidPadding
@@ -365,12 +408,16 @@ func UnpadManifest(padded []byte) ([]byte, error) {
 	if l == 0 || l > ManifestMaxRawBytes || int(4+l) > len(padded) {
 		return nil, ErrInvalidPadding
 	}
-	// Verify all trailing padding bytes are strictly 0x00.
+	expectedTotal := ((4 + int(l) + ManifestPadBucket - 1) / ManifestPadBucket) * ManifestPadBucket
+	if len(padded) != expectedTotal {
+		return nil, ErrInvalidPadding
+	}
+	// Verify all trailing padding bytes are strictly 0x00 in constant time.
 	var nonZero byte
 	for i := int(4 + l); i < len(padded); i++ {
 		nonZero |= padded[i]
 	}
-	if nonZero != 0 {
+	if subtle.ConstantTimeByteEq(nonZero, 0) != 1 {
 		return nil, ErrInvalidPadding
 	}
 	out := make([]byte, l)
