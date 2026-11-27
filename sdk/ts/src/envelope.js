@@ -2,82 +2,39 @@
 // and unified cross-language SyncError & TransferEvent types (spec/ENVELOPE_AND_SDK.md).
 
 import { normalizeRoomId } from './crockford.js';
+import {
+  ErrorCode,
+  SyncError,
+  isAuthError,
+  isQuotaExceeded,
+  isRetryable,
+  isSecurityAlert,
+  isVersionMismatch,
+  redactMessage,
+  suggestPipeMode,
+} from './errors.js';
+
+export {
+  ErrorCode,
+  SyncError,
+  redactMessage,
+  isRetryable,
+  isQuotaExceeded,
+  suggestPipeMode,
+  isAuthError,
+  isSecurityAlert,
+  isVersionMismatch,
+};
 
 export const ENVELOPE_VERSION = 1;
 export const MAX_MANIFEST_BYTES = 131072; // 128 KiB
+export const MAX_ENCRYPTED_MANIFEST_BYTES = 135216; // 135,168 B padded + 3 * 16 B GCM tags
+export const MAX_MANIFEST_CHUNKS = 4;
 export const MAX_INLINE_PAYLOAD_BYTES = 65536; // 64 KiB
 export const MAX_BLOBS = 63; // part_id 0 (Manifest) + 1..63 (Blobs) = max 64 parts
 export const MAX_BLOB_META_BYTES = 2048;
 
 const UTF8_ENCODER = new TextEncoder();
-
-/** Frozen cross-language error code enumeration (15 wire + 19 client/local = 34 codes). */
-export const ErrorCode = Object.freeze({
-  // Wire protocol codes (1-to-1 with spec/PROTOCOL.md §4)
-  ERR_BAD_REQUEST: 'ERR_BAD_REQUEST',
-  ERR_REPLAY_DETECTED: 'ERR_REPLAY_DETECTED',
-  ERR_UNAUTHORIZED_TOKEN: 'ERR_UNAUTHORIZED_TOKEN',
-  ERR_SPOOL_DISABLED: 'ERR_SPOOL_DISABLED',
-  ERR_DOWNLOAD_LIMIT_EXCEEDED: 'ERR_DOWNLOAD_LIMIT_EXCEEDED',
-  ERR_NOT_FOUND: 'ERR_NOT_FOUND',
-  ERR_CLOCK_SKEW: 'ERR_CLOCK_SKEW',
-  ERR_ROOM_BUSY: 'ERR_ROOM_BUSY',
-  ERR_INVALID_STATE: 'ERR_INVALID_STATE',
-  ERR_CONFLICT: 'ERR_CONFLICT',
-  ERR_ROOM_BURNED: 'ERR_ROOM_BURNED',
-  ERR_CHUNK_TOO_LARGE: 'ERR_CHUNK_TOO_LARGE',
-  ERR_OFFLINE_QUOTA_EXCEEDED: 'ERR_OFFLINE_QUOTA_EXCEEDED',
-  ERR_RATE_LIMITED: 'ERR_RATE_LIMITED',
-  ERR_PIPE_PEER_TIMEOUT: 'ERR_PIPE_PEER_TIMEOUT',
-
-  // Client transport, crypto & host codes
-  ERR_RELAY_UNREACHABLE: 'ERR_RELAY_UNREACHABLE',
-  ERR_TLS_PIN_MISMATCH: 'ERR_TLS_PIN_MISMATCH',
-  ERR_TLS_CERT_INVALID: 'ERR_TLS_CERT_INVALID',
-  ERR_AUTH_FAILED: 'ERR_AUTH_FAILED',
-  ERR_HANDSHAKE_TIMEOUT: 'ERR_HANDSHAKE_TIMEOUT',
-  ERR_SAS_MISMATCH: 'ERR_SAS_MISMATCH',
-  ERR_CRYPTO_HANDSHAKE_FAILED: 'ERR_CRYPTO_HANDSHAKE_FAILED',
-  ERR_CRYPTO_DECRYPT_FAILED: 'ERR_CRYPTO_DECRYPT_FAILED',
-  ERR_CRYPTO_SIGNATURE_INVALID: 'ERR_CRYPTO_SIGNATURE_INVALID',
-  ERR_STREAM_TRUNCATED: 'ERR_STREAM_TRUNCATED',
-  ERR_MSG_REPLAY_DETECTED: 'ERR_MSG_REPLAY_DETECTED',
-  ERR_HASH_MISMATCH: 'ERR_HASH_MISMATCH',
-  ERR_MANIFEST_INVALID: 'ERR_MANIFEST_INVALID',
-  ERR_DEVICE_UNTRUSTED: 'ERR_DEVICE_UNTRUSTED',
-  ERR_INTERRUPTED_RESUMABLE: 'ERR_INTERRUPTED_RESUMABLE',
-  ERR_URI_INVALID: 'ERR_URI_INVALID',
-  ERR_KEYSTORE_ERROR: 'ERR_KEYSTORE_ERROR',
-  ERR_STORAGE_IO: 'ERR_STORAGE_IO',
-  ERR_CANCELLED: 'ERR_CANCELLED',
-});
-
-/** Structured cross-language error matching spec/ENVELOPE_AND_SDK.md §4.1. */
-export class SyncError extends Error {
-  /**
-   * @param {string} code
-   * @param {string} message
-   * @param {{ retryable?: boolean, httpStatus?: number, details?: Record<string, unknown>, cause?: unknown }} [options]
-   */
-  constructor(code, message, options = {}) {
-    super(message, options.cause !== undefined ? { cause: options.cause } : undefined);
-    this.name = 'SyncError';
-    this.code = code;
-    this.retryable = Boolean(options.retryable);
-    this.httpStatus = options.httpStatus ?? 0;
-    this.details = options.details ?? {};
-  }
-
-  toJSON() {
-    return {
-      code: this.code,
-      retryable: this.retryable,
-      http_status: this.httpStatus,
-      message: this.message,
-      details: this.details,
-    };
-  }
-}
 
 const HEX32_RE = /^[0-9a-f]{32}$/;
 const HEX64_RE = /^[0-9a-f]{64}$/;
@@ -96,6 +53,13 @@ const ALLOWED_ENCODINGS = new Set(['identity', 'gzip', 'zstd']);
 export function validateManifest(manifest, options = {}) {
   if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
     throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, 'manifest must be a JSON object');
+  }
+  if (Number.isInteger(manifest.envelope_version) && manifest.envelope_version > ENVELOPE_VERSION) {
+    throw new SyncError(
+      ErrorCode.ERR_UNSUPPORTED_VERSION,
+      `unsupported envelope_version: ${manifest.envelope_version} (supported: ${ENVELOPE_VERSION})`,
+      { details: { envelope_version: manifest.envelope_version, supported_version: ENVELOPE_VERSION } },
+    );
   }
   if (manifest.envelope_version !== ENVELOPE_VERSION) {
     throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, `unsupported envelope_version: ${manifest.envelope_version}`);
@@ -208,24 +172,70 @@ export function validateManifest(manifest, options = {}) {
   return encoded;
 }
 
+const WIN_RESERVED_STEM_RE = /^(CON|PRN|AUX|NUL|COM[1-9\u00b9\u00b2\u00b3]|LPT[1-9\u00b9\u00b2\u00b3])$/i;
+const BIDI_OVERRIDE_RE = /[\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/g;
+
+function truncateUtf8CodePoints(str, maxBytes) {
+  if (UTF8_ENCODER.encode(str).length <= maxBytes) return str;
+  const dotIdx = str.lastIndexOf('.');
+  let ext = '';
+  let stem = str;
+  if (dotIdx > 0 && str.length - dotIdx <= 16) {
+    ext = str.slice(dotIdx);
+    stem = str.slice(0, dotIdx);
+  }
+  const extBytes = UTF8_ENCODER.encode(ext).length;
+  const budget = maxBytes - extBytes;
+  let out = '';
+  let used = 0;
+  for (const cp of stem) {
+    const len = UTF8_ENCODER.encode(cp).length;
+    if (used + len > budget) break;
+    out += cp;
+    used += len;
+  }
+  out = out.replace(/[\s.]+$/g, '');
+  return out ? `${out}${ext}` : '';
+}
+
 /**
- * Sanitize untrusted display filename from Manifest to prevent path traversal when saving locally.
+ * Sanitize untrusted display filename from Manifest to prevent path traversal, RLO spoofing,
+ * UTF-8/surrogate truncation, trailing dots/spaces, and Windows reserved device names.
  * @param {string} name
  * @param {string} [fallback='attachment.bin']
  * @returns {string}
  */
 export function sanitizeFileName(name, fallback = 'attachment.bin') {
   if (typeof name !== 'string') return fallback;
-  // Strip path components, control chars, NUL, Windows-reserved chars
-  const base = name.replace(/^.*[\\/]/, '').trim();
-  if (!base || /^\.+$/.test(base)) return fallback;
+  const base = name.replace(/^.*[\\/]/, '');
   let cleaned = base
-    .replace(/[\x00-\x1f\x7f<>:"/\\|?*]/g, '_')
+    .replace(BIDI_OVERRIDE_RE, '')
+    .replace(/[\x00-\x1f\x7f-\x9f<>:"/\\|?*]/g, '_')
     .replace(/\.{2,}/g, '_')
-    .trim();
-  while (cleaned.startsWith('.')) cleaned = cleaned.slice(1);
+    .replace(/^[\s.]+|[\s.]+$/g, '');
   if (!cleaned || /^[._]+$/.test(cleaned)) return fallback;
-  return cleaned.slice(0, 200);
+  cleaned = truncateUtf8CodePoints(cleaned, 199).replace(/^[\s.]+|[\s.]+$/g, '');
+  if (!cleaned || /^[._]+$/.test(cleaned)) return fallback;
+  const dot = cleaned.indexOf('.');
+  const stem = (dot >= 0 ? cleaned.slice(0, dot) : cleaned).trim();
+  if (WIN_RESERVED_STEM_RE.test(stem)) {
+    cleaned = `_${cleaned}`;
+  }
+  return cleaned;
+}
+
+/**
+ * Construct a zero-boilerplate UTF-8 text ParcelInput (`schema = "clip.text.v1"`).
+ * @param {string} text
+ * @param {string} [appId]
+ */
+export function parcelText(text, appId) {
+  return {
+    ...(appId ? { appId } : {}),
+    schema: 'clip.text.v1',
+    inlinePayload: { text: String(text) },
+    blobs: [],
+  };
 }
 
 /**
@@ -321,14 +331,18 @@ function parseKV(str) {
  * @param {string} uri
  */
 export function parseRelayURI(uri) {
-  if (typeof uri !== 'string' || !uri.startsWith('synctool://relay')) {
+  if (typeof uri !== 'string') {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'relay URI must start with synctool://relay');
+  }
+  uri = uri.trim();
+  if (!uri.toLowerCase().startsWith('synctool://relay')) {
     throw new SyncError(ErrorCode.ERR_URI_INVALID, 'relay URI must start with synctool://relay');
   }
   const hashIdx = uri.indexOf('#');
   const beforeHash = hashIdx >= 0 ? uri.slice(0, hashIdx) : uri;
   const fragmentStr = hashIdx >= 0 ? uri.slice(hashIdx + 1) : '';
   const qIdx = beforeHash.indexOf('?');
-  const pathPart = qIdx >= 0 ? beforeHash.slice('synctool://'.length, qIdx) : beforeHash.slice('synctool://'.length);
+  const pathPart = (qIdx >= 0 ? beforeHash.slice('synctool://'.length, qIdx) : beforeHash.slice('synctool://'.length)).toLowerCase();
   if (pathPart !== 'relay') {
     throw new SyncError(ErrorCode.ERR_URI_INVALID, 'relay URI path must be "relay"');
   }
@@ -338,6 +352,11 @@ export function parseRelayURI(uri) {
 
   const vStr = query.get('v') ?? '1';
   if (vStr !== '1') {
+    if (/^\d+$/.test(vStr) && Number(vStr) > 1) {
+      throw new SyncError(ErrorCode.ERR_UNSUPPORTED_VERSION, `unsupported relay URI version: ${vStr} (supported: 1)`, {
+        details: { version: Number(vStr), supported_version: 1 },
+      });
+    }
     throw new SyncError(ErrorCode.ERR_URI_INVALID, `unsupported relay URI version: ${vStr}`);
   }
   const rawU = query.get('u');
@@ -400,14 +419,18 @@ export function formatRelayURI(profile) {
  * @param {string} uri
  */
 export function parsePairURI(uri) {
-  if (typeof uri !== 'string' || !uri.startsWith('synctool://pair')) {
+  if (typeof uri !== 'string') {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'pair URI must start with synctool://pair');
+  }
+  uri = uri.trim();
+  if (!uri.toLowerCase().startsWith('synctool://pair')) {
     throw new SyncError(ErrorCode.ERR_URI_INVALID, 'pair URI must start with synctool://pair');
   }
   const hashIdx = uri.indexOf('#');
   const beforeHash = hashIdx >= 0 ? uri.slice(0, hashIdx) : uri;
   const fragmentStr = hashIdx >= 0 ? uri.slice(hashIdx + 1) : '';
   const qIdx = beforeHash.indexOf('?');
-  const pathPart = qIdx >= 0 ? beforeHash.slice('synctool://'.length, qIdx) : beforeHash.slice('synctool://'.length);
+  const pathPart = (qIdx >= 0 ? beforeHash.slice('synctool://'.length, qIdx) : beforeHash.slice('synctool://'.length)).toLowerCase();
   if (pathPart !== 'pair') {
     throw new SyncError(ErrorCode.ERR_URI_INVALID, 'pair URI path must be "pair"');
   }
@@ -420,6 +443,11 @@ export function parsePairURI(uri) {
 
   const vStr = query.get('v') ?? '1';
   if (vStr !== '1') {
+    if (/^\d+$/.test(vStr) && Number(vStr) > 1) {
+      throw new SyncError(ErrorCode.ERR_UNSUPPORTED_VERSION, `unsupported pair URI version: ${vStr} (supported: 1)`, {
+        details: { version: Number(vStr), supported_version: 1 },
+      });
+    }
     throw new SyncError(ErrorCode.ERR_URI_INVALID, `unsupported pair URI version: ${vStr}`);
   }
 
@@ -586,4 +614,16 @@ export function redactURI(uri) {
   if (typeof uri !== 'string') return '';
   const idx = uri.indexOf('#');
   return idx >= 0 ? `${uri.slice(0, idx)}#<redacted>` : uri;
+}
+
+/**
+ * Load and parse `SYNCTOOL_RELAY` (or `SYNCTOOL_RELAY_URI`) in Node/Deno/Bun runtimes.
+ */
+export function relayProfileFromEnv() {
+  const env = typeof process !== 'undefined' && process?.env ? process.env : {};
+  const raw = (env.SYNCTOOL_RELAY || env.SYNCTOOL_RELAY_URI || '').trim();
+  if (!raw) {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'SYNCTOOL_RELAY environment variable is not set');
+  }
+  return parseRelayURI(raw);
 }
