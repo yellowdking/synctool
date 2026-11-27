@@ -136,7 +136,7 @@ export async function startRelayProcess(relayBin, opts) {
     port,
     stop() {
       return new Promise((resolve) => {
-        if (child.exitCode !== null) {
+        if (child.exitCode !== null || child.signalCode !== null) {
           fs.rmSync(dataDir, { recursive: true, force: true });
           resolve();
           return;
@@ -147,7 +147,7 @@ export async function startRelayProcess(relayBin, opts) {
         });
         child.kill('SIGTERM');
         setTimeout(() => {
-          if (child.exitCode === null) child.kill('SIGKILL');
+          if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
         }, 2000).unref();
       });
     },
