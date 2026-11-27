@@ -38,9 +38,12 @@ import {
 import {
   ENVELOPE_VERSION,
   ErrorCode,
+  MAX_ENCRYPTED_MANIFEST_BYTES,
+  MAX_MANIFEST_CHUNKS,
   SyncError,
   formatPairURI,
   parsePairURI,
+  sanitizeFileName,
   validateManifest,
 } from './envelope.js';
 import {
@@ -245,6 +248,7 @@ export async function downloadBlobStreaming({
     const sinkResult = sink ? await sink.finish() : undefined;
     return {
       descriptor: blobDesc,
+      safeName: sanitizeFileName(blobDesc.name),
       bytes: collected ? concatBytes(...collected) : undefined,
       sinkResult,
     };
@@ -254,6 +258,20 @@ export async function downloadBlobStreaming({
   } finally {
     zeroBytes(encKey);
     zeroBytes(blobKey);
+  }
+}
+
+export function assertValidPart0Layout(part0Meta) {
+  if (
+    !part0Meta ||
+    !Number.isInteger(part0Meta.total_bytes) ||
+    part0Meta.total_bytes <= 0 ||
+    part0Meta.total_bytes > MAX_ENCRYPTED_MANIFEST_BYTES ||
+    !Number.isInteger(part0Meta.chunk_count) ||
+    part0Meta.chunk_count < 1 ||
+    part0Meta.chunk_count > MAX_MANIFEST_CHUNKS
+  ) {
+    throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, 'part_id=0 layout missing or exceeds 128 KiB manifest bounds');
   }
 }
 
@@ -270,7 +288,8 @@ export async function putPipeChunkWithRetry(client, pipeId, roomToken, partId, t
       });
       return;
     } catch (err) {
-      if (err instanceof SyncError && err.code === ErrorCode.ERR_PIPE_PEER_TIMEOUT && Date.now() < deadlineMs) {
+      if (err instanceof SyncError && err.code === ErrorCode.ERR_PIPE_PEER_TIMEOUT && Date.now() < deadlineMs && !signal?.aborted) {
+        await new Promise((r) => setTimeout(r, 50));
         continue;
       }
       throw err;
@@ -289,7 +308,8 @@ export async function getPipeChunkWithRetry(client, pipeId, roomToken, partId, t
       });
       return new Uint8Array(await res.arrayBuffer());
     } catch (err) {
-      if (err instanceof SyncError && err.code === ErrorCode.ERR_PIPE_PEER_TIMEOUT && Date.now() < deadlineMs) {
+      if (err instanceof SyncError && err.code === ErrorCode.ERR_PIPE_PEER_TIMEOUT && Date.now() < deadlineMs && !signal?.aborted) {
+        await new Promise((r) => setTimeout(r, 50));
         continue;
       }
       throw err;
@@ -412,8 +432,13 @@ export async function startOneShotSendImpl(client, parcel, opts = {}) {
 }
 
 export async function receiveOneShotImpl(client, pairInput, handler, opts = {}) {
+  return receiveOneShotJoinedImpl(client, pairInput, null, handler, opts);
+}
+
+export async function receiveOneShotJoinedImpl(client, pairInput, preJoined, handler, opts = {}) {
   const { roomId, pipeId, roomToken, seq: s0, hs } = await runFlow1Responder(client, pairInput, {
     expectedPurpose: 'oneshot',
+    preJoined,
     onSASDisplay: opts.onSASDisplay,
     timeoutMs: opts.timeoutMs,
     preferPoll: opts.preferPoll,
@@ -441,11 +466,17 @@ export async function receiveOneShotImpl(client, pairInput, handler, opts = {}) 
     const deadlineMs = Date.now() + (opts.timeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS);
 
     const part0Meta = startPayload.parts.find((p) => p.part_id === 0);
-    if (!part0Meta) throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, 'pipe_start missing part_id=0');
+    assertValidPart0Layout(part0Meta);
 
     const p0Chunks = [];
+    let p0Total = 0;
     for (let tx = 0; tx < part0Meta.chunk_count; tx++) {
-      p0Chunks.push(await getPipeChunkWithRetry(client, pipeId, roomToken, 0, tx, deadlineMs, opts.signal));
+      const ch = await getPipeChunkWithRetry(client, pipeId, roomToken, 0, tx, deadlineMs, opts.signal);
+      p0Total += ch.length;
+      if (p0Total > MAX_ENCRYPTED_MANIFEST_BYTES) {
+        throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, 'part_id=0 stream exceeded maximum manifest byte budget');
+      }
+      p0Chunks.push(ch);
     }
     const paddedManifest = await decryptPartBytes(part0Key, part0NoncePrefix, msgIdRaw, 0, p0Chunks);
     const manifestUtf8 = unpadManifest(paddedManifest);
@@ -578,9 +609,10 @@ export async function sendDirectModeAImpl(client, prep, sealed, blocksPerChunk, 
  * Receive Flow 2 Mode A Direct Transfer (m=0&p=direct, spec/CRYPTO_AND_AUTH.md §5.4).
  */
 export async function receiveDirectImpl(client, pairInput, handler, opts = {}) {
-  const roomId = typeof pairInput === 'string' && pairInput.startsWith('synctool://pair')
-    ? parsePairURI(pairInput).roomId
-    : normalizeRoomId(pairInput);
+  const trimmed = typeof pairInput === 'string' ? pairInput.trim() : '';
+  const roomId = trimmed.toLowerCase().startsWith('synctool://pair')
+    ? parsePairURI(trimmed).roomId
+    : normalizeRoomId(trimmed);
 
   const joinRes = await client._signedRequest({
     method: 'POST',
@@ -590,13 +622,24 @@ export async function receiveDirectImpl(client, pairInput, handler, opts = {}) {
   });
   const joined = await joinRes.json();
   const roomToken = joined.receiver_token;
-  const pipeId = joined.pipe_id;
   const m1Msg = (joined.messages || []).find((m) => m.from === 'sender' && m.kind === 'handshake');
   if (!m1Msg) {
     await closeRoom(client, roomId, roomToken, 'verify_failed');
     throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'direct room missing initial M1');
   }
   const m1 = JSON.parse(utf8Decode(b64uToBytes(m1Msg.msg_b64)));
+  if (Number.isInteger(m1.proto_v) && m1.proto_v > PROTO_VERSION) {
+    await closeRoom(client, roomId, roomToken, 'verify_failed');
+    throw new SyncError(ErrorCode.ERR_UNSUPPORTED_VERSION, `unsupported direct M1 proto_v: ${m1.proto_v}`, {
+      details: { proto_v: m1.proto_v, supported_proto_v: PROTO_VERSION },
+    });
+  }
+  return receiveDirectJoinedImpl(client, roomId, joined, m1, handler, opts);
+}
+
+export async function receiveDirectJoinedImpl(client, roomId, joined, m1, handler, opts = {}) {
+  const roomToken = joined.receiver_token;
+  const pipeId = joined.pipe_id;
   if (m1.proto_v !== PROTO_VERSION || m1.mode !== 0 || m1.purpose !== 'direct' || !m1.sealed_header || !Array.isArray(m1.parts)) {
     await closeRoom(client, roomId, roomToken, 'verify_failed');
     throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'invalid direct M1 payload');
@@ -620,11 +663,17 @@ export async function receiveDirectImpl(client, pairInput, handler, opts = {}) {
   try {
     const deadlineMs = Date.now() + (opts.timeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS);
     const part0Meta = m1.parts.find((p) => p.part_id === 0);
-    if (!part0Meta) throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, 'direct M1 missing part_id=0');
+    assertValidPart0Layout(part0Meta);
 
     const p0Chunks = [];
+    let p0Total = 0;
     for (let tx = 0; tx < part0Meta.chunk_count; tx++) {
-      p0Chunks.push(await getPipeChunkWithRetry(client, pipeId, roomToken, 0, tx, deadlineMs, opts.signal));
+      const ch = await getPipeChunkWithRetry(client, pipeId, roomToken, 0, tx, deadlineMs, opts.signal);
+      p0Total += ch.length;
+      if (p0Total > MAX_ENCRYPTED_MANIFEST_BYTES) {
+        throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, 'part_id=0 stream exceeded maximum manifest byte budget');
+      }
+      p0Chunks.push(ch);
     }
     const paddedManifest = await decryptPartBytes(header.part0Key, header.part0NoncePrefix, header.msgIdRaw, 0, p0Chunks);
     const manifestUtf8 = unpadManifest(paddedManifest);
