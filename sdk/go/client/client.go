@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -41,11 +42,17 @@ type Client struct {
 	deviceKeys     *synccrypto.DeviceKeys
 	mailboxKeys    *synccrypto.MailboxKeys
 	clockOffsetSec atomic.Int64
+
+	tempMu         sync.Mutex
+	createdMsgDirs []string
 }
 
 // PingResult matches GET /v1/ping (PROTOCOL.md §5.1).
 type PingResult struct {
 	ProtoV                int    `json:"proto_v"`
+	MinProtoV             int    `json:"min_proto_v,omitempty"`
+	MaxProtoV             int    `json:"max_proto_v,omitempty"`
+	ServerVersion         string `json:"server_version,omitempty"`
 	ServerTS              int64  `json:"server_ts"`
 	Profile               string `json:"profile"`
 	SpoolBackend          string `json:"spool_backend"`
@@ -58,6 +65,10 @@ type PingResult struct {
 // RelayCaps matches GET /v1/caps (PROTOCOL.md §5.1).
 type RelayCaps struct {
 	ProtoV                    int           `json:"proto_v"`
+	MinProtoV                 int           `json:"min_proto_v,omitempty"`
+	MaxProtoV                 int           `json:"max_proto_v,omitempty"`
+	ServerVersion             string        `json:"server_version,omitempty"`
+	Features                  []string      `json:"features,omitempty"`
 	Profile                   string        `json:"profile"`
 	ServerTS                  int64         `json:"server_ts"`
 	CertExpiresAt             int64         `json:"cert_expires_at"`
@@ -237,7 +248,13 @@ func New(cfg Config) (*Client, error) {
 	}
 	tempDir := cfg.TempDir
 	if tempDir == "" {
-		tempDir = filepath.Join(os.TempDir(), "synctool-tmp")
+		if fks, ok := cfg.KeyStore.(*envelope.FileKeyStore); ok && fks.Dir() != "" {
+			tempDir = filepath.Join(fks.Dir(), "tmp")
+		} else if cacheDir, err := os.UserCacheDir(); err == nil && cacheDir != "" {
+			tempDir = filepath.Join(cacheDir, "synctool-tmp", dk.DeviceID[:12])
+		} else {
+			tempDir = filepath.Join(os.TempDir(), "synctool-tmp-"+dk.DeviceID[:12])
+		}
 	}
 
 	return &Client{
@@ -271,10 +288,18 @@ func defaultPlatform() string {
 	}
 }
 
-// Close wipes derived key material from memory and closes idle HTTP connections.
+// Close wipes derived key material from memory, removes verified parcel staging dirs created by this Client,
+// and closes idle HTTP connections.
 func (c *Client) Close() {
 	if c == nil {
 		return
+	}
+	c.tempMu.Lock()
+	dirs := c.createdMsgDirs
+	c.createdMsgDirs = nil
+	c.tempMu.Unlock()
+	for _, d := range dirs {
+		_ = os.RemoveAll(d)
 	}
 	if c.deviceKeys != nil {
 		c.deviceKeys.Zero()
@@ -285,6 +310,17 @@ func (c *Client) Close() {
 	if c.httpClient != nil {
 		c.httpClient.CloseIdleConnections()
 	}
+}
+
+func (c *Client) trackMsgDir(dir string) {
+	c.tempMu.Lock()
+	defer c.tempMu.Unlock()
+	for _, existing := range c.createdMsgDirs {
+		if existing == dir {
+			return
+		}
+	}
+	c.createdMsgDirs = append(c.createdMsgDirs, dir)
 }
 
 // Identity returns public identity metadata for this device on the active relay (never returns private keys).
