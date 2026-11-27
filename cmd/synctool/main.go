@@ -40,7 +40,9 @@ func (m *multiStringFlag) Set(v string) error {
 }
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	rawArgs := append([]string(nil), os.Args[1:]...)
+	scrubProcessArgs(os.Args)
+	os.Exit(run(rawArgs, os.Stdin, os.Stdout, os.Stderr))
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -86,16 +88,34 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 }
 
 func defaultConfigDir() string {
+	if envDir := strings.TrimSpace(os.Getenv(envConfig)); envDir != "" {
+		return envDir
+	}
 	if d, err := os.UserConfigDir(); err == nil && d != "" {
 		return filepath.Join(d, "synctool")
 	}
 	return filepath.Join(os.TempDir(), "synctool-config")
 }
 
+func defaultRelayRefFromEnv() string {
+	if v := strings.TrimSpace(os.Getenv(envRelay)); v != "" {
+		return v
+	}
+	return strings.TrimSpace(os.Getenv(envRelayURI))
+}
+
+func defaultAppID() string {
+	if v := strings.TrimSpace(os.Getenv(envApp)); v != "" {
+		return v
+	}
+	return "synctool.cli"
+}
+
 func parseGlobalFlags(args []string) (globalOpts, []string, error) {
 	opts := globalOpts{
 		configDir: defaultConfigDir(),
-		appID:     "synctool.cli",
+		relayRef:  defaultRelayRefFromEnv(),
+		appID:     defaultAppID(),
 	}
 	i := 0
 	for i < len(args) {
@@ -173,7 +193,9 @@ func emitEvent(opts globalOpts, stdout io.Writer, ev any) {
 func emitErr(opts globalOpts, stdout, stderr io.Writer, err error) int {
 	se, ok := envelope.AsSyncError(err)
 	if !ok {
-		se = envelope.WrapError(envelope.ErrCodeStorageIO, false, 0, err.Error(), err)
+		se = envelope.WrapError(envelope.ErrCodeStorageIO, false, 0, redactSecretsInText(err.Error()), err)
+	} else {
+		se = sanitizeSyncError(se)
 	}
 	if opts.jsonMode {
 		_ = json.NewEncoder(stdout).Encode(map[string]any{
@@ -187,30 +209,51 @@ func emitErr(opts globalOpts, stdout, stderr io.Writer, err error) int {
 }
 
 func openKeyStore(opts globalOpts) (*envelope.FileKeyStore, error) {
+	if err := ensurePrivateDir(opts.configDir); err != nil {
+		return nil, err
+	}
 	return envelope.NewFileKeyStore(opts.configDir)
+}
+
+func resolveRelayProfile(opts globalOpts, ks envelope.KeyStore, stderr io.Writer) (*envelope.RelayProfile, error) {
+	ref := strings.TrimSpace(opts.relayRef)
+	if ref != "" {
+		if hasCaseInsensitivePrefix(ref, "synctool://") {
+			return envelope.ParseRelayURI(ref)
+		}
+		prof, err := ks.GetRelayProfile(ref)
+		if err != nil {
+			return nil, err
+		}
+		if prof != nil {
+			return prof, nil
+		}
+		return nil, envelope.NewError(envelope.ErrCodeKeystoreError, false, 0, fmt.Sprintf("relay profile %q not found in keystore", redactSecretsInText(ref)), nil)
+	}
+	return ks.GetDefaultRelayProfile()
 }
 
 func openClient(opts globalOpts, ks envelope.KeyStore, overrideProfile *envelope.RelayProfile, stdout, stderr io.Writer) (*client.Client, error) {
 	prof := overrideProfile
 	var err error
 	if prof == nil {
-		if opts.relayRef != "" {
-			prof, err = ks.GetRelayProfile(opts.relayRef)
-		} else {
-			prof, err = ks.GetDefaultRelayProfile()
-		}
+		prof, err = resolveRelayProfile(opts, ks, stderr)
 		if err != nil {
 			return nil, err
 		}
 		if prof == nil {
-			return nil, envelope.NewError(envelope.ErrCodeKeystoreError, false, 0, "no relay configured; run 'synctool init' first", nil)
+			return nil, envelope.NewError(envelope.ErrCodeKeystoreError, false, 0, "no relay configured; run 'synctool init' or set SYNCTOOL_RELAY", nil)
 		}
+	}
+	tmpDir := filepath.Join(opts.configDir, "tmp")
+	if err := ensurePrivateDir(tmpDir); err != nil {
+		return nil, err
 	}
 	return client.New(client.Config{
 		AppID:    opts.appID,
 		Relay:    prof,
 		KeyStore: ks,
-		TempDir:  filepath.Join(opts.configDir, "tmp"),
+		TempDir:  tmpDir,
 		OnCertExpiring: func(ev envelope.RelayCertExpiringEvent) {
 			if opts.jsonMode {
 				emitEvent(opts, stdout, ev)
@@ -239,6 +282,7 @@ func cmdInit(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 	fs.SetOutput(io.Discard)
 	relayURI := fs.String("relay-uri", "", "synctool://relay URI")
 	useStdin := fs.Bool("stdin", false, "read synctool://relay URI from stdin")
+	useRelayStdin := fs.Bool("relay-stdin", false, "read synctool://relay URI from stdin (alias for --stdin)")
 	alias := fs.String("alias", "", "optional alias for this relay")
 	label := fs.String("label", "", "local device label")
 	if err := fs.Parse(args); err != nil {
@@ -246,14 +290,32 @@ func cmdInit(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 	}
 
 	rawURI := strings.TrimSpace(*relayURI)
-	if *useStdin || (rawURI == "" && fs.NArg() == 0) {
+	switch {
+	case *useStdin || *useRelayStdin:
 		var err error
 		rawURI, err = readSecretLine(stdin)
 		if err != nil {
 			return err
 		}
-	} else if rawURI == "" && fs.NArg() > 0 {
+	case rawURI != "":
+		warnSecretOnArgv(opts, stderr, rawURI)
+	case fs.NArg() > 0:
 		rawURI = strings.TrimSpace(fs.Arg(0))
+		warnSecretOnArgv(opts, stderr, rawURI)
+	default:
+		envURI := strings.TrimSpace(os.Getenv(envRelayURI))
+		if envURI == "" && hasCaseInsensitivePrefix(strings.TrimSpace(os.Getenv(envRelay)), "synctool://") {
+			envURI = strings.TrimSpace(os.Getenv(envRelay))
+		}
+		if envURI != "" {
+			rawURI = envURI
+		} else {
+			var err error
+			rawURI, err = readSecretLine(stdin)
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	prof, err := envelope.ParseRelayURI(rawURI)
@@ -442,22 +504,25 @@ func cmdPair(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 			return envelope.NewError(envelope.ErrCodeBadRequest, false, 0, err.Error(), nil)
 		}
 		var pairIn string
-		if *useStdin {
+		switch {
+		case *useStdin:
 			pairIn, err = readSecretLine(stdin)
 			if err != nil {
 				return err
 			}
-		} else if fs.NArg() > 0 {
+		case fs.NArg() > 0:
 			pairIn = strings.TrimSpace(fs.Arg(0))
-		} else {
-			return envelope.NewError(envelope.ErrCodeBadRequest, false, 0, "pair accept requires URI/room code or --stdin", nil)
+			warnSecretOnArgv(opts, stderr, pairIn)
+		case strings.TrimSpace(os.Getenv(envPairURI)) != "":
+			pairIn = strings.TrimSpace(os.Getenv(envPairURI))
+		default:
+			return envelope.NewError(envelope.ErrCodeBadRequest, false, 0, "pair accept requires URI/room code, --stdin, or SYNCTOOL_PAIR_URI", nil)
 		}
 		var overrideProf *envelope.RelayProfile
 		if p, ok, err := client.ParseRelayFromPairURI(pairIn); err != nil {
 			return err
 		} else if ok {
 			overrideProf = p
-			_ = ks.SaveRelayProfile(*p)
 		}
 		cli, err := openClient(opts, ks, overrideProf, stdout, stderr)
 		if err != nil {
@@ -478,6 +543,14 @@ func cmdPair(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 		})
 		if err != nil {
 			return err
+		}
+		// Only persist embedded relay profile AFTER handshake + SAS + DeviceCard verification succeed!
+		if overrideProf != nil {
+			existingDefault, _ := ks.GetDefaultRelayProfile()
+			overrideProf.IsDefault = existingDefault == nil
+			if err := ks.SaveRelayProfile(*overrideProf); err != nil {
+				return err
+			}
 		}
 		emitResult(opts, stdout, card, fmt.Sprintf("paired device %s (%s)", card.DeviceID, card.Label))
 		return nil
