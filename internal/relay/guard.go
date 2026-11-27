@@ -75,8 +75,18 @@ func NewIPGuard(preset ProfilePreset, trustedProxies []netip.Prefix) *IPGuard {
 	}
 }
 
+func cleanIPAddr(addr netip.Addr) netip.Addr {
+	if !addr.IsValid() {
+		return netip.Addr{}
+	}
+	return addr.Unmap().WithZone("")
+}
+
 func NormalizeIPKey(addr netip.Addr) netip.Prefix {
-	addr = addr.Unmap()
+	addr = cleanIPAddr(addr)
+	if !addr.IsValid() {
+		return netip.PrefixFrom(netip.MustParseAddr("0.0.0.0"), 32)
+	}
 	if addr.Is6() {
 		return netip.PrefixFrom(addr, 64).Masked()
 	}
@@ -84,7 +94,10 @@ func NormalizeIPKey(addr netip.Addr) netip.Prefix {
 }
 
 func (g *IPGuard) isTrusted(addr netip.Addr) bool {
-	addr = addr.Unmap()
+	addr = cleanIPAddr(addr)
+	if !addr.IsValid() {
+		return false
+	}
 	for _, p := range g.trustedProxies {
 		if p.Contains(addr) {
 			return true
@@ -103,7 +116,7 @@ func ParseRemoteAddrIP(remoteAddr string) (netip.Addr, bool) {
 	if err != nil {
 		return netip.Addr{}, false
 	}
-	return addr.Unmap(), true
+	return cleanIPAddr(addr), true
 }
 
 // ExtractClientIP extracts the true client IP safely respecting TRUSTED_PROXIES.
@@ -116,25 +129,42 @@ func (g *IPGuard) ExtractClientIP(r *http.Request) netip.Addr {
 		return remoteIP
 	}
 
-	// Walk X-Forwarded-For right-to-left and pick first IP not in TRUSTED_PROXIES.
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+	// Merge all X-Forwarded-For header lines (prevents spoofed first header line bypass)
+	// and walk right-to-left, stopping immediately on any malformed token.
+	if xffVals := r.Header.Values("X-Forwarded-For"); len(xffVals) > 0 {
+		xff := strings.Join(xffVals, ",")
 		parts := strings.Split(xff, ",")
+		var leftmostTrusted netip.Addr
 		for i := len(parts) - 1; i >= 0; i-- {
 			cand := strings.TrimSpace(parts[i])
-			if addr, err := netip.ParseAddr(cand); err == nil {
-				addr = addr.Unmap()
-				if !g.isTrusted(addr) {
-					return addr
-				}
+			if cand == "" {
+				break
 			}
+			addr, err := netip.ParseAddr(cand)
+			if err != nil || addr.Zone() != "" {
+				break
+			}
+			addr = cleanIPAddr(addr)
+			if !g.isTrusted(addr) {
+				return addr
+			}
+			leftmostTrusted = addr
 		}
+		// Never fall through to client-spoofable CF-Connecting-IP / X-Real-IP when XFF is present.
+		if leftmostTrusted.IsValid() {
+			return leftmostTrusted
+		}
+		return remoteIP
 	}
 
-	// Fallback to CF-Connecting-IP / X-Real-IP when proxy is explicitly trusted.
+	// Fallback to CF-Connecting-IP / X-Real-IP only when XFF is absent and proxy is trusted.
 	for _, hdr := range []string{"CF-Connecting-IP", "X-Real-IP"} {
-		if v := strings.TrimSpace(r.Header.Get(hdr)); v != "" {
-			if addr, err := netip.ParseAddr(v); err == nil {
-				return addr.Unmap()
+		vals := r.Header.Values(hdr)
+		if len(vals) == 1 {
+			if v := strings.TrimSpace(vals[0]); v != "" {
+				if addr, err := netip.ParseAddr(v); err == nil && addr.Zone() == "" {
+					return cleanIPAddr(addr)
+				}
 			}
 		}
 	}
@@ -171,7 +201,7 @@ func (g *IPGuard) getOrCreateLocked(key netip.Prefix, now time.Time) *ipEntry {
 }
 
 func (g *IPGuard) evictLocked(now time.Time) {
-	// First drop idle non-banned entries (>10 min idle).
+	// Pass 1: drop idle non-banned entries (>10 min idle).
 	cutoff := now.Add(-10 * time.Minute)
 	removed := 0
 	target := g.maxTrackedIPs / 8
@@ -187,13 +217,44 @@ func (g *IPGuard) evictLocked(now time.Time) {
 			}
 		}
 	}
-	// If still at capacity, remove arbitrary oldest-ish batch.
-	for k := range g.entries {
-		delete(g.entries, k)
-		removed++
-		if removed >= target {
-			return
+	// Pass 2: never evict active banned IPs while any non-banned entry exists;
+	// evict oldest-seen non-banned entries first.
+	for removed < target {
+		var oldestKey netip.Prefix
+		var oldestTime time.Time
+		foundUnbanned := false
+		for k, v := range g.entries {
+			if now.Before(v.bannedUntil) {
+				continue
+			}
+			if !foundUnbanned || v.lastSeen.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = v.lastSeen
+				foundUnbanned = true
+			}
 		}
+		if !foundUnbanned {
+			break
+		}
+		delete(g.entries, oldestKey)
+		removed++
+	}
+	if removed > 0 {
+		return
+	}
+	// Pass 3 (100% of table is actively banned): evict single entry closest to ban expiry.
+	var soonestKey netip.Prefix
+	var soonestExpiry time.Time
+	hasAny := false
+	for k, v := range g.entries {
+		if !hasAny || v.bannedUntil.Before(soonestExpiry) {
+			soonestKey = k
+			soonestExpiry = v.bannedUntil
+			hasAny = true
+		}
+	}
+	if hasAny {
+		delete(g.entries, soonestKey)
 	}
 }
 
@@ -238,14 +299,14 @@ func (g *IPGuard) RecordStrike(addr netip.Addr, now time.Time) (bannedNow bool) 
 // LimitListener enforces L4 active TCP concurrency and drops banned IPs at Accept().
 type LimitListener struct {
 	net.Listener
-	guard     *IPGuard
-	nowFunc   func() time.Time
-	maxTotal  int
-	maxPerIP  int
-	mu        sync.Mutex
-	total     int
-	perIP     map[netip.Prefix]int
-	hasProxy  bool
+	guard    *IPGuard
+	nowFunc  func() time.Time
+	maxTotal int
+	maxPerIP int
+	mu       sync.Mutex
+	total    int
+	perIP    map[netip.Prefix]int
+	hasProxy bool
 }
 
 func NewLimitListener(inner net.Listener, guard *IPGuard, maxTotal, maxPerIP int, nowFunc func() time.Time) *LimitListener {

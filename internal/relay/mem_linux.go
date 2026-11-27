@@ -4,32 +4,64 @@ package relay
 
 import (
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 )
 
+func readCgroupV2Max(path string) uint64 {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	s := strings.TrimSpace(string(data))
+	if s == "" || s == "max" {
+		return 0
+	}
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil || v == 0 {
+		return 0
+	}
+	return v
+}
+
+func readCgroupV1Limit(path string) uint64 {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	s := strings.TrimSpace(string(data))
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil || v == 0 || v >= (1<<60) {
+		return 0
+	}
+	return v
+}
+
 func detectEffectiveMemoryBytes() uint64 {
 	var cgroupLimit uint64
 
-	// 1. Try cgroup v2 (/sys/fs/cgroup/memory.max)
-	if data, err := os.ReadFile("/sys/fs/cgroup/memory.max"); err == nil {
-		s := strings.TrimSpace(string(data))
-		if s != "" && s != "max" {
-			if v, err := strconv.ParseUint(s, 10, 64); err == nil && v > 0 {
-				cgroupLimit = v
-			}
-		}
+	// Inspect /proc/self/cgroup first so systemd non-containerized MemoryMax slices are honored.
+	var v2Rel, v1MemRel string
+	if selfCg, err := os.ReadFile("/proc/self/cgroup"); err == nil {
+		v2Rel, v1MemRel = ParseProcSelfCgroupPaths(string(selfCg))
 	}
 
-	// 2. Fallback to cgroup v1 (/sys/fs/cgroup/memory/memory.limit_in_bytes)
+	// 1. Try cgroup v2 (process slice first, then root /sys/fs/cgroup/memory.max)
+	if v2Rel != "" {
+		cgroupLimit = readCgroupV2Max(filepath.Join("/sys/fs/cgroup", v2Rel, "memory.max"))
+	}
 	if cgroupLimit == 0 {
-		if data, err := os.ReadFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); err == nil {
-			s := strings.TrimSpace(string(data))
-			if v, err := strconv.ParseUint(s, 10, 64); err == nil && v > 0 && v < (1<<60) {
-				cgroupLimit = v
-			}
-		}
+		cgroupLimit = readCgroupV2Max("/sys/fs/cgroup/memory.max")
+	}
+
+	// 2. Fallback to cgroup v1 (process slice first, then root memory.limit_in_bytes)
+	if cgroupLimit == 0 && v1MemRel != "" {
+		cgroupLimit = readCgroupV1Limit(filepath.Join("/sys/fs/cgroup/memory", v1MemRel, "memory.limit_in_bytes"))
+	}
+	if cgroupLimit == 0 {
+		cgroupLimit = readCgroupV1Limit("/sys/fs/cgroup/memory/memory.limit_in_bytes")
 	}
 
 	// 3. Read host physical RAM from /proc/meminfo
