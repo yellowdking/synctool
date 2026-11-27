@@ -126,7 +126,7 @@ export async function waitRoomMessage(client, roomId, roomToken, sinceSeq, predi
       }
     } catch (err) {
       if (signal?.aborted) throw new SyncError(ErrorCode.ERR_CANCELLED, 'operation cancelled', { cause: err });
-      if (err instanceof SyncError && (err.code === ErrorCode.ERR_ROOM_BURNED || err.code === ErrorCode.ERR_NOT_FOUND || err.code === ErrorCode.ERR_UNAUTHORIZED_TOKEN || err.code === ErrorCode.ERR_HANDSHAKE_TIMEOUT)) {
+      if (err instanceof SyncError && (err.code === ErrorCode.ERR_ROOM_BURNED || err.code === ErrorCode.ERR_NOT_FOUND || err.code === ErrorCode.ERR_UNAUTHORIZED_TOKEN || err.code === ErrorCode.ERR_HANDSHAKE_TIMEOUT || err.code === ErrorCode.ERR_UNSUPPORTED_VERSION)) {
         throw err;
       }
       if (!usePoll && Date.now() < deadline) {
@@ -203,6 +203,12 @@ export async function runFlow1Initiator(client, { purpose, mode = 1, includeRela
     );
     seq = s2;
     const m2 = JSON.parse(utf8Decode(b64uToBytes(m2Msg.msg_b64)));
+    if (Number.isInteger(m2.proto_v) && m2.proto_v > PROTO_VERSION) {
+      await closeRoom(client, roomId, roomToken, 'verify_failed');
+      throw new SyncError(ErrorCode.ERR_UNSUPPORTED_VERSION, `unsupported peer handshake proto_v: ${m2.proto_v}`, {
+        details: { proto_v: m2.proto_v, supported_proto_v: PROTO_VERSION },
+      });
+    }
     if (m2.proto_v !== PROTO_VERSION || m2.mode !== mode) {
       await closeRoom(client, roomId, roomToken, 'verify_failed');
       throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'peer handshake mode/version mismatch');
@@ -263,7 +269,7 @@ export async function runFlow1Initiator(client, { purpose, mode = 1, includeRela
     for (let tries = 0; tries < 3; tries++) {
       const entered = await onSASInput({ attempt: tries + 1, maxAttempts: 3 });
       if (entered == null) break; // user rejected
-      const cleaned = String(entered).replace(/\s+/g, '');
+      const cleaned = String(entered).replace(/[\s-]+/g, '');
       if (cleaned.length === 6 && constantTimeEqual(utf8Encode(cleaned), expectedSasBytes)) {
         verified = true;
         break;
@@ -283,23 +289,29 @@ export async function runFlow1Initiator(client, { purpose, mode = 1, includeRela
   }
 }
 
-export async function runFlow1Responder(client, pairInput, { expectedPurpose, onSASDisplay, timeoutMs = DEFAULT_HANDSHAKE_TIMEOUT_MS, preferPoll = false, signal } = {}) {
-  const parsed = typeof pairInput === 'string' && pairInput.startsWith('synctool://pair')
-    ? parsePairURI(pairInput)
-    : { roomId: normalizeRoomId(pairInput), mode: 2, purpose: expectedPurpose, oobSecret: null };
+export async function runFlow1Responder(client, pairInput, { expectedPurpose, preJoined = null, onSASDisplay, timeoutMs = DEFAULT_HANDSHAKE_TIMEOUT_MS, preferPoll = false, signal } = {}) {
+  const trimmedInput = typeof pairInput === 'string' ? pairInput.trim() : '';
+  const parsed = typeof pairInput === 'object' && pairInput !== null && pairInput.roomId
+    ? pairInput
+    : (trimmedInput.toLowerCase().startsWith('synctool://pair')
+      ? parsePairURI(trimmedInput)
+      : { roomId: normalizeRoomId(trimmedInput), mode: 2, purpose: expectedPurpose, oobSecret: null });
 
-  if (expectedPurpose && parsed.purpose !== expectedPurpose) {
+  if (expectedPurpose && parsed.purpose && parsed.purpose !== expectedPurpose) {
     throw new SyncError(ErrorCode.ERR_BAD_REQUEST, `expected purpose=${expectedPurpose}, got ${parsed.purpose}`);
   }
 
   // Join without msg_b64 first to read and lock M1 (PROTOCOL.md §5.2)
-  const joinRes = await client._signedRequest({
-    method: 'POST',
-    path: `/v1/rooms/${parsed.roomId}/join`,
-    jsonBody: {},
-    signal,
-  });
-  const joined = await joinRes.json();
+  let joined = preJoined;
+  if (!joined) {
+    const joinRes = await client._signedRequest({
+      method: 'POST',
+      path: `/v1/rooms/${parsed.roomId}/join`,
+      jsonBody: {},
+      signal,
+    });
+    joined = await joinRes.json();
+  }
   const roomToken = joined.receiver_token;
   let seq = joined.seq ?? 0;
 
@@ -316,6 +328,12 @@ export async function runFlow1Responder(client, pairInput, { expectedPurpose, on
   const m1 = JSON.parse(utf8Decode(b64uToBytes(m1Msg.msg_b64)));
   const mode = m1.mode;
   const purpose = m1.purpose;
+  if (Number.isInteger(m1.proto_v) && m1.proto_v > PROTO_VERSION) {
+    await closeRoom(client, parsed.roomId, roomToken, 'verify_failed');
+    throw new SyncError(ErrorCode.ERR_UNSUPPORTED_VERSION, `unsupported M1 proto_v: ${m1.proto_v}`, {
+      details: { proto_v: m1.proto_v, supported_proto_v: PROTO_VERSION },
+    });
+  }
   if (m1.proto_v !== PROTO_VERSION || (mode !== 1 && mode !== 2) || (expectedPurpose && purpose !== expectedPurpose)) {
     await closeRoom(client, parsed.roomId, roomToken, 'verify_failed');
     throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'invalid M1 handshake parameters');
@@ -433,12 +451,14 @@ async function buildSelfBindPayload(client, caps, label, platform, signal) {
 
   let mailbox = null;
   let inboundTokenId = null;
+  let inboundTokenHash = null;
   if (caps?.spool?.enabled) {
     const mb = await client.getMailboxIdentity();
     await client.registerMailbox({ signal });
     const rawDepositToken = bytesToB64u(randomBytes(32));
     inboundTokenId = `dt_${bytesToHex(randomBytes(8))}`;
     const tokenHashHex = await hashDepositToken(rawDepositToken);
+    inboundTokenHash = tokenHashHex;
     await client._signedRequest({
       method: 'POST',
       path: `/v1/mailboxes/${mb.mailboxId}/deposit-tokens`,
@@ -457,10 +477,11 @@ async function buildSelfBindPayload(client, caps, label, platform, signal) {
   return {
     payload: mailbox ? { device_card: deviceCard, mailbox } : { device_card: deviceCard, mailbox: null },
     inboundTokenId,
+    inboundTokenHash,
   };
 }
 
-async function storePeerBindPayload(client, peerPayload, inboundTokenId) {
+async function storePeerBindPayload(client, peerPayload, inboundTokenId, inboundTokenHash) {
   const dc = peerPayload?.device_card;
   if (!dc || !(await verifyDeviceCard(dc))) {
     throw new SyncError(ErrorCode.ERR_CRYPTO_SIGNATURE_INVALID, 'peer DeviceCard signature verification failed');
@@ -481,6 +502,7 @@ async function storePeerBindPayload(client, peerPayload, inboundTokenId) {
     mailbox_id: mb?.mailbox_id ?? null,
     outbound_deposit_token: mb?.deposit_token ?? null,
     inbound_token_id: inboundTokenId ?? null,
+    inbound_token_hash: inboundTokenHash ?? null,
     paired_at: Math.floor(Date.now() / 1000),
     revoked: false,
   };
@@ -522,7 +544,7 @@ export async function startDeviceBindImpl(client, opts = {}) {
     signal: opts.signal,
   });
   try {
-    const { payload, inboundTokenId } = await buildSelfBindPayload(client, caps, opts.label, opts.platform, opts.signal);
+    const { payload, inboundTokenId, inboundTokenHash } = await buildSelfBindPayload(client, caps, opts.label, opts.platform, opts.signal);
     const ctA = await sealPairBindPayload(hs.sessionKey, hs.prk, hs.th, 'a', payload);
     const sent = await postRoomMessage(client, roomId, roomToken, 'handshake', encodePairBindMessage(ctA), opts.signal);
     const { msg: peerMsg } = await waitRoomMessage(
@@ -532,7 +554,7 @@ export async function startDeviceBindImpl(client, opts = {}) {
     );
     const peerCt = extractPairBindCiphertext(peerMsg.msg_b64);
     const peerPayload = await openPairBindPayload(hs.sessionKey, hs.prk, hs.th, 'b', peerCt);
-    const card = await storePeerBindPayload(client, peerPayload, inboundTokenId);
+    const card = await storePeerBindPayload(client, peerPayload, inboundTokenId, inboundTokenHash);
     await closeRoom(client, roomId, roomToken, 'completed');
     return card;
   } finally {
@@ -558,10 +580,10 @@ export async function acceptDeviceBindImpl(client, pairInput, opts = {}) {
     );
     const peerCt = extractPairBindCiphertext(peerMsg.msg_b64);
     const peerPayload = await openPairBindPayload(hs.sessionKey, hs.prk, hs.th, 'a', peerCt);
-    const { payload, inboundTokenId } = await buildSelfBindPayload(client, caps, opts.label, opts.platform, opts.signal);
+    const { payload, inboundTokenId, inboundTokenHash } = await buildSelfBindPayload(client, caps, opts.label, opts.platform, opts.signal);
     const ctB = await sealPairBindPayload(hs.sessionKey, hs.prk, hs.th, 'b', payload);
     await postRoomMessage(client, roomId, roomToken, 'handshake', encodePairBindMessage(ctB), opts.signal);
-    const card = await storePeerBindPayload(client, peerPayload, inboundTokenId);
+    const card = await storePeerBindPayload(client, peerPayload, inboundTokenId, inboundTokenHash);
     // Do NOT close room here: initiator closes room after reading & verifying ctB (prevents wipe race).
     return card;
   } finally {
