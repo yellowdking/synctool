@@ -1,0 +1,70 @@
+package main
+
+import (
+	"crypto/tls"
+	"net"
+	"path/filepath"
+	"testing"
+
+	"github.com/yellowdking/synctool/internal/relay"
+)
+
+func TestCLIInitRotateAndHealthcheck(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1. Test `init` subcommand generates access.key + 730-day self-signed cert.
+	if code := run([]string{"init", "--data-dir", dir, "--public-host", "127.0.0.1", "--listen", "127.0.0.1:54843"}); code != 0 {
+		t.Fatalf("init returned non-zero code: %d", code)
+	}
+	b1, err := relay.LoadCertBundle(filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"))
+	if err != nil {
+		t.Fatalf("expected persisted cert after init: %v", err)
+	}
+
+	// 2. Test `cert-rotate` replaces cert with a new SPKI pin.
+	if code := run([]string{"cert-rotate", "--data-dir", dir, "--public-host", "127.0.0.1", "--listen", "127.0.0.1:54843"}); code != 0 {
+		t.Fatalf("cert-rotate returned non-zero code: %d", code)
+	}
+	b2, err := relay.LoadCertBundle(filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"))
+	if err != nil {
+		t.Fatalf("expected rotated cert: %v", err)
+	}
+	if b1.SPKISHA256Hex == b2.SPKISHA256Hex {
+		t.Fatal("expected cert-rotate to produce a new SPKI pin")
+	}
+
+	// 3. Spin up real TLS 1.3 server on ephemeral loopback port and verify `healthcheck` passes with SPKI pinning!
+	rawLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listenAddr := rawLn.Addr().String()
+
+	cfg := relay.Config{
+		ListenAddr:     listenAddr,
+		PublicHost:     "127.0.0.1",
+		Profile:        relay.ProfileNano,
+		Spool:          relay.SpoolOff,
+		TLSMode:        relay.TLSSelfSigned,
+		DataDir:        dir,
+		DisableMemTune: true,
+	}
+	rc, err := cfg.Resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := relay.NewServer(rc, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	httpSrv := srv.NewHTTPServer()
+	tlsLn := tls.NewListener(srv.WrapListener(rawLn), srv.Certs().TLSConfig())
+	go func() { _ = httpSrv.Serve(tlsLn) }()
+	defer httpSrv.Close()
+
+	if code := run([]string{"healthcheck", "--data-dir", dir, "--listen", listenAddr, "--tls", "selfsigned"}); code != 0 {
+		t.Fatalf("healthcheck against live TLS 1.3 relay failed with code %d", code)
+	}
+}
