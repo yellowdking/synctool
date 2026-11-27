@@ -82,11 +82,19 @@ func matchRoute(method, rawPath string) (matchedRoute, bool) {
 	if !strings.HasPrefix(rawPath, "/v1/") {
 		return matchedRoute{}, false
 	}
+	if strings.Contains(rawPath, "..") || strings.Contains(rawPath, `\`) || strings.Contains(rawPath, "//") {
+		return matchedRoute{}, false
+	}
 	trimmed := strings.TrimPrefix(rawPath, "/v1/")
 	if trimmed == "" || strings.HasSuffix(trimmed, "/") {
 		return matchedRoute{}, false
 	}
 	segs := strings.Split(trimmed, "/")
+	for _, seg := range segs {
+		if seg == "" || seg == "." {
+			return matchedRoute{}, false
+		}
+	}
 
 	switch segs[0] {
 	case "ping":
@@ -323,35 +331,94 @@ func (s *Server) WrapListener(ln net.Listener) net.Listener {
 	return NewLimitListener(ln, s.guard, s.cfg.Preset.MaxConns, s.cfg.Preset.MaxConnsPerIP, s.cfg.NowFunc)
 }
 
+func hasSingleOrZeroHeader(h http.Header, keys ...string) bool {
+	for _, k := range keys {
+		if len(h.Values(k)) > 1 {
+			return false
+		}
+	}
+	return true
+}
+
+func abortUnreadUploadBody(w http.ResponseWriter, r *http.Request, rc *http.ResponseController) {
+	if r.ProtoMajor == 1 {
+		w.Header().Set("Connection", "close")
+	}
+	if rc != nil {
+		_ = rc.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	}
+}
+
 // ServeHTTP executes the normative 7-step validation pipeline (PROTOCOL.md §3.3).
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	now := s.cfg.NowFunc()
 	clientIP := s.guard.ExtractClientIP(r)
+	rc := http.NewResponseController(w)
 
-	// Step 3 (partial): Route/method syntactic check + rate limit bucket classification.
-	rt, matched := matchRoute(r.Method, r.URL.Path)
+	// Baseline defense-in-depth security headers on every response.
+	wh := w.Header()
+	wh.Del("Server")
+	wh.Set("X-Content-Type-Options", "nosniff")
+	wh.Set("Referrer-Policy", "no-referrer")
+	wh.Set("Cache-Control", "no-store")
+
+	// Default control-plane write deadline prevents Slow-Read (TCP 0-window) tarpits;
+	// streaming/SSE/long-poll handlers manage rolling write deadlines explicitly.
+	_ = rc.SetWriteDeadline(time.Now().Add(ControlDeadline))
+
+	// Step 3 (partial): Reject percent-encoded path tricks + route/method syntactic check.
+	var rt matchedRoute
+	var matched bool
+	if r.URL.RawPath == "" {
+		rt, matched = matchRoute(r.Method, r.URL.Path)
+	}
 
 	// Step 2: Real IP rate limiting & ban enforcement.
 	allowed, banned := s.guard.AllowRequest(clientIP, matched && rt.isDataOrEvent, now)
 	if banned {
+		abortUnreadUploadBody(w, r, rc)
 		writeStealth404(w, r)
 		return
 	}
 	if !matched {
 		s.guard.RecordStrike(clientIP, now)
+		abortUnreadUploadBody(w, r, rc)
 		writeStealth404(w, r)
 		return
 	}
 
 	// Step 3: Header syntactic pre-check BEFORE reading body.
+	if !hasSingleOrZeroHeader(r.Header,
+		HeaderSyncTS, HeaderSyncNonce, HeaderSyncSig, HeaderSyncClient,
+		HeaderSyncDepositToken, HeaderSyncUploadToken, HeaderSyncRoomToken, HeaderSyncMailboxSig,
+	) {
+		s.guard.RecordStrike(clientIP, now)
+		abortUnreadUploadBody(w, r, rc)
+		writeStealth404(w, r)
+		return
+	}
+
 	tsHeader := r.Header.Get(HeaderSyncTS)
 	nonceHeader := r.Header.Get(HeaderSyncNonce)
 	sigHeader := r.Header.Get(HeaderSyncSig)
 	clientHeader := r.Header.Get(HeaderSyncClient)
+	depositTok := r.Header.Get(HeaderSyncDepositToken)
+	uploadTok := r.Header.Get(HeaderSyncUploadToken)
+	roomTok := r.Header.Get(HeaderSyncRoomToken)
+	mailboxSig := r.Header.Get(HeaderSyncMailboxSig)
 
 	clientTS, tsErr := strconv.ParseInt(tsHeader, 10, 64)
-	if tsErr != nil || !isLowerHexLen(nonceHeader, 32) || !isLowerHexLen(sigHeader, 64) || !isValidClientHeader(clientHeader) {
+	if tsErr != nil || clientTS <= 0 ||
+		!isLowerHexLen(nonceHeader, 32) ||
+		!isLowerHexLen(sigHeader, 64) ||
+		!isValidClientHeader(clientHeader) ||
+		(depositTok != "" && uploadTok != "") ||
+		!isValidAuthHeaderToken(depositTok) ||
+		!isValidAuthHeaderToken(uploadTok) ||
+		!isValidAuthHeaderToken(roomTok) ||
+		!isValidAuthHeaderToken(mailboxSig) {
 		s.guard.RecordStrike(clientIP, now)
+		abortUnreadUploadBody(w, r, rc)
 		writeStealth404(w, r)
 		return
 	}
@@ -359,13 +426,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Prepare BODY_BINDING without buffering data-plane chunk bodies!
 	var rawBody []byte
 	var bodyBinding string
-	rc := http.NewResponseController(w)
 
 	if rt.isDataUpload {
-		// Data-plane chunk PUT: require explicit non-negative Content-Length (reject chunked TE).
-		clStr := r.Header.Get("Content-Length")
-		if clStr == "" || r.ContentLength < 0 {
+		// Data-plane chunk PUT: require single explicit non-negative Content-Length (strictly reject chunked TE).
+		clVals := r.Header.Values("Content-Length")
+		if len(r.TransferEncoding) > 0 || len(clVals) != 1 || clVals[0] == "" || r.ContentLength < 0 {
 			s.guard.RecordStrike(clientIP, now)
+			abortUnreadUploadBody(w, r, rc)
 			writeStealth404(w, r)
 			return
 		}
@@ -378,6 +445,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			b, err := io.ReadAll(limited)
 			if err != nil || len(b) > MaxControlBodyBytes {
 				s.guard.RecordStrike(clientIP, now)
+				abortUnreadUploadBody(w, r, rc)
 				writeStealth404(w, r)
 				return
 			}
@@ -387,37 +455,39 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		bodyBinding = ControlBodyBinding(rawBody)
 	}
 
-	depositTok := r.Header.Get(HeaderSyncDepositToken)
-	uploadTok := r.Header.Get(HeaderSyncUploadToken)
 	extraBinding := ExtraTokenBinding(depositTok, uploadTok)
 	pathAndQuery := CanonicalPathAndQuery(r)
 
 	// Step 4: Constant-time X-Sync-Sig HMAC verification FIRST (before clock skew & nonce!).
 	if !VerifyRelaySig(s.hmacKey, sigHeader, r.Method, pathAndQuery, tsHeader, nonceHeader, bodyBinding, extraBinding) {
 		s.guard.RecordStrike(clientIP, now)
+		abortUnreadUploadBody(w, r, rc)
 		writeStealth404(w, r)
 		return
 	}
 
 	// Authenticated rate limit check (now safe to return JSON 429 + Retry-After).
 	if !allowed {
+		if rt.isDataUpload {
+			abortUnreadUploadBody(w, r, rc)
+		}
 		w.Header().Set("Retry-After", "5")
 		writeAPIError(w, newAPIError(429, "ERR_RATE_LIMITED", "request rate limit exceeded", true))
 		return
 	}
 
-	// Step 5: Clock skew check (±60s) AFTER HMAC, BEFORE nonce cache (zero side-effects!).
-	skew := clientTS - now.Unix()
-	if skew < 0 {
-		skew = -skew
-	}
-	if skew > ClockSkewMaxSec {
+	// Step 5: Overflow-safe clock skew check (±60s) AFTER HMAC, BEFORE nonce cache (zero side-effects!).
+	nowUnix := now.Unix()
+	if clientTS < nowUnix-ClockSkewMaxSec || clientTS > nowUnix+ClockSkewMaxSec {
+		if rt.isDataUpload {
+			abortUnreadUploadBody(w, r, rc)
+		}
 		writeAPIError(w, &apiError{
 			Status:     409,
 			Code:       "ERR_CLOCK_SKEW",
 			Message:    "client clock skew exceeds 60s window",
 			Retryable:  true,
-			ServerTS:   now.Unix(),
+			ServerTS:   nowUnix,
 			MaxSkewSec: ClockSkewMaxSec,
 		})
 		return
@@ -426,6 +496,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Step 6: Bounded replay nonce check (only written after valid HMAC + valid clock window!).
 	if !s.nonces.CheckAndAdd(nonceHeader, now) {
 		s.guard.RecordStrike(clientIP, now)
+		if rt.isDataUpload {
+			abortUnreadUploadBody(w, r, rc)
+		}
 		writeAPIError(w, newAPIError(401, "ERR_REPLAY_DETECTED", "nonce already consumed", true))
 		return
 	}
@@ -442,8 +515,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rawBody:      rawBody,
 		depositTok:   depositTok,
 		uploadTok:    uploadTok,
-		roomTok:      r.Header.Get(HeaderSyncRoomToken),
-		mailboxSig:   r.Header.Get(HeaderSyncMailboxSig),
+		roomTok:      roomTok,
+		mailboxSig:   mailboxSig,
 		rc:           rc,
 	}
 
@@ -514,10 +587,13 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request, rt matchedRout
 }
 
 func writeStealth404(w http.ResponseWriter, r *http.Request) {
-	w.Header().Del("Server")
-	w.Header().Set("Content-Length", "0")
+	h := w.Header()
+	h.Del("Server")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Cache-Control", "no-store")
+	h.Set("Content-Length", "0")
 	if r.ProtoMajor == 1 {
-		w.Header().Set("Connection", "close")
+		h.Set("Connection", "close")
 	}
 	w.WriteHeader(http.StatusNotFound)
 }
@@ -528,9 +604,11 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Length", strconv.Itoa(len(b)))
+	h := w.Header()
+	h.Set("Content-Type", "application/json; charset=utf-8")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Cache-Control", "no-store")
+	h.Set("Content-Length", strconv.Itoa(len(b)))
 	w.WriteHeader(status)
 	_, _ = w.Write(b)
 }
