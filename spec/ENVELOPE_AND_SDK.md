@@ -537,3 +537,20 @@ interface Client {
 | 离线暂存与手动关 | `--profile=auto\|nano\|standard\|media` + 显式手动关 `--spool=off`（返回 `403 ERR_SPOOL_DISABLED`）；超限返 `413`/`507 ERR_OFFLINE_QUOTA_EXCEEDED` | `PROTOCOL.md` §4 & §6 |
 | 自签证书与 Pin | 730 天 ECDSA P-256（含 `ServerAuth` EKU + IP/DNS SAN），64 位小写 hex SPKI Pin；剩余 `<30 天` `cert_rotate_recommended=true` 触发预警 | `CRYPTO_AND_AUTH.md` §7.5, `PROTOCOL.md` §5.1 & §7.2 |
 | 统一 URI 与红线 | `synctool://relay?v=1&u=...[&pin=<64hex>]#k=...` 与 `synctool://pair?r=...&m=0\|1\|2&p=direct\|oneshot\|pair...[#[s=...][&k=...]]`（`#s=` 仅 `m=1` 必带）；敏感参数强制置 `#fragment`，严禁全局 Deep Link 与日志落盘 | `CRYPTO_AND_AUTH.md` §4.1 & §7.5, `PROTOCOL.md` §7.4 |
+
+---
+
+## 8. 端侧安全加固、无感自愈与版本前向兼容补充约定（v1.x 非破坏性扩展）
+
+1. **HTTP 重定向硬阻断**：所有 SDK 客户端必须禁止自动跟随任何 HTTP `3xx` 重定向（Go `http.ErrUseLastResponse`、Web `redirect: "error"`），收到 `300..399` 立即以不可重试 `ERR_RELAY_UNREACHABLE` 拒绝，防止自定义 `X-Sync-*` 鉴权头泄露或绕过 SPKI Pinning。
+2. **`part_id = 0` 内存前置防线**：接收端在拉取 `part_id = 0`（Manifest）进入内存缓冲前，必须前置校验 `0 < total_bytes <= 135,216` 且 `1 <= chunk_count <= 4`，超限立即拒绝并返回 `ERR_MANIFEST_INVALID`。
+3. **跨平台文件名清洗与原子落盘**：
+   - `SanitizeFilename` / `sanitizeFileName` 除剥离路径分隔符与控制字符外，必须剔除 Unicode 双向覆盖符（`U+202A..202E`, `U+2066..2069`）、循环剥离首尾 `.` 与空白、按完整 UTF-8 码点边界截断，并对 Windows 保留设备主文件名（`CON`、`PRN`、`AUX`、`NUL`、`COM1..9`、`LPT1..9` 含扩展名如 `NUL.txt`）统一加 `_` 前缀（如 `_NUL.txt`）。
+   - 本地接收附件先写入 `0600` 临时 `.part` 文件，全量 AEAD 终结块与 `size + sha256` 校验通过后方可原子重命名为 `.verified` 暴露给业务回调，并在 `Client.Close()` 时清理残留临时目录。
+4. **内存暂存重启自愈（Self-Healing）**：
+   - `DeviceCard` 可选持久化单向哈希 `inbound_token_hash`（64 位小写 hex `SHA256("synctool-v1/deposit-token:" || raw_token)`，向后兼容旧 `keystore.json`）。
+   - 当 `nano` 内存暂存重启后，接收端访问 `/v1/mailboxes/{self_id}/*` 遇到 `404 ERR_NOT_FOUND` 时，SDK 自动执行 1 次 `SyncMailbox`（幂等调用 `PUT /v1/mailboxes/{self_id}` 合并恢复全部未吊销同中继名片的 `(inbound_token_id, inbound_token_hash)`，并对旧版中继自动回退逐条 `POST .../deposit-tokens`）后无感重试原请求。
+5. **平滑演进与错误分类契约**：
+   - 所有控制面/信封 JSON 反序列化必须容忍并忽略未来 `v1.x` 新增的可选未知字段；当遇到合法正整数且高于当前支持的主版本号（`envelope_version > 1`、URI `v > 1`、握手 `proto_v > 1`）时，统一返回客户端错误码 `ERR_UNSUPPORTED_VERSION`（CLI 退出码 `2`）。
+   - `SyncError` 在构造与格式化时自动脱敏内嵌 `synctool://...#fragment` 及 `#k=`/`#s=`，并跨语言提供 `IsRetryable`、`IsQuotaExceeded`、`SuggestPipeMode`、`IsAuthError`、`IsSecurityAlert`、`IsVersionMismatch` 稳定分类器。
+   - 统一环境变量约定：`SYNCTOOL_RELAY`（主，兼容 `SYNCTOOL_RELAY_URI`）、`SYNCTOOL_PAIR_URI`、`SYNCTOOL_APP`、`SYNCTOOL_CONFIG`。
