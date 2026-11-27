@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -158,7 +159,15 @@ func (c *Client) runInitiatorHandshake(ctx context.Context, purpose string, opts
 		return nil, envelope.NewError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, "decode M2 b64", nil)
 	}
 	var m2 hsM2Wire
-	if err := json.Unmarshal(m2Raw, &m2); err != nil || m2.ProtoV != 1 || m2.Mode != mode {
+	if err := json.Unmarshal(m2Raw, &m2); err != nil {
+		c.closeRoom(ctx, roomID, created.SenderToken, "verify_failed")
+		return nil, envelope.NewError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, "invalid M2 payload", nil)
+	}
+	if m2.ProtoV > 1 {
+		c.closeRoom(ctx, roomID, created.SenderToken, "verify_failed")
+		return nil, envelope.NewError(envelope.ErrCodeUnsupportedVersion, false, 0, fmt.Sprintf("unsupported peer proto_v %d", m2.ProtoV), map[string]any{"proto_v": m2.ProtoV, "supported_proto_v": 1})
+	}
+	if m2.ProtoV != 1 || m2.Mode != mode {
 		c.closeRoom(ctx, roomID, created.SenderToken, "verify_failed")
 		return nil, envelope.NewError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, "invalid M2 payload", nil)
 	}
@@ -433,14 +442,14 @@ func (c *Client) runResponderHandshake(ctx context.Context, joined *roomJoinResp
 
 // --- Flow 1 Device Binding (StartDeviceBind / AcceptDeviceBind) ---
 
-func (c *Client) buildLocalPairBind(ctx context.Context, label string) (envelope.PairBindPayload, string, error) {
+func (c *Client) buildLocalPairBind(ctx context.Context, label string) (envelope.PairBindPayload, string, string, error) {
 	if label == "" {
 		label = c.deviceLabel
 	}
 	issuedAt := time.Now().Unix()
 	cardSig, err := synccrypto.SignDeviceCard(c.deviceKeys.SignPriv, c.deviceKeys.KEMPubBytes[:], issuedAt)
 	if err != nil {
-		return envelope.PairBindPayload{}, "", envelope.WrapError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, "sign device card", err)
+		return envelope.PairBindPayload{}, "", "", envelope.WrapError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, "sign device card", err)
 	}
 	payload := envelope.PairBindPayload{
 		DeviceCard: envelope.DeviceCardPayload{
@@ -456,28 +465,29 @@ func (c *Client) buildLocalPairBind(ctx context.Context, label string) (envelope
 
 	caps, err := c.Capabilities(ctx)
 	if err != nil {
-		return envelope.PairBindPayload{}, "", err
+		return envelope.PairBindPayload{}, "", "", err
 	}
-	var inboundTokenID string
+	var inboundTokenID, inboundTokenHash string
 	if caps.Spool.Enabled {
 		if err := c.EnsureMailboxRegistered(ctx); err != nil {
-			return envelope.PairBindPayload{}, "", err
+			return envelope.PairBindPayload{}, "", "", err
 		}
-		tokID, rawTok, err := c.registerPeerDepositToken(ctx)
+		tokID, tokHash, rawTok, err := c.registerPeerDepositToken(ctx)
 		if err != nil {
-			return envelope.PairBindPayload{}, "", err
+			return envelope.PairBindPayload{}, "", "", err
 		}
 		inboundTokenID = tokID
+		inboundTokenHash = tokHash
 		payload.Mailbox = &envelope.MailboxBindPayload{
 			RelayOrigin:  c.profile.Endpoint,
 			MailboxID:    c.mailboxKeys.MailboxID,
 			DepositToken: rawTok,
 		}
 	}
-	return payload, inboundTokenID, nil
+	return payload, inboundTokenID, inboundTokenHash, nil
 }
 
-func (c *Client) verifyAndSavePeerBind(peerBind envelope.PairBindPayload, inboundTokenID string) (*envelope.DeviceCard, error) {
+func (c *Client) verifyAndSavePeerBind(peerBind envelope.PairBindPayload, inboundTokenID, inboundTokenHash string) (*envelope.DeviceCard, error) {
 	signPK, err1 := base64.RawURLEncoding.DecodeString(peerBind.DeviceCard.SignPK)
 	kemPK, err2 := base64.RawURLEncoding.DecodeString(peerBind.DeviceCard.KEMPK)
 	cardSig, err3 := base64.RawURLEncoding.DecodeString(peerBind.DeviceCard.CardSig)
@@ -488,17 +498,18 @@ func (c *Client) verifyAndSavePeerBind(peerBind envelope.PairBindPayload, inboun
 		return nil, envelope.WrapError(envelope.ErrCodeCryptoSignatureInvalid, false, 0, "peer device card signature invalid", err)
 	}
 	card := envelope.DeviceCard{
-		DeviceID:       strings.ToLower(peerBind.DeviceCard.DeviceID),
-		Label:          peerBind.DeviceCard.Label,
-		Platform:       peerBind.DeviceCard.Platform,
-		SignPK:         peerBind.DeviceCard.SignPK,
-		KEMPK:          peerBind.DeviceCard.KEMPK,
-		IssuedAt:       peerBind.DeviceCard.IssuedAt,
-		CardSig:        peerBind.DeviceCard.CardSig,
-		RelayOrigin:    c.profile.Endpoint,
-		RelayID:        c.profile.RelayID,
-		InboundTokenID: inboundTokenID,
-		PairedAt:       time.Now().Unix(),
+		DeviceID:         strings.ToLower(peerBind.DeviceCard.DeviceID),
+		Label:            peerBind.DeviceCard.Label,
+		Platform:         peerBind.DeviceCard.Platform,
+		SignPK:           peerBind.DeviceCard.SignPK,
+		KEMPK:            peerBind.DeviceCard.KEMPK,
+		IssuedAt:         peerBind.DeviceCard.IssuedAt,
+		CardSig:          peerBind.DeviceCard.CardSig,
+		RelayOrigin:      c.profile.Endpoint,
+		RelayID:          c.profile.RelayID,
+		InboundTokenID:   inboundTokenID,
+		InboundTokenHash: inboundTokenHash,
+		PairedAt:         time.Now().Unix(),
 	}
 	if peerBind.Mailbox != nil {
 		card.RelayOrigin = peerBind.Mailbox.RelayOrigin
@@ -523,7 +534,7 @@ func (c *Client) StartDeviceBind(ctx context.Context, opts PairOptions) (*envelo
 	}
 	defer sess.HS.Zero()
 
-	myBind, inboundTokenID, err := c.buildLocalPairBind(ctx, opts.Label)
+	myBind, inboundTokenID, inboundTokenHash, err := c.buildLocalPairBind(ctx, opts.Label)
 	if err != nil {
 		c.closeRoom(ctx, sess.RoomID, sess.Token, "cancelled")
 		return nil, err
@@ -574,7 +585,7 @@ func (c *Client) StartDeviceBind(ctx context.Context, opts PairOptions) (*envelo
 		c.closeRoom(ctx, sess.RoomID, sess.Token, "verify_failed")
 		return nil, envelope.WrapError(envelope.ErrCodeCryptoDecryptFailed, false, 0, "parse peer pair_bind", err)
 	}
-	card, err := c.verifyAndSavePeerBind(peerBind, inboundTokenID)
+	card, err := c.verifyAndSavePeerBind(peerBind, inboundTokenID, inboundTokenHash)
 	if err != nil {
 		c.closeRoom(ctx, sess.RoomID, sess.Token, "verify_failed")
 		return nil, err
@@ -635,12 +646,12 @@ func (c *Client) AcceptDeviceBind(ctx context.Context, pairInput string, opts Pa
 		return nil, envelope.WrapError(envelope.ErrCodeCryptoDecryptFailed, false, 0, "parse peer pair_bind", err)
 	}
 
-	myBind, inboundTokenID, err := c.buildLocalPairBind(ctx, opts.Label)
+	myBind, inboundTokenID, inboundTokenHash, err := c.buildLocalPairBind(ctx, opts.Label)
 	if err != nil {
 		c.closeRoom(ctx, sess.RoomID, sess.Token, "cancelled")
 		return nil, err
 	}
-	card, err := c.verifyAndSavePeerBind(peerBind, inboundTokenID)
+	card, err := c.verifyAndSavePeerBind(peerBind, inboundTokenID, inboundTokenHash)
 	if err != nil {
 		c.closeRoom(ctx, sess.RoomID, sess.Token, "verify_failed")
 		return nil, err
