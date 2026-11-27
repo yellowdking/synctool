@@ -351,15 +351,19 @@ export async function ed25519KeyPairFromSeed(seed32) {
   }
   const subtle = getSubtle();
   const pkcs8 = ed25519SeedToPkcs8(seed32);
-  const privKey = await subtle.importKey('pkcs8', pkcs8, { name: 'Ed25519' }, true, ['sign']);
-  const jwk = await subtle.exportKey('jwk', privKey);
-  if (!jwk.x) {
-    throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'WebCrypto Ed25519 JWK export missing public key x');
+  try {
+    const privKey = await subtle.importKey('pkcs8', pkcs8, { name: 'Ed25519' }, true, ['sign']);
+    const jwk = await subtle.exportKey('jwk', privKey);
+    if (!jwk.x) {
+      throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'WebCrypto Ed25519 JWK export missing public key x');
+    }
+    return {
+      seed: new Uint8Array(seed32),
+      publicKey: b64uToBytes(jwk.x),
+    };
+  } finally {
+    zeroBytes(pkcs8);
   }
-  return {
-    seed: new Uint8Array(seed32),
-    publicKey: b64uToBytes(jwk.x),
-  };
 }
 
 /**
@@ -375,15 +379,19 @@ export async function x25519KeyPairFromSk(sk32) {
   }
   const subtle = getSubtle();
   const pkcs8 = x25519SkToPkcs8(sk32);
-  const privKey = await subtle.importKey('pkcs8', pkcs8, { name: 'X25519' }, true, ['deriveBits']);
-  const jwk = await subtle.exportKey('jwk', privKey);
-  if (!jwk.x) {
-    throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'WebCrypto X25519 JWK export missing public key x');
+  try {
+    const privKey = await subtle.importKey('pkcs8', pkcs8, { name: 'X25519' }, true, ['deriveBits']);
+    const jwk = await subtle.exportKey('jwk', privKey);
+    if (!jwk.x) {
+      throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'WebCrypto X25519 JWK export missing public key x');
+    }
+    return {
+      privateKey: new Uint8Array(sk32),
+      publicKey: b64uToBytes(jwk.x),
+    };
+  } finally {
+    zeroBytes(pkcs8);
   }
-  return {
-    privateKey: new Uint8Array(sk32),
-    publicKey: b64uToBytes(jwk.x),
-  };
 }
 
 /** Generate a fresh CSPRNG X25519 key pair. */
@@ -408,10 +416,15 @@ export async function x25519SharedSecret(sk32, peerPk32) {
       shared = new Uint8Array(await customCryptoProvider.x25519SharedSecret(sk32, peerPk32));
     } else {
       const subtle = getSubtle();
-      const privKey = await subtle.importKey('pkcs8', x25519SkToPkcs8(sk32), { name: 'X25519' }, false, ['deriveBits']);
-      const pubKey = await subtle.importKey('spki', x25519PubToSpki(peerPk32), { name: 'X25519' }, false, []);
-      const bits = await subtle.deriveBits({ name: 'X25519', public: pubKey }, privKey, 256);
-      shared = new Uint8Array(bits);
+      const pkcs8 = x25519SkToPkcs8(sk32);
+      try {
+        const privKey = await subtle.importKey('pkcs8', pkcs8, { name: 'X25519' }, false, ['deriveBits']);
+        const pubKey = await subtle.importKey('spki', x25519PubToSpki(peerPk32), { name: 'X25519' }, false, []);
+        const bits = await subtle.deriveBits({ name: 'X25519', public: pubKey }, privKey, 256);
+        shared = new Uint8Array(bits);
+      } finally {
+        zeroBytes(pkcs8);
+      }
     }
   } catch (err) {
     throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'X25519 key agreement failed', { cause: err });
@@ -434,9 +447,14 @@ export async function ed25519Sign(seed32, message) {
     return new Uint8Array(await customCryptoProvider.ed25519Sign(seed32, message));
   }
   const subtle = getSubtle();
-  const privKey = await subtle.importKey('pkcs8', ed25519SeedToPkcs8(seed32), { name: 'Ed25519' }, false, ['sign']);
-  const sig = await subtle.sign('Ed25519', privKey, message);
-  return new Uint8Array(sig);
+  const pkcs8 = ed25519SeedToPkcs8(seed32);
+  try {
+    const privKey = await subtle.importKey('pkcs8', pkcs8, { name: 'Ed25519' }, false, ['sign']);
+    const sig = await subtle.sign('Ed25519', privKey, message);
+    return new Uint8Array(sig);
+  } finally {
+    zeroBytes(pkcs8);
+  }
 }
 
 /**
