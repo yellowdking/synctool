@@ -340,10 +340,15 @@ func (c *Client) pullAndVerifyManifest(
 	p0Layout envelope.PartLayout,
 	opened *synccrypto.SealedHeaderOpenResult,
 	fetchChunk func(txIdx int) ([]byte, error),
-) (*envelope.Manifest, error) {
+) (*envelope.Manifest, [32]byte, error) {
+	var zeroSHA [32]byte
+	// Anti-OOM hard cap before allocating or downloading any part_id=0 chunks.
+	if p0Layout.TotalBytes <= 0 || p0Layout.TotalBytes > envelope.MaxEncryptedManifestBytes || p0Layout.ChunkCount < 1 || p0Layout.ChunkCount > envelope.MaxManifestChunks {
+		return nil, zeroSHA, envelope.NewError(envelope.ErrCodeManifestInvalid, false, 0, fmt.Sprintf("part_id=0 layout out of bounds (bytes=%d chunks=%d)", p0Layout.TotalBytes, p0Layout.ChunkCount), nil)
+	}
 	sc, err := synccrypto.NewStreamCipher(p0Key, p0NP, msgIDRaw, 0)
 	if err != nil {
-		return nil, envelope.WrapError(envelope.ErrCodeCryptoDecryptFailed, false, 0, "init manifest stream cipher", err)
+		return nil, zeroSHA, envelope.WrapError(envelope.ErrCodeCryptoDecryptFailed, false, 0, "init manifest stream cipher", err)
 	}
 	var padded bytes.Buffer
 	var blkIdx uint32
@@ -351,11 +356,14 @@ func (c *Client) pullAndVerifyManifest(
 	for tx := 0; tx < p0Layout.ChunkCount; tx++ {
 		chunkBytes, err := fetchChunk(tx)
 		if err != nil {
-			return nil, err
+			return nil, zeroSHA, err
+		}
+		if int64(padded.Len()+len(chunkBytes)) > envelope.MaxEncryptedManifestBytes {
+			return nil, zeroSHA, envelope.NewError(envelope.ErrCodeManifestInvalid, false, 0, "part_id=0 stream exceeded maximum manifest byte budget", nil)
 		}
 		nBlk, _, isFin, err := decryptChunkIntoStream(sc, chunkBytes, blkIdx, 0, tx == p0Layout.ChunkCount-1, &padded)
 		if err != nil {
-			return nil, err
+			return nil, zeroSHA, err
 		}
 		blkIdx += nBlk
 		if isFin {
@@ -363,33 +371,49 @@ func (c *Client) pullAndVerifyManifest(
 		}
 	}
 	if !sawFinal {
-		return nil, envelope.NewError(envelope.ErrCodeStreamTruncated, false, 0, "manifest stream missing final block", nil)
+		return nil, zeroSHA, envelope.NewError(envelope.ErrCodeStreamTruncated, false, 0, "manifest stream missing final block", nil)
 	}
 	rawManifest, err := synccrypto.UnpadManifest(padded.Bytes())
 	if err != nil {
-		return nil, envelope.WrapError(envelope.ErrCodeStreamTruncated, false, 0, "unpad manifest", err)
+		return nil, zeroSHA, envelope.WrapError(envelope.ErrCodeStreamTruncated, false, 0, "unpad manifest", err)
 	}
+	rawSHA := sha256.Sum256(rawManifest)
 	if opened != nil {
-		if sha256.Sum256(rawManifest) != opened.ManifestSHA256 {
-			return nil, envelope.NewError(envelope.ErrCodeCryptoSignatureInvalid, false, 0, "manifest SHA-256 does not match signed SealedHeader", nil)
+		if rawSHA != opened.ManifestSHA256 {
+			return nil, zeroSHA, envelope.NewError(envelope.ErrCodeCryptoSignatureInvalid, false, 0, "manifest SHA-256 does not match signed SealedHeader", nil)
 		}
 	}
 	manifest, err := envelope.ParseManifest(rawManifest)
 	if err != nil {
-		return nil, err
+		return nil, zeroSHA, err
 	}
 	if manifest.MsgID != msgIDHex {
-		return nil, envelope.NewError(envelope.ErrCodeManifestInvalid, false, 0, "manifest msg_id mismatch", nil)
+		return nil, zeroSHA, envelope.NewError(envelope.ErrCodeManifestInvalid, false, 0, "manifest msg_id mismatch", nil)
 	}
 	if opened != nil {
 		if manifest.Sender.DeviceID != opened.SenderDeviceID {
-			return nil, envelope.NewError(envelope.ErrCodeCryptoSignatureInvalid, false, 0, "manifest sender.device_id does not match SealedHeader", nil)
+			return nil, zeroSHA, envelope.NewError(envelope.ErrCodeCryptoSignatureInvalid, false, 0, "manifest sender.device_id does not match SealedHeader", nil)
 		}
 		if manifest.CreatedAt != opened.CreatedAt {
-			return nil, envelope.NewError(envelope.ErrCodeCryptoSignatureInvalid, false, 0, "manifest created_at does not match SealedHeader", nil)
+			return nil, zeroSHA, envelope.NewError(envelope.ErrCodeCryptoSignatureInvalid, false, 0, "manifest created_at does not match SealedHeader", nil)
 		}
 	}
-	return manifest, nil
+	return manifest, rawSHA, nil
+}
+
+func ensureSafeRealDir(dir string) error {
+	if fi, err := os.Lstat(dir); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+			return envelope.NewError(envelope.ErrCodeStorageIO, false, 0, "temp directory must be a real directory, not a symlink", nil)
+		}
+	} else if !os.IsNotExist(err) {
+		return envelope.WrapError(envelope.ErrCodeStorageIO, false, 0, "lstat temp dir", err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return envelope.WrapError(envelope.ErrCodeStorageIO, false, 0, "create temp dir", err)
+	}
+	_ = os.Chmod(dir, 0o700)
+	return nil
 }
 
 func (c *Client) pullAndVerifyBlobs(
@@ -407,10 +431,14 @@ func (c *Client) pullAndVerifyBlobs(
 	if len(manifest.Blobs) == 0 {
 		return nil, nil
 	}
-	msgDir := filepath.Join(c.tempDir, manifest.MsgID)
-	if err := os.MkdirAll(msgDir, 0o700); err != nil {
-		return nil, envelope.WrapError(envelope.ErrCodeStorageIO, false, 0, "create temp parcel dir", err)
+	if err := ensureSafeRealDir(c.tempDir); err != nil {
+		return nil, err
 	}
+	msgDir := filepath.Join(c.tempDir, manifest.MsgID)
+	if err := ensureSafeRealDir(msgDir); err != nil {
+		return nil, err
+	}
+	c.trackMsgDir(msgDir)
 
 	out := make([]envelope.ReceivedBlob, 0, len(manifest.Blobs))
 	for _, blob := range manifest.Blobs {
@@ -419,31 +447,40 @@ func (c *Client) pullAndVerifyBlobs(
 		}
 		layout, ok := partMap[blob.PartID]
 		if !ok || layout.ChunkCount <= 0 {
+			_ = os.RemoveAll(msgDir)
 			return nil, envelope.NewError(envelope.ErrCodeManifestInvalid, false, 0, fmt.Sprintf("missing part layout for part_id=%d", blob.PartID), nil)
 		}
 		rawKey, err := base64.RawURLEncoding.DecodeString(blob.Key)
 		if err != nil || len(rawKey) != 32 {
+			_ = os.RemoveAll(msgDir)
 			return nil, envelope.NewError(envelope.ErrCodeManifestInvalid, false, 0, "invalid blob key", nil)
 		}
 		encKey, np, err := synccrypto.DeriveBlobPartKeys(msgIDRaw, blob.PartID, rawKey)
 		clear(rawKey)
 		if err != nil {
+			_ = os.RemoveAll(msgDir)
 			return nil, err
 		}
 		sc, err := synccrypto.NewStreamCipher(encKey, np, msgIDRaw, blob.PartID)
 		clear(encKey[:])
 		if err != nil {
+			_ = os.RemoveAll(msgDir)
 			return nil, err
 		}
 
-		safePath := filepath.Join(msgDir, fmt.Sprintf("part_%d.tmp", blob.PartID))
+		partPath := filepath.Join(msgDir, fmt.Sprintf("part_%d.part", blob.PartID))
+		verifiedPath := filepath.Join(msgDir, fmt.Sprintf("part_%d.verified", blob.PartID))
+		if fi, lerr := os.Lstat(partPath); lerr == nil && !fi.Mode().IsRegular() {
+			_ = os.RemoveAll(msgDir)
+			return nil, envelope.NewError(envelope.ErrCodeStorageIO, false, 0, "refusing non-regular temp part file", nil)
+		}
 		// Check resumable checkpoint (Mode B spool).
 		startTx := 0
 		var blkIdx uint32
 		resumed := false
 		if mode == "spool" {
 			if cp, _ := c.keyStore.GetCheckpoint("recv", manifest.MsgID, blob.PartID); cp != nil && cp.NextTxIdx > 0 && cp.NextTxIdx <= layout.ChunkCount {
-				if st, statErr := os.Stat(safePath); statErr == nil && st.Size() == int64(cp.NextBlockIdx)*synccrypto.ChunkPlaintextMax {
+				if st, statErr := os.Stat(partPath); statErr == nil && st.Size() == int64(cp.NextBlockIdx)*synccrypto.ChunkPlaintextMax {
 					startTx = cp.NextTxIdx
 					blkIdx = cp.NextBlockIdx
 					resumed = true
@@ -455,10 +492,11 @@ func (c *Client) pullAndVerifyBlobs(
 		if !resumed {
 			openFlags |= os.O_TRUNC
 		}
-		f, err := os.OpenFile(safePath, openFlags, 0o600)
+		f, err := os.OpenFile(partPath, openFlags, 0o600)
 		if err != nil {
 			return nil, envelope.WrapError(envelope.ErrCodeStorageIO, false, 0, "open temp blob file", err)
 		}
+		_ = f.Chmod(0o600)
 		if resumed {
 			if _, err := f.Seek(0, io.SeekEnd); err != nil {
 				_ = f.Close()
@@ -481,7 +519,7 @@ func (c *Client) pullAndVerifyBlobs(
 			nBlk, _, isFin, err := decryptChunkIntoStream(sc, chunkBytes, blkIdx, totalBlocks, tx == layout.ChunkCount-1, f)
 			if err != nil {
 				_ = f.Close()
-				_ = os.Remove(safePath)
+				_ = os.RemoveAll(msgDir)
 				_ = c.keyStore.DeleteCheckpoint("recv", manifest.MsgID, blob.PartID)
 				return nil, err
 			}
@@ -522,12 +560,12 @@ func (c *Client) pullAndVerifyBlobs(
 		}
 		_ = f.Close()
 		if !sawFinal {
-			_ = os.Remove(safePath)
+			_ = os.RemoveAll(msgDir)
 			return nil, envelope.NewError(envelope.ErrCodeStreamTruncated, false, 0, "blob stream missing authenticated final block", nil)
 		}
 
-		// Verify exact plaintext size and SHA-256 on disk (supports resumed files cleanly).
-		rf, err := os.Open(safePath)
+		// Verify exact plaintext size and SHA-256 on disk BEFORE exposing verified SafePath via atomic rename!
+		rf, err := os.Open(partPath)
 		if err != nil {
 			return nil, envelope.WrapError(envelope.ErrCodeStorageIO, false, 0, "reopen blob for sha256 verify", err)
 		}
@@ -539,15 +577,20 @@ func (c *Client) pullAndVerifyBlobs(
 		}
 		gotSHA := hex.EncodeToString(h.Sum(nil))
 		if gotSize != blob.Size || gotSHA != blob.SHA256 {
-			_ = os.Remove(safePath)
+			_ = os.RemoveAll(msgDir)
 			_ = c.keyStore.DeleteCheckpoint("recv", manifest.MsgID, blob.PartID)
 			return nil, envelope.NewError(envelope.ErrCodeHashMismatch, false, 0, fmt.Sprintf("part_id=%d size/sha256 mismatch", blob.PartID), nil)
 		}
 		_ = c.keyStore.DeleteCheckpoint("recv", manifest.MsgID, blob.PartID)
+		_ = os.Remove(verifiedPath)
+		if err := os.Rename(partPath, verifiedPath); err != nil {
+			_ = os.RemoveAll(msgDir)
+			return nil, envelope.WrapError(envelope.ErrCodeStorageIO, false, 0, "atomic finalize verified blob", err)
+		}
 
 		out = append(out, envelope.ReceivedBlob{
 			Descriptor: blob,
-			SafePath:   safePath,
+			SafePath:   verifiedPath,
 			SafeName:   envelope.SanitizeFilename(blob.Name),
 		})
 	}
