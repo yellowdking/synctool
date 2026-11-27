@@ -1,6 +1,6 @@
 {
   "name": "@yellowdking/synctool",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Zero-dependency WebCrypto TypeScript/JavaScript SDK for synctool v1 end-to-end encrypted relay sync",
   "type": "module",
   "main": "./src/index.js",
