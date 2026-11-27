@@ -17,15 +17,19 @@ import (
 
 const (
 	ProtoVersion              = 1
+	MinProtoVersion           = 1
+	MaxProtoVersion           = 1
 	CryptoPlaintextBlockBytes = 65536
 	AEADTagBytes              = 16
 	CryptoBlockBytes          = CryptoPlaintextBlockBytes + AEADTagBytes // 65552 B
 
 	MaxControlBodyBytes        = 16384 // 16 KiB
-	MaxRoomMsgBytes            = 4096  // 4 KiB raw decoded
+	MaxAuthHeaderBytes         = 128
+	MaxRoomMsgBytes            = 4096 // 4 KiB raw decoded
 	MaxHandshakeFrames         = 8
 	MaxControlRingSize         = 16
-	MaxPartsPerItem            = 64 // part_id 0..63
+	MaxPartsPerItem            = 64    // part_id 0..63
+	MaxChunksPerPart           = 65536 // >4 GiB at 64 KiB blocks; prevents Commit loop DoS
 	MaxDepositTokensPerMailbox = 16
 	SealedHeaderLen            = 208
 
@@ -234,6 +238,7 @@ type Config struct {
 	AccessKey        string
 	TrustedProxies   []netip.Prefix
 	MaxBandwidthMbps float64
+	ServerVersion    string
 
 	// Optional overrides (0 = inherit preset)
 	SpoolMaxTotalBytes      int64
@@ -336,13 +341,24 @@ func ParseTrustedProxies(raw string) ([]netip.Prefix, error) {
 			if err != nil {
 				return nil, fmt.Errorf("invalid trusted proxy CIDR %q: %w", p, err)
 			}
-			out = append(out, pref.Masked())
+			addr := pref.Addr()
+			bits := pref.Bits()
+			if addr.Is4In6() {
+				addr = addr.Unmap()
+				if bits >= 96 {
+					bits -= 96
+				} else {
+					bits = 0
+				}
+			}
+			addr = addr.WithZone("")
+			out = append(out, netip.PrefixFrom(addr, bits).Masked())
 		} else {
 			addr, err := netip.ParseAddr(p)
 			if err != nil {
 				return nil, fmt.Errorf("invalid trusted proxy IP %q: %w", p, err)
 			}
-			addr = addr.Unmap()
+			addr = addr.Unmap().WithZone("")
 			out = append(out, netip.PrefixFrom(addr, addr.BitLen()))
 		}
 	}
@@ -365,7 +381,45 @@ func IsLoopbackListenAddr(addr string) bool {
 	if err != nil {
 		return false
 	}
-	return ip.IsLoopback()
+	return ip.Unmap().WithZone("").IsLoopback()
+}
+
+// ParseProcSelfCgroupPaths extracts relative cgroup v2 and v1 memory slice paths from /proc/self/cgroup.
+func ParseProcSelfCgroupPaths(content string) (v2Rel string, v1MemRel string) {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "0::") {
+			rel := strings.TrimSpace(strings.TrimPrefix(line, "0::"))
+			if rel != "" && rel != "/" && !strings.Contains(rel, "..") {
+				v2Rel = rel
+			}
+			continue
+		}
+		first := strings.IndexByte(line, ':')
+		if first < 0 {
+			continue
+		}
+		rest := line[first+1:]
+		second := strings.IndexByte(rest, ':')
+		if second < 0 {
+			continue
+		}
+		subsys := rest[:second]
+		rel := strings.TrimSpace(rest[second+1:])
+		if rel == "" || rel == "/" || strings.Contains(rel, "..") {
+			continue
+		}
+		for _, s := range strings.Split(subsys, ",") {
+			if s == "memory" {
+				v1MemRel = rel
+				break
+			}
+		}
+	}
+	return v2Rel, v1MemRel
 }
 
 func GenerateAccessKey() (string, error) {
@@ -406,13 +460,8 @@ func EnsureAccessKey(dataDir, provided string) (key string, created bool, err er
 		if mkErr := os.MkdirAll(dataDir, 0o700); mkErr != nil {
 			return "", false, fmt.Errorf("access key not provided and cannot create data-dir %s: %w", dataDir, mkErr)
 		}
-		tmp := keyPath + ".tmp"
-		if wErr := os.WriteFile(tmp, []byte(k+"\n"), 0o600); wErr != nil {
+		if wErr := atomicWriteFile(keyPath, []byte(k+"\n"), 0o600); wErr != nil {
 			return "", false, fmt.Errorf("access key not provided and cannot write %s: %w", keyPath, wErr)
-		}
-		if rErr := os.Rename(tmp, keyPath); rErr != nil {
-			_ = os.Remove(tmp)
-			return "", false, rErr
 		}
 		return k, true, nil
 	}
