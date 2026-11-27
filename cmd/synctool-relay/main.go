@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -51,6 +52,23 @@ func run(args []string) int {
 	case "healthcheck":
 		return runHealthcheck(rest)
 	case "version", "-v", "--version":
+		jsonOut := false
+		for _, a := range rest {
+			if a == "--json" {
+				jsonOut = true
+			}
+		}
+		if jsonOut {
+			b, _ := json.Marshal(map[string]any{
+				"version":     version,
+				"commit":      commit,
+				"proto_v":     relay.ProtoVersion,
+				"min_proto_v": relay.MinProtoVersion,
+				"max_proto_v": relay.MaxProtoVersion,
+			})
+			fmt.Println(string(b))
+			return 0
+		}
 		fmt.Printf("synctool-relay %s (%s)\n", version, commit)
 		return 0
 	case "help", "-h", "--help":
@@ -125,6 +143,7 @@ func parseConfigFlags(name string, args []string) (relay.Config, error) {
 		}
 		cfg.TrustedProxies = prefixes
 	}
+	cfg.ServerVersion = version
 	return cfg, nil
 }
 
@@ -186,12 +205,17 @@ func runCertRotate(args []string) int {
 		fmt.Fprintf(os.Stderr, "cert-rotate config error: %v\n", err)
 		return 1
 	}
-	cm, err := relay.NewCertManager(rc)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "cert-rotate load error: %v\n", err)
+	if rc.TLSMode != relay.TLSSelfSigned {
+		fmt.Fprintf(os.Stderr, "cert-rotate failed: only applies to --tls=selfsigned (current: %s)\n", rc.TLSMode)
 		return 1
 	}
-	b, err := cm.RotateSelfSigned(rc.PublicHost, time.Now())
+	var certPath, keyPath string
+	if rc.DataDir != "" {
+		certPath = filepath.Join(rc.DataDir, "cert.pem")
+		keyPath = filepath.Join(rc.DataDir, "key.pem")
+	}
+	// Mint directly without pre-loading old cert so cert-rotate can self-heal corrupted/expired files.
+	b, err := relay.GenerateSelfSignedCert(rc.PublicHost, time.Now(), certPath, keyPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cert-rotate failed: %v\n", err)
 		return 1
@@ -290,6 +314,26 @@ func runServe(args []string) int {
 	}
 }
 
+func resolveHealthcheckTarget(listenAddr string, tlsMode relay.TLSMode) string {
+	host, port, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		port = "54843"
+	}
+	if port == "" {
+		port = "54843"
+	}
+	trimmed := strings.Trim(host, "[]")
+	targetHost := "127.0.0.1"
+	if trimmed != "" && trimmed != "0.0.0.0" && trimmed != "::" {
+		targetHost = trimmed
+	}
+	scheme := "https"
+	if tlsMode == relay.TLSOff {
+		scheme = "http"
+	}
+	return fmt.Sprintf("%s://%s/v1/ping", scheme, net.JoinHostPort(targetHost, port))
+}
+
 func runHealthcheck(args []string) int {
 	cfg, err := parseConfigFlags("healthcheck", args)
 	if err != nil {
@@ -297,17 +341,7 @@ func runHealthcheck(args []string) int {
 		return 2
 	}
 
-	// Resolve listen port & scheme.
-	_, port, err := net.SplitHostPort(cfg.ListenAddr)
-	if err != nil || port == "" {
-		port = "54843"
-	}
-
-	scheme := "https"
-	if cfg.TLSMode == relay.TLSOff {
-		scheme = "http"
-	}
-	targetURL := fmt.Sprintf("%s://127.0.0.1:%s/v1/ping", scheme, port)
+	targetURL := resolveHealthcheckTarget(cfg.ListenAddr, cfg.TLSMode)
 
 	// Load access key (must already exist via env or dataDir/access.key).
 	accessKey := strings.TrimSpace(cfg.AccessKey)
@@ -346,6 +380,10 @@ func runHealthcheck(args []string) int {
 				if perr != nil {
 					return perr
 				}
+				now := time.Now()
+				if now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
+					return errors.New("TLS certificate expired or not yet valid")
+				}
 				if !relay.ConstantTimeStringEqual(relay.SPKISHA256Hex(leaf), expectedPin) {
 					return errors.New("SPKI pin mismatch")
 				}
@@ -375,7 +413,13 @@ func runHealthcheck(args []string) int {
 	req.Header.Set(relay.HeaderSyncNonce, nonceHex)
 	req.Header.Set(relay.HeaderSyncSig, sig)
 
-	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   5 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "healthcheck failed: %v\n", err)
