@@ -81,7 +81,13 @@ func buildHTTPClient(profile *envelope.RelayProfile) (*http.Client, error) {
 		MaxIdleConnsPerHost:   8,
 		DisableCompression:    true,
 	}
-	return &http.Client{Transport: tr}, nil
+	return &http.Client{
+		Transport: tr,
+		// Security hard-block: NEVER follow HTTP 3xx redirects (prevents X-Sync-* credential leak & SPKI pin bypass).
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}, nil
 }
 
 type reqOptions struct {
@@ -159,6 +165,9 @@ func (c *Client) doSignedOnce(ctx context.Context, method, pathAndQuery string, 
 			Body:       respBody,
 		}, nil
 	}
+	if httpResp.StatusCode >= 300 && httpResp.StatusCode < 400 {
+		return nil, envelope.NewError(envelope.ErrCodeRelayUnreachable, false, httpResp.StatusCode, "relay HTTP redirect blocked for credential and SPKI pin safety", nil)
+	}
 	return nil, decodeWireError(httpResp.StatusCode, httpResp.Header, respBody)
 }
 
@@ -173,6 +182,9 @@ func (c *Client) openSignedStream(ctx context.Context, method, pathAndQuery stri
 		}
 		respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 64*1024))
 		_ = httpResp.Body.Close()
+		if httpResp.StatusCode >= 300 && httpResp.StatusCode < 400 {
+			return nil, envelope.NewError(envelope.ErrCodeRelayUnreachable, false, httpResp.StatusCode, "relay HTTP redirect blocked for credential and SPKI pin safety", nil)
+		}
 		werr := decodeWireError(httpResp.StatusCode, httpResp.Header, respBody)
 		if se, ok := envelope.AsSyncError(werr); ok && se.Code == envelope.ErrCodeClockSkew && attempt == 0 {
 			if serverTS, ok := extractInt64Detail(se.Details, "server_ts"); ok {
