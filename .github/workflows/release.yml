@@ -226,8 +226,8 @@ jobs:
           generate_release_notes: true
           files: dist/*
 
-  publish-ghcr:
-    name: Publish Multi-Arch Docker Image to GHCR
+  publish-images:
+    name: Publish Multi-Arch Docker Images (GHCR & Docker Hub)
     needs: [prepare]
     if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
@@ -248,14 +248,56 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push linux/amd64,linux/arm64
+      - name: Resolve Docker Hub credentials & combined image tags
+        id: registries
+        shell: bash
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME || secrets.DOCKER_HUB_USERNAME || secrets.DOCKER_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKER_HUB_TOKEN || secrets.DOCKER_TOKEN || secrets.DOCKER_PASSWORD }}
+          GHCR_TAGS: ${{ needs.prepare.outputs.image_tags }}
+          VER: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          ALL_TAGS="${GHCR_TAGS}"
+
+          if [[ -n "${DH_USER}" && -n "${DH_TOKEN}" ]]; then
+            DH_USER_LOWER="$(printf '%s' "${DH_USER}" | tr '[:upper:]' '[:lower:]')"
+            VER_LOWER="$(printf '%s' "${VER}" | tr '[:upper:]' '[:lower:]')"
+            TAG_LOWER="v${VER_LOWER}"
+            DH_IMAGE="${DH_USER_LOWER}/synctool"
+            MAJOR_MINOR="$(printf '%s' "${VER_LOWER}" | cut -d. -f1,2)"
+
+            DH_TAGS="${DH_IMAGE}:${TAG_LOWER},${DH_IMAGE}:${VER_LOWER}"
+            if [[ "${VER_LOWER}" != *-* ]]; then
+              DH_TAGS="${DH_TAGS},${DH_IMAGE}:${MAJOR_MINOR},${DH_IMAGE}:latest"
+            fi
+
+            ALL_TAGS="${ALL_TAGS},${DH_TAGS}"
+            echo "dockerhub_enabled=true" >> "${GITHUB_OUTPUT}"
+            echo "dockerhub_image=${DH_IMAGE}" >> "${GITHUB_OUTPUT}"
+            echo "Docker Hub publishing enabled for ${DH_IMAGE}"
+          else
+            echo "dockerhub_enabled=false" >> "${GITHUB_OUTPUT}"
+            echo "Docker Hub secrets not configured; publishing to GHCR only."
+          fi
+
+          echo "all_tags=${ALL_TAGS}" >> "${GITHUB_OUTPUT}"
+
+      - name: Log in to Docker Hub
+        if: steps.registries.outputs.dockerhub_enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME || secrets.DOCKER_HUB_USERNAME || secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKER_HUB_TOKEN || secrets.DOCKER_TOKEN || secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push linux/amd64,linux/arm64 (GHCR + Docker Hub)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: deploy/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ needs.prepare.outputs.image_tags }}
+          tags: ${{ steps.registries.outputs.all_tags }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ needs.prepare.outputs.version }}

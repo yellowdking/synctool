@@ -7,7 +7,8 @@
 
 services:
   synctool-relay:
-    image: ghcr.io/yellowdking/synctool:latest
+    # 默认拉取 GHCR；若使用 Docker Hub 镜像可设 SYNCTOOL_IMAGE=<dockerhub用户名>/synctool:latest
+    image: "${SYNCTOOL_IMAGE:-ghcr.io/yellowdking/synctool:latest}"
     build:
       context: ..
       dockerfile: deploy/Dockerfile
