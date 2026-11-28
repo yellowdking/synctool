@@ -199,6 +199,7 @@ async function main() {
         goPairSAS.writeLine(sas);
         goPairSAS.endInput();
       },
+      onSASConfirm: async () => true,
     });
     log('   3A: TS acceptDeviceBind returned! Waiting for Go CLI...');
     const goPairSASRes = await goPairSAS.done;
@@ -206,7 +207,7 @@ async function main() {
     assert.equal(goPairSASRes.result.device_id, tsBId.deviceId);
     assert.equal(tsCardOfGo.device_id, goAliceDeviceId);
 
-    // 3B: TS startOneShotSend (mode=2 SAS) <-> Go CLI recv (read sas_ready event into TS onSASInput)
+    // 3B: TS startOneShotSend (mode=2 SAS) <-> Go CLI recv (read sas_ready event into TS onSASInput + confirm Go Responder SAS!)
     log('   3B: TS startOneShotSend (mode=2 SAS) <-> Go CLI recv...');
     const goOutSAS = path.join(workDir, 'out-sas-from-ts');
     let goRecvSASProc = null;
@@ -225,7 +226,9 @@ async function main() {
         onSASInput: async () => {
           log('   3B: TS waiting for Go CLI sas_ready event...');
           const sasEv = await goRecvSASProc.waitForEvent((e) => e.type === 'event' && e.event === 'sas_ready');
-          log(`   3B: Go CLI displayed SAS=${sasEv.sas}, feeding to TS...`);
+          log(`   3B: Go CLI displayed SAS=${sasEv.sas}, confirming Go Responder & feeding to TS...`);
+          goRecvSASProc.writeLine('y');
+          goRecvSASProc.endInput();
           return sasEv.sas;
         },
       },
