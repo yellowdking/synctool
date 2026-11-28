@@ -17,6 +17,11 @@ import (
 	"github.com/yellowdking/synctool/sdk/go/envelope"
 )
 
+const (
+	maxInitialPipePeerTimeouts   = 12
+	maxMidStreamPipePeerTimeouts = 2
+)
+
 // --- Room signaling helpers ---
 
 type roomCreateResp struct {
@@ -110,31 +115,60 @@ func (c *Client) closeRoom(ctx context.Context, roomID, roomToken, reason string
 	}, reqOptions{RoomToken: roomToken})
 }
 
-// waitForPeerRoomMessage waits via SSE (with transparent Long-Poll fallback) for the next message
-// from expectedFrom ("sender" or "receiver") with seq > sinceSeq.
+func classifyRoomCtxErr(ctx context.Context, closeCtx context.Context) error {
+	if ctx != nil && ctx.Err() == context.DeadlineExceeded {
+		return envelope.WrapError(envelope.ErrCodeHandshakeTimeout, true, 0, "timed out waiting for peer in room", context.DeadlineExceeded)
+	}
+	if closeCtx != nil && closeCtx.Err() != nil {
+		return envelope.NewError(envelope.ErrCodeCancelled, false, 0, "client closed", nil)
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return envelope.WrapError(envelope.ErrCodeCancelled, false, 0, "waiting for peer cancelled", ctx.Err())
+	}
+	return nil
+}
+
+// waitForPeerRoomMessage waits via SSE (with transparent Long-Poll fallback, 60s SSE idle timeout,
+// 250ms..5s backoff, and immediate security/auth error rethrow) for the next message from expectedFrom.
 func (c *Client) waitForPeerRoomMessage(ctx context.Context, roomID, roomToken, expectedFrom string, sinceSeq int) (roomMessageWire, int, error) {
 	curSince := sinceSeq
 	usePoll := false
+	backoffAttempt := 0
+	var lastFastReconnect time.Time
+
 	for {
-		if err := ctx.Err(); err != nil {
-			return roomMessageWire{}, curSince, envelope.WrapError(envelope.ErrCodeCancelled, false, 0, "waiting for peer cancelled", err)
+		if cerr := classifyRoomCtxErr(ctx, c.closeCtx); cerr != nil {
+			return roomMessageWire{}, curSince, cerr
 		}
 		if !usePoll {
 			path := fmt.Sprintf("/v1/rooms/%s/events?since=%d&mode=sse", roomID, curSince)
-			httpResp, err := c.openSignedStream(ctx, http.MethodGet, path, reqOptions{
+			streamBody, err := c.openSSEStreamWithIdleTimeout(ctx, path, reqOptions{
 				RoomToken: roomToken,
-				AcceptSSE: true,
 			})
 			if err != nil {
-				if se, ok := envelope.AsSyncError(err); ok && (se.Code == envelope.ErrCodeRoomBurned || se.Code == envelope.ErrCodeNotFound || se.Code == envelope.ErrCodeUnauthorizedToken) {
+				if cerr := classifyRoomCtxErr(ctx, c.closeCtx); cerr != nil {
+					return roomMessageWire{}, curSince, cerr
+				}
+				if isFatalWatchOrRoomErr(err) {
+					return roomMessageWire{}, curSince, err
+				}
+				if se, ok := envelope.AsSyncError(err); ok && (se.Code == envelope.ErrCodeRoomBurned || se.Code == envelope.ErrCodeNotFound || se.Code == envelope.ErrCodeInvalidState) {
 					return roomMessageWire{}, curSince, se
 				}
+				if serr := sleepWithBackoff(ctx, backoffAttempt, err); serr != nil {
+					return roomMessageWire{}, curSince, classifyRoomCtxErr(ctx, c.closeCtx)
+				}
+				backoffAttempt++
 				usePoll = true
 				continue
 			}
+
 			var found *roomMessageWire
 			var termErr error
-			parseErr := parseSSEStream(httpResp.Body, func(ev sseEvent) error {
+			sawReconnect := false
+			sawAnyEvent := false
+			parseErr := parseSSEStream(streamBody, func(ev sseEvent) error {
+				sawAnyEvent = true
 				switch ev.Event {
 				case "message":
 					var m roomMessageWire
@@ -155,20 +189,41 @@ func (c *Client) waitForPeerRoomMessage(ctx context.Context, roomID, roomToken, 
 					termErr = envelope.NewError(envelope.ErrCodeNotFound, false, 404, "room closed by peer", nil)
 					return errStopSSE
 				case "reconnect":
+					sawReconnect = true
 					return errStopSSE
 				}
 				return nil
 			})
-			_ = httpResp.Body.Close()
+			_ = streamBody.Close()
+
 			if found != nil {
 				return *found, curSince, nil
 			}
 			if termErr != nil {
 				return roomMessageWire{}, curSince, termErr
 			}
-			if parseErr != nil && !errors.Is(parseErr, errStopSSE) {
+			if cerr := classifyRoomCtxErr(ctx, c.closeCtx); cerr != nil {
+				return roomMessageWire{}, curSince, cerr
+			}
+			if sawReconnect {
+				backoffAttempt = 0
+				now := time.Now()
+				if !lastFastReconnect.IsZero() && now.Sub(lastFastReconnect) < 100*time.Millisecond {
+					if serr := sleepWithBackoff(ctx, 0, nil); serr != nil {
+						return roomMessageWire{}, curSince, classifyRoomCtxErr(ctx, c.closeCtx)
+					}
+				}
+				lastFastReconnect = now
+				continue
+			}
+			// Immediate unexpected EOF or stream error -> backoff and try Long-Poll fallback.
+			if parseErr != nil || !sawAnyEvent {
 				usePoll = true
 			}
+			if serr := sleepWithBackoff(ctx, backoffAttempt, parseErr); serr != nil {
+				return roomMessageWire{}, curSince, classifyRoomCtxErr(ctx, c.closeCtx)
+			}
+			backoffAttempt++
 			continue
 		}
 
@@ -176,8 +231,22 @@ func (c *Client) waitForPeerRoomMessage(ctx context.Context, roomID, roomToken, 
 		path := fmt.Sprintf("/v1/rooms/%s/events?since=%d&mode=poll&wait_sec=20", roomID, curSince)
 		resp, err := c.doControl(ctx, http.MethodGet, path, nil, reqOptions{RoomToken: roomToken})
 		if err != nil {
-			return roomMessageWire{}, curSince, err
+			if cerr := classifyRoomCtxErr(ctx, c.closeCtx); cerr != nil {
+				return roomMessageWire{}, curSince, cerr
+			}
+			if isFatalWatchOrRoomErr(err) {
+				return roomMessageWire{}, curSince, err
+			}
+			if se, ok := envelope.AsSyncError(err); ok && (se.Code == envelope.ErrCodeRoomBurned || se.Code == envelope.ErrCodeNotFound || se.Code == envelope.ErrCodeInvalidState || !se.Retryable) {
+				return roomMessageWire{}, curSince, se
+			}
+			if serr := sleepWithBackoff(ctx, backoffAttempt, err); serr != nil {
+				return roomMessageWire{}, curSince, classifyRoomCtxErr(ctx, c.closeCtx)
+			}
+			backoffAttempt++
+			continue
 		}
+		backoffAttempt = 0
 		var pr roomPollResp
 		if err := json.Unmarshal(resp.Body, &pr); err != nil {
 			return roomMessageWire{}, curSince, envelope.WrapError(envelope.ErrCodeBadRequest, false, resp.StatusCode, "decode room poll", err)
@@ -196,6 +265,8 @@ func (c *Client) waitForPeerRoomMessage(ctx context.Context, roomID, roomToken, 
 		if pr.State == "closed" {
 			return roomMessageWire{}, curSince, envelope.NewError(envelope.ErrCodeNotFound, false, 404, "room closed: "+pr.Reason, nil)
 		}
+		// Try SSE again on next cycle if poll returned cleanly with no messages yet.
+		usePoll = false
 	}
 }
 
@@ -205,7 +276,13 @@ var errStopSSE = errors.New("stop sse")
 
 // StartOneShotSend runs a Flow 1 one-shot transfer over Mode A streaming pipe.
 func (c *Client) StartOneShotSend(ctx context.Context, parcel envelope.ParcelInput, opts PairOptions) (*SendResult, error) {
-	caps, err := c.Capabilities(ctx)
+	done, err := c.beginOp()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+
+	caps, err := c.capabilitiesInternal(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -217,6 +294,7 @@ func (c *Client) StartOneShotSend(ctx context.Context, parcel envelope.ParcelInp
 	if err != nil {
 		return nil, err
 	}
+	defer prep.Zero()
 
 	sess, err := c.runInitiatorHandshake(ctx, synccrypto.PurposeOneshot, opts)
 	if err != nil {
@@ -269,22 +347,27 @@ func (c *Client) StartOneShotSend(ctx context.Context, parcel envelope.ParcelInp
 	}
 	ackRaw, err := base64.RawURLEncoding.DecodeString(ackWire.MsgB64)
 	if err != nil {
+		c.closeRoom(ctx, sess.RoomID, sess.Token, "verify_failed")
 		return nil, envelope.NewError(envelope.ErrCodeCryptoDecryptFailed, false, 0, "decode pipe_ack", nil)
 	}
 	var cw pipeCtrlWire
 	if err := json.Unmarshal(ackRaw, &cw); err != nil || cw.CtrlSeq != 1 {
+		c.closeRoom(ctx, sess.RoomID, sess.Token, "verify_failed")
 		return nil, envelope.NewError(envelope.ErrCodeCryptoDecryptFailed, false, 0, "invalid pipe_ack ctrl_seq", nil)
 	}
 	ctBytes, err := base64.RawURLEncoding.DecodeString(cw.CT)
 	if err != nil {
+		c.closeRoom(ctx, sess.RoomID, sess.Token, "verify_failed")
 		return nil, envelope.NewError(envelope.ErrCodeCryptoDecryptFailed, false, 0, "decode pipe_ack ct", nil)
 	}
 	ptAck, err := synccrypto.OpenPipeCtrl(ctrlKey, ctrlNP, sess.HS.TH[:], cw.CtrlSeq, ctBytes)
 	if err != nil {
+		c.closeRoom(ctx, sess.RoomID, sess.Token, "verify_failed")
 		return nil, envelope.WrapError(envelope.ErrCodeCryptoDecryptFailed, false, 0, "decrypt pipe_ack", err)
 	}
 	var ack envelope.PipeAckPayload
 	if err := json.Unmarshal(ptAck, &ack); err != nil || ack.Op != "pipe_ack" || ack.MsgID != prep.MsgID {
+		c.closeRoom(ctx, sess.RoomID, sess.Token, "verify_failed")
 		return nil, envelope.NewError(envelope.ErrCodeCryptoDecryptFailed, false, 0, "invalid pipe_ack payload", nil)
 	}
 	c.closeRoom(ctx, sess.RoomID, sess.Token, "completed")
@@ -330,6 +413,11 @@ func (c *Client) uploadAllPipeParts(
 	putPipeChunk := func(partID uint32, txIdx int, data []byte) error {
 		path := fmt.Sprintf("/v1/pipe/%s/parts/%d/chunks/%d", pipeID, partID, txIdx)
 		chunkCopy := data
+		maxRetries := maxMidStreamPipePeerTimeouts
+		if partID == 0 && txIdx == 0 {
+			maxRetries = maxInitialPipePeerTimeouts
+		}
+		timeouts := 0
 		for {
 			_, err := c.doSignedWithSkewRetry(ctx, http.MethodPut, path, nil, reqOptions{
 				ContentType: "application/octet-stream",
@@ -340,7 +428,8 @@ func (c *Client) uploadAllPipeParts(
 					return io.NopCloser(bytes.NewReader(chunkCopy)), nil
 				},
 			})
-			if err != nil && envelope.IsCode(err, envelope.ErrCodePipePeerTimeout) && ctx.Err() == nil {
+			if err != nil && envelope.IsCode(err, envelope.ErrCodePipePeerTimeout) && ctx.Err() == nil && timeouts < maxRetries {
+				timeouts++
 				select {
 				case <-ctx.Done():
 					return envelope.WrapError(envelope.ErrCodeCancelled, false, 0, "pipe upload cancelled", ctx.Err())
@@ -400,10 +489,18 @@ func (c *Client) uploadAllPipeParts(
 
 // ReceiveFromRoom auto-dispatches Mode A receiving for Flow 1 oneshot (m=1/2) AND Flow 2 direct (m=0).
 func (c *Client) ReceiveFromRoom(ctx context.Context, pairInput string, handler ParcelHandler, opts ReceiveOptions) (*envelope.Manifest, error) {
+	done, err := c.beginOp()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+
 	roomID, oob, err := parseRoomInput(pairInput)
 	if err != nil {
 		return nil, err
 	}
+	defer clear(oob)
+
 	joined, rawM1, err := c.joinAndReadRawM1(ctx, roomID)
 	if err != nil {
 		return nil, err
@@ -452,7 +549,7 @@ func (c *Client) ReceiveDirect(ctx context.Context, pairInput string, handler Pa
 }
 
 func (c *Client) receiveOneShotJoined(ctx context.Context, joined *roomJoinResp, m1 hsM1Wire, oob []byte, handler ParcelHandler, opts ReceiveOptions) (*envelope.Manifest, error) {
-	sess, err := c.runResponderHandshake(ctx, joined, m1, oob, opts.OnSASDisplay)
+	sess, err := c.runResponderHandshake(ctx, joined, m1, oob, opts.OnSASDisplay, opts.OnSASConfirm)
 	if err != nil {
 		return nil, err
 	}
@@ -460,6 +557,7 @@ func (c *Client) receiveOneShotJoined(ctx context.Context, joined *roomJoinResp,
 
 	ctrlKey, ctrlNP, err := synccrypto.DerivePipeCtrlKeys(sess.HS.TH[:], sess.HS.SessionKey[:])
 	if err != nil {
+		c.closeRoom(ctx, sess.RoomID, sess.Token, "cancelled")
 		return nil, err
 	}
 	defer clear(ctrlKey[:])
@@ -472,26 +570,32 @@ func (c *Client) receiveOneShotJoined(ctx context.Context, joined *roomJoinResp,
 	sess.LastSeq = nextSeq
 	startRaw, err := base64.RawURLEncoding.DecodeString(startWire.MsgB64)
 	if err != nil {
+		c.closeRoom(ctx, sess.RoomID, sess.Token, "verify_failed")
 		return nil, envelope.NewError(envelope.ErrCodeCryptoDecryptFailed, false, 0, "decode pipe_start", nil)
 	}
 	var cw pipeCtrlWire
 	if err := json.Unmarshal(startRaw, &cw); err != nil || cw.CtrlSeq != 0 {
+		c.closeRoom(ctx, sess.RoomID, sess.Token, "verify_failed")
 		return nil, envelope.NewError(envelope.ErrCodeCryptoDecryptFailed, false, 0, "invalid pipe_start ctrl_seq", nil)
 	}
 	ctBytes, err := base64.RawURLEncoding.DecodeString(cw.CT)
 	if err != nil {
+		c.closeRoom(ctx, sess.RoomID, sess.Token, "verify_failed")
 		return nil, envelope.NewError(envelope.ErrCodeCryptoDecryptFailed, false, 0, "decode pipe_start ct", nil)
 	}
 	ptStart, err := synccrypto.OpenPipeCtrl(ctrlKey, ctrlNP, sess.HS.TH[:], cw.CtrlSeq, ctBytes)
 	if err != nil {
+		c.closeRoom(ctx, sess.RoomID, sess.Token, "verify_failed")
 		return nil, envelope.WrapError(envelope.ErrCodeCryptoDecryptFailed, false, 0, "decrypt pipe_start", err)
 	}
 	var startCmd envelope.PipeStartPayload
 	if err := json.Unmarshal(ptStart, &startCmd); err != nil || startCmd.Op != "pipe_start" {
+		c.closeRoom(ctx, sess.RoomID, sess.Token, "verify_failed")
 		return nil, envelope.NewError(envelope.ErrCodeCryptoDecryptFailed, false, 0, "invalid pipe_start payload", nil)
 	}
 	msgIDSlice, err := hex.DecodeString(startCmd.MsgID)
 	if err != nil || len(msgIDSlice) != 16 {
+		c.closeRoom(ctx, sess.RoomID, sess.Token, "verify_failed")
 		return nil, envelope.NewError(envelope.ErrCodeManifestInvalid, false, 0, "invalid pipe_start msg_id", nil)
 	}
 	var msgIDRaw [16]byte
@@ -499,13 +603,18 @@ func (c *Client) receiveOneShotJoined(ctx context.Context, joined *roomJoinResp,
 
 	p0Key, p0NP, err := synccrypto.DeriveOneshotPart0Keys(sess.HS.SessionKey[:], msgIDRaw[:])
 	if err != nil {
+		c.closeRoom(ctx, sess.RoomID, sess.Token, "cancelled")
 		return nil, err
 	}
 	defer clear(p0Key[:])
 
-	manifest, err := c.downloadAndDeliverPipeParcel(ctx, sess.PipeID, sess.Token, msgIDRaw, startCmd.MsgID, p0Key, p0NP, nil, startCmd.Parts, handler, opts.OnProgress)
+	manifest, err := c.downloadAndDeliverPipeParcel(ctx, sess.PipeID, sess.Token, msgIDRaw, startCmd.MsgID, p0Key, p0NP, nil, startCmd.BlocksPerChunk, startCmd.Parts, handler, opts.OnProgress)
 	if err != nil {
-		c.closeRoom(ctx, sess.RoomID, sess.Token, "cancelled")
+		reason := "cancelled"
+		if envelope.IsSecurityAlert(err) || envelope.IsCode(err, envelope.ErrCodeManifestInvalid) {
+			reason = "verify_failed"
+		}
+		c.closeRoom(ctx, sess.RoomID, sess.Token, reason)
 		return nil, err
 	}
 
@@ -537,11 +646,33 @@ func (c *Client) receiveDirectJoined(ctx context.Context, joined *roomJoinResp, 
 	}
 	defer opened.Zero()
 
-	manifest, err := c.downloadAndDeliverPipeParcel(ctx, joined.PipeID, token, opened.MsgIDRaw, opened.MsgID, opened.Part0Key, opened.Part0NoncePrefix, opened, initPayload.Parts, handler, opts.OnProgress)
+	releaseMsg, claimed := c.claimInFlightMsgID(opened.MsgID)
+	if !claimed {
+		c.closeRoom(ctx, roomID, token, "verify_failed")
+		return nil, envelope.NewError(envelope.ErrCodeMsgReplayDetected, false, 0, "msg_id is already being processed concurrently", map[string]any{"msg_id": opened.MsgID})
+	}
+	defer releaseMsg()
+
+	if seen, err := c.keyStore.HasSeenMsgID(opened.MsgID); err != nil {
+		c.closeRoom(ctx, roomID, token, "cancelled")
+		return nil, err
+	} else if seen {
+		c.closeRoom(ctx, roomID, token, "verify_failed")
+		return nil, envelope.NewError(envelope.ErrCodeMsgReplayDetected, false, 0, "msg_id already processed (replay rejected)", map[string]any{"msg_id": opened.MsgID})
+	}
+
+	// ST-P2-14: Always close/burn the direct room if verification or delivery fails so sender never hangs until TTL!
+	manifest, err := c.downloadAndDeliverPipeParcel(ctx, joined.PipeID, token, opened.MsgIDRaw, opened.MsgID, opened.Part0Key, opened.Part0NoncePrefix, opened, initPayload.BlocksPerChunk, initPayload.Parts, handler, opts.OnProgress)
 	if err != nil {
+		reason := "cancelled"
+		if envelope.IsSecurityAlert(err) || envelope.IsCode(err, envelope.ErrCodeManifestInvalid) {
+			reason = "verify_failed"
+		}
+		c.closeRoom(ctx, roomID, token, reason)
 		return nil, err
 	}
 	if err := c.keyStore.MarkSeenMsgID(opened.MsgID, opened.CreatedAt, time.Now().Unix()); err != nil {
+		c.closeRoom(ctx, roomID, token, "cancelled")
 		return nil, err
 	}
 
@@ -565,6 +696,7 @@ func (c *Client) downloadAndDeliverPipeParcel(
 	p0Key [32]byte,
 	p0NP [7]byte,
 	opened *synccrypto.SealedHeaderOpenResult,
+	blocksPerChunk int,
 	parts []envelope.PartLayout,
 	handler ParcelHandler,
 	onProgress func(envelope.TransferEvent),
@@ -572,6 +704,12 @@ func (c *Client) downloadAndDeliverPipeParcel(
 	partMap := make(map[uint32]envelope.PartLayout, len(parts))
 	var totalBytes int64
 	for _, p := range parts {
+		if _, dup := partMap[p.PartID]; dup {
+			return nil, envelope.NewError(envelope.ErrCodeManifestInvalid, false, 0, fmt.Sprintf("duplicate part_id=%d in wire layout", p.PartID), nil)
+		}
+		if p.TotalBytes <= 0 || p.ChunkCount <= 0 {
+			return nil, envelope.NewError(envelope.ErrCodeManifestInvalid, false, 0, fmt.Sprintf("invalid part_id=%d layout", p.PartID), nil)
+		}
 		partMap[p.PartID] = p
 		totalBytes += p.TotalBytes
 	}
@@ -582,10 +720,20 @@ func (c *Client) downloadAndDeliverPipeParcel(
 
 	getPipeChunk := func(partID uint32, txIdx int) ([]byte, error) {
 		path := fmt.Sprintf("/v1/pipe/%s/parts/%d/chunks/%d", pipeID, partID, txIdx)
+		maxRetries := maxMidStreamPipePeerTimeouts
+		if partID == 0 && txIdx == 0 {
+			maxRetries = maxInitialPipePeerTimeouts
+		}
+		timeouts := 0
 		for {
-			resp, err := c.doSignedWithSkewRetry(ctx, http.MethodGet, path, nil, reqOptions{RoomToken: recvToken})
+			resp, err := c.doSignedWithSkewRetry(ctx, http.MethodGet, path, nil, reqOptions{
+				RoomToken:     recvToken,
+				MaxRespBytes:  maxChunkRespBytes,
+				IsBinaryChunk: true,
+			})
 			if err != nil {
-				if envelope.IsCode(err, envelope.ErrCodePipePeerTimeout) && ctx.Err() == nil {
+				if envelope.IsCode(err, envelope.ErrCodePipePeerTimeout) && ctx.Err() == nil && timeouts < maxRetries {
+					timeouts++
 					select {
 					case <-ctx.Done():
 						return nil, envelope.WrapError(envelope.ErrCodeCancelled, false, 0, "pipe download cancelled", ctx.Err())
@@ -605,9 +753,12 @@ func (c *Client) downloadAndDeliverPipeParcel(
 	if err != nil {
 		return nil, err
 	}
+	if len(partMap) != 1+len(manifest.Blobs) {
+		return nil, envelope.NewError(envelope.ErrCodeManifestInvalid, false, 0, "wire parts count does not match signed manifest blobs count", nil)
+	}
 
 	var doneBytes int64 = p0Layout.TotalBytes
-	receivedBlobs, err := c.pullAndVerifyBlobs(ctx, "", msgIDRaw, manifest, partMap, totalBytes, &doneBytes, "pipe", func(partID uint32, txIdx int) ([]byte, error) {
+	receivedBlobs, err := c.pullAndVerifyBlobs(ctx, "", msgIDRaw, manifest, partMap, blocksPerChunk, totalBytes, &doneBytes, "pipe", func(partID uint32, txIdx int) ([]byte, error) {
 		return getPipeChunk(partID, txIdx)
 	}, onProgress)
 	if err != nil {
@@ -661,6 +812,8 @@ func (c *Client) sendDirectViaPipe(
 	if opts.IncludeRelay {
 		offer.Endpoint = c.profile.Endpoint
 		offer.SPKISHA256 = c.profile.SPKISHA256
+		offer.SPKIPin = c.profile.SPKIPin
+		offer.SPKIPins = append([]string(nil), c.profile.SPKIPins...)
 		offer.AccessKey = c.profile.AccessKey
 	}
 	pairURI, err := envelope.FormatPairURI(offer)
@@ -692,14 +845,17 @@ func (c *Client) sendDirectViaPipe(
 	}
 	ackRaw, err := base64.RawURLEncoding.DecodeString(ackWire.MsgB64)
 	if err != nil {
+		c.closeRoom(ctx, roomID, created.SenderToken, "verify_failed")
 		return nil, envelope.NewError(envelope.ErrCodeCryptoDecryptFailed, false, 0, "decode direct pipe_ack", nil)
 	}
 	var ack envelope.PipeAckPayload
 	if err := json.Unmarshal(ackRaw, &ack); err != nil || ack.Op != "pipe_ack" || ack.MsgID != prep.MsgID {
+		c.closeRoom(ctx, roomID, created.SenderToken, "verify_failed")
 		return nil, envelope.NewError(envelope.ErrCodeCryptoSignatureInvalid, false, 0, "invalid direct pipe_ack payload", nil)
 	}
 	macBytes, err := base64.RawURLEncoding.DecodeString(ack.AckMAC)
 	if err != nil || synccrypto.VerifyDirectAckMAC(p0Key, prep.MsgIDRaw, macBytes) != nil {
+		c.closeRoom(ctx, roomID, created.SenderToken, "verify_failed")
 		return nil, envelope.NewError(envelope.ErrCodeCryptoSignatureInvalid, false, 0, "direct pipe_ack MAC verification failed", nil)
 	}
 	c.closeRoom(ctx, roomID, created.SenderToken, "completed")
