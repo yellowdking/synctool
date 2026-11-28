@@ -274,6 +274,14 @@ func Open0RTTHeader(
 		}
 		return nil, ErrUntrustedSender
 	}
+	if IsSmallOrderOrNonCanonicalEd25519PK(senderSignPK) {
+		wipePart0()
+		return nil, ErrInvalidSignature
+	}
+	if _, derivedSenderHex := DeriveDeviceID(senderSignPK); subtle.ConstantTimeCompare([]byte(derivedSenderHex), []byte(senderIDHex)) != 1 {
+		wipePart0()
+		return nil, ErrDeviceIDMismatch
+	}
 
 	sigInput, err := BuildZeroRTTSigInput(clearHdr, senderIDRaw, recipIDRaw, createdAt, manifestSHA)
 	if err != nil {
