@@ -10,7 +10,7 @@
 - **零信任中继（数据绝对安全）**：中继 VPS 仅转发/暂存密文分片，**永远拿不到明文、解密密钥、应用类型（`app_id`）、文件名、媒体类型、设备真名或离线发送者身份**；即使 VPS 被攻破、抓包或整盘拖库，也无法还原任何数据。
 - **三路径 + 两套密码流（安全 × 适用 × 易用兼得）**：
   - **面对面换机 / 首次绑定（主路径）**：**QR 二维码 128-bit 线下暗码 + 临时 X25519**，一扫即连，前向保密、防离线破解、防中间人；
-  - **无摄像头 / 跨城 / CLI 兜底**：**8 位 Crockford Base32 明码路由 + 3 步 Commit-Reveal X25519 + 发送端输入接收端 6 位 SAS 核验码**（防离线碰撞、防盲点同意、失败即熔断房间）；
+  - **无摄像头 / 跨城 / CLI 兜底**：**8 位 Crockford Base32 明码路由 + 3 步 Commit-Reveal X25519 + 双端强制核验 6 位 SAS（发起端输入 + 响应端 `OnSASConfirm` 显式放行）**（防离线碰撞、防盲点同意、防恶心中继单边投毒，失败即熔断房间）；
   - **已绑定设备高频定向推送（记事本 / 剪贴板）**：**DeviceCard 0-RTT Ephemeral-Static X25519 + Ed25519 Sealed Sender**，点选目标设备一键发送，仅该目标设备私钥可解，支持**单台丢失设备精准吊销**且不误伤其他设备。
 - **双模式按需中转 + 适应全档位 VPS**：
   - **Mode A（实时零落盘分块管道）**：双方同时在线时 32/64 KiB 缓冲直通，**256MB 内存小鸡也能零落盘稳传 GB 级视频**，支持弱网分块级断点续传；
@@ -81,22 +81,26 @@ flowchart LR
 首次初始化会自动生成高熵随机 `RELAY_ACCESS_KEY` 与 730 天含 IP SAN 的 ECDSA P-256 自签证书，并仅向当前终端打印 `synctool://relay?...#k=...` 配置链接（**严禁写死默认密钥、严禁跳过证书校验**）：
 
 ```bash
-# 1. 初始化私有密钥与自签证书（将 1.2.3.4 替换为你的 VPS 公网 IP）
-docker run --rm -it -v $(pwd)/data:/data \
-  ghcr.io/yellowdking/synctool:latest \
-  init --public-host 1.2.3.4 --listen :54843 --data-dir /data
+cd deploy
 
-# 2. 启动中继（默认 --profile=auto；如需彻底关闭离线暂存，加 -e SYNCTOOL_SPOOL=off）
-cd deploy && docker compose up -d
+# 1. 在统一的 synctool_data 命名卷（UID 65532:65532）内初始化私有密钥与 730 天自签证书（将 1.2.3.4 替换为你的 VPS 公网 IP）
+SYNCTOOL_PUBLIC_HOST=1.2.3.4 docker compose run --rm synctool-relay init
+
+# 2. 启动中继（默认 standard / 256m；如需彻底关闭离线暂存，加 SYNCTOOL_SPOOL=off）
+SYNCTOOL_PUBLIC_HOST=1.2.3.4 docker compose up -d
 ```
+> 若不使用 `docker compose` 而直接 `docker run`，请同样挂载 Docker 命名卷 `-v synctool_data:/data`（避免宿主机新建空 `./data` 属主为 `root` 导致容器内非特权 `USER 65532:65532` 无写权限或产生双份密钥）。
 
 ### 方式 2：Docker + Caddy（有域名，自动 HTTPS，完美兼容浏览器/PWA）
 
 ```bash
-# 编辑 deploy/Caddyfile 填入你的域名（如 sync.example.com），随后启动：
-cd deploy && docker compose -f docker-compose.caddy.yml up -d
+# 设置域名（跨源浏览器/PWA 前端可额外指定 SYNCTOOL_CORS_ORIGINS=https://app.example.com），初始化并启动：
+cd deploy
+export SYNCTOOL_DOMAIN=sync.example.com
+docker compose -f docker-compose.caddy.yml run --rm synctool-relay init
+docker compose -f docker-compose.caddy.yml up -d
 ```
-> 走反代时中继自动以 `--tls=off --trust-proxies=<caddy网段>` 运行，防止真实客户端 IP 误判；浏览器/PWA 版 `sdk/ts` 可直接通过系统 CA 证书无缝接入。
+> 走反代时中继自动以 `--tls=off --trust-proxies=<caddy网段>` 运行，防止真实客户端 IP 误判；浏览器/PWA 版 `sdk/ts` 可直接通过系统 CA 证书与受控 `--cors-origins` 零封禁无缝接入。
 
 ### 方式 3：256MB 极低配小鸡免 Docker 裸跑（`systemd` 单二进制）
 
@@ -237,6 +241,7 @@ for (const item of previews) {
 - `internal/relay/` & `cmd/synctool-relay/` —— 纯 Go 零依赖中继服务端
 - `sdk/go/` & `cmd/synctool/` —— 纯 Go 标准库参考 SDK 与万能 CLI
 - `sdk/ts/` —— 零第三方依赖 WebCrypto ESM SDK + `.d.ts` 类型声明
+- `sdk/kotlin/` —— 纯 JVM / Android 原生 Kotlin SDK（OkHttp + BouncyCastle RFC 7748/8032）
 - `examples/` —— Go / Node WebCrypto / 跨语言 CLI `--json` 最小可运行接入模板
 - `deploy/` —— Docker `scratch` 镜像、Caddy HTTPS 反代配置与 256MB 小鸡 `systemd` 脚本
 - `e2e/` —— Go ↔ TS 真实中继跨语言端到端集成测试
@@ -248,7 +253,7 @@ for (const item of previews) {
 1. **反社工铁律（跨城无摄像头传人时）**：面对面优先扫 QR 码；必须手输明码时，**8 位房间明码与 6 位 SAS 核验码切勿发在同一个微信/QQ 对话框**（建议文字发明码，语音/电话核对 6 位 SAS 并由发件端输入验证）。
 2. **严禁注册系统全局 Deep Link**：将 `synctool` 嵌入移动端（Android/iOS）或桌面端 App 时，**不要**向操作系统注册全局 `synctool://` 协议拉起；请仅在应用内扫码器或受控粘贴框中解析 URI，且严禁把含 `#k=` / `#s=` 的 URI 打印到日志或崩溃上报。
 3. **浏览器 vs 裸 IP 证书边界**：浏览器 / PWA 沙箱仅允许通过域名有效 HTTPS（`system_ca`，推荐使用 `deploy/docker-compose.caddy.yml`）连接；裸 IP 自建证书（`spki_pin`）适用于 Go / Node / Electron / 移动端原生客户端。
-4. **730 天自签证书轮换**：为兼容 Apple（iOS/macOS ≤ 825 天）叶证书红线，自签证书有效期锁定 2 年；剩余 `< 30 天` 时 SDK 与 `synctool ping` 会主动预警，运行 `synctool-relay cert-rotate` 生成新证书并重新扫码即可。
+4. **730 天自签证书无感轮换（支持同钥续期与双指纹零停机切换）**：为兼容 Apple（iOS/macOS ≤ 825 天）叶证书红线，自签证书有效期锁定 2 年；剩余 `< 30 天` 时 SDK 与 `synctool ping` 会主动预警。日常到期续签可执行 `synctool-relay cert-rotate --reuse-key`（复用现有 P-256 私钥签发新 730 天证书，**SPKI `pin` 不变，客户端零重配**）；如需轮换私钥，先执行 `synctool-relay cert-rotate --stage-next` 分发含 `pin=<cur>,<next>` 的双指纹 URI，待客户端升级后再执行 `synctool-relay cert-rotate --promote-staged` 并发送 `SIGHUP` 热加载即可零停机切换。
 5. **移动端传输大视频提示**：iOS 切后台约 30 秒会被系统挂起，Android 建议在 Foreground Service / WorkManager 中执行大视频续传；传输大视频时建议保持前台，若中途断网或切后台，切回后会自动从已保存的分片 checkpoint 断点续传。
 
 ---
