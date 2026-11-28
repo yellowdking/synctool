@@ -373,10 +373,86 @@ func SignDeviceCard(signSK ed25519.PrivateKey, kemPK []byte, issuedAt int64) ([]
 	return ed25519.Sign(signSK, input), nil
 }
 
+// RFC 8032 §5.1.3 canonical Curve25519 prime p = 2^255 - 19 (little-endian) and the 5 canonical
+// small-order Edwards25519 y-coordinates (with sign bit 255 cleared).
+var (
+	edwards25519PrimeLE = [32]byte{
+		0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+	}
+	smallOrderEd25519Ys = [5][32]byte{
+		// y = 0 (order 4)
+		{},
+		// y = 1 (order 1 identity)
+		{0x01},
+		// order 8 torsion y_1
+		{
+			0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0,
+			0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef, 0x98, 0xf0,
+			0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39,
+			0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53, 0xfc, 0x05,
+		},
+		// order 8 torsion y_2 = p - y_1
+		{
+			0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f,
+			0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10, 0x67, 0x0f,
+			0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6,
+			0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac, 0x03, 0x7a,
+		},
+		// y = p - 1 (order 2)
+		{
+			0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+		},
+	}
+)
+
+// IsSmallOrderOrNonCanonicalEd25519PK reports whether pk (32B) has a non-canonical y >= p
+// or represents one of the 8 small-order torsion points on Edwards25519.
+func IsSmallOrderOrNonCanonicalEd25519PK(pk []byte) bool {
+	if len(pk) != ed25519.PublicKeySize {
+		return true
+	}
+	var y [32]byte
+	copy(y[:], pk)
+	signBit := pk[31] >> 7
+	y[31] &= 0x7f
+
+	// Check y >= p in little-endian (most-significant byte is index 31).
+	cmp := 0 // 1 if y > p, -1 if y < p, 0 if equal
+	for i := 31; i >= 0; i-- {
+		if y[i] > edwards25519PrimeLE[i] {
+			cmp = 1
+			break
+		}
+		if y[i] < edwards25519PrimeLE[i] {
+			cmp = -1
+			break
+		}
+	}
+	if cmp >= 0 {
+		return true
+	}
+	// Non-canonical negative zero x: when y == 1 or y == p-1, x == 0 so signBit MUST NOT be 1 (caught below anyway).
+	_ = signBit
+	matched := 0
+	for i := range smallOrderEd25519Ys {
+		matched |= subtle.ConstantTimeCompare(y[:], smallOrderEd25519Ys[i][:])
+	}
+	return matched == 1
+}
+
 // VerifyDeviceCard verifies both canonical 32-lower-hex device_id derivation and the Ed25519 card_sig binding.
 func VerifyDeviceCard(deviceID string, signPK, kemPK []byte, issuedAt int64, cardSig []byte) error {
 	if len(signPK) != ed25519.PublicKeySize || len(kemPK) != 32 || len(cardSig) != ed25519.SignatureSize {
 		return ErrInvalidKeyLength
+	}
+	if IsSmallOrderOrNonCanonicalEd25519PK(signPK) {
+		return ErrInvalidSignature
 	}
 	if !isLowerHex(deviceID, 32) {
 		return ErrDeviceIDMismatch
