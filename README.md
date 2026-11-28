@@ -18,7 +18,7 @@
   - **自动分档 + 极低待机**：`--profile=auto` 自动按容器/系统内存匹配 `nano / standard / media`，无任务时 Lazy GC 休眠（空闲内存 `< 15 MiB`）。
 - **万物皆可组装（业务彻底解耦）**：
   - 统一 `Parcel` 信封（`part_id=0` 加密 Manifest + `part_id=1..63` 独立密钥加密二进制流），通过 `app_id` 隔离业务；
-  - **零第三方依赖**：服务端 `synctool-relay`（纯 Go 单静态二进制 ~8MB）、`sdk/go` + `synctool-cli`（纯 Go 标准库，含 `--json` 机器模式）、`sdk/ts`（纯标准 WebCrypto + `fetch`，通吃浏览器 / PWA / Node / Electron / Tauri / WebView），并由 **7 份黄金测试向量（`spec/test-vectors/`）** 保障所有语言字节级互通。
+  - **零第三方依赖 / 全端原生 SDK**：服务端 `synctool-relay`（纯 Go 单静态二进制 ~8MB）、`sdk/go` + `synctool-cli`（纯 Go 标准库，含 `--json` 机器模式）、`sdk/ts`（纯标准 WebCrypto + `fetch`，通吃浏览器 / PWA / Node / Electron / Tauri / WebView）、`sdk/kotlin`（纯 JVM / Android 原生 SDK）、`sdk/swift`（纯 Apple `CryptoKit` + `Security` + `URLSession` 零第三方依赖，支持 iOS 16+ / macOS 13+），并由 **7 份黄金测试向量（`spec/test-vectors/`）** 保障所有语言字节级互通。
 
 ---
 
@@ -213,6 +213,29 @@ for (const item of previews) {
 ```
 > 无需 `npm install` 即可直接运行测试：`cd sdk/ts && node --test test/*.test.mjs`。更多可直接复制运行的最小模板见 [`examples/`](./examples/)（含 `go-minimal`、`ts-minimal` 与任意语言通用的 `cli-subprocess` NDJSON 示例）。
 
+### 4. Swift SDK（iOS 16+ / macOS 13+ 零依赖原生接入）
+
+```swift
+import Foundation
+import SyncToolSDK
+
+let relay = try SyncUri.parseRelayUri(ProcessInfo.processInfo.environment["SYNCTOOL_RELAY"] ?? "")
+let store = KeychainKeyStore(service: "com.yellowdking.notes.sync", stateFileURL: stateFileURL)
+let client = try SyncClient(relay: relay, keyStore: store, appId: "com.yellowdking.notes", deviceLabel: "iPhone")
+defer { Task { await client.close() } }
+
+// 两阶段拉取：先预览已验签 Manifest，确认后再流式下载附件并发送签名 ACK 物理焚毁中继副本
+let previews = try await client.listInbox(filterAppId: "com.yellowdking.notes")
+for item in previews {
+    let parcel = try await client.fetchParcel(itemId: item.itemId, autoAck: false)
+    for blob in parcel.blobs {
+        _ = try blob.saveToDir(outDir)
+    }
+    try await client.ackItem(item.itemId)
+}
+```
+> 仅依赖 Apple 系统框架（`CryptoKit` + `Security` + `Foundation`），零第三方包依赖；详见 [`sdk/swift/README.md`](./sdk/swift/README.md)。
+
 ---
 
 ## 下游应用接入与平滑升级契约（v1.x 长期免维护指南）
@@ -242,6 +265,7 @@ for (const item of previews) {
 - `sdk/go/` & `cmd/synctool/` —— 纯 Go 标准库参考 SDK 与万能 CLI
 - `sdk/ts/` —— 零第三方依赖 WebCrypto ESM SDK + `.d.ts` 类型声明
 - `sdk/kotlin/` —— 纯 JVM / Android 原生 Kotlin SDK（OkHttp + BouncyCastle RFC 7748/8032）
+- `sdk/swift/` —— 零第三方依赖 Apple 原生 Swift SDK（`CryptoKit` + `Security` + `URLSession`，支持 iOS 16+ / macOS 13+）
 - `examples/` —— Go / Node WebCrypto / 跨语言 CLI `--json` 最小可运行接入模板
 - `deploy/` —— Docker `scratch` 镜像、Caddy HTTPS 反代配置与 256MB 小鸡 `systemd` 脚本
 - `e2e/` —— Go ↔ TS 真实中继跨语言端到端集成测试
