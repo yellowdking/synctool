@@ -89,7 +89,7 @@ SYNCTOOL_PUBLIC_HOST=1.2.3.4 docker compose run --rm synctool-relay init
 # 2. 启动中继（默认 standard / 256m；如需彻底关闭离线暂存，加 SYNCTOOL_SPOOL=off）
 SYNCTOOL_PUBLIC_HOST=1.2.3.4 docker compose up -d
 ```
-> 若不使用 `docker compose` 而直接 `docker run`，请同样挂载 Docker 命名卷 `-v synctool_data:/data`（避免宿主机新建空 `./data` 属主为 `root` 导致容器内非特权 `USER 65532:65532` 无写权限或产生双份密钥）。
+> 若不使用 `docker compose` 而直接 `docker run`，请同样挂载 Docker 命名卷 `-v synctool_data:/data`（避免宿主机新建空 `./data` 属主为 `root` 导致容器内非特权 `USER 65532:65532` 无写权限或产生双份密钥），官方多架构镜像发布于 Docker Hub：`bbplin/synctool:latest`。
 
 ### 方式 2：Docker + Caddy（有域名，自动 HTTPS，完美兼容浏览器/PWA）
 
