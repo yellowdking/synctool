@@ -15,15 +15,7 @@ func readCgroupV2Max(path string) uint64 {
 	if err != nil {
 		return 0
 	}
-	s := strings.TrimSpace(string(data))
-	if s == "" || s == "max" {
-		return 0
-	}
-	v, err := strconv.ParseUint(s, 10, 64)
-	if err != nil || v == 0 {
-		return 0
-	}
-	return v
+	return ParseCgroupV2MaxBytes(string(data))
 }
 
 func readCgroupV1Limit(path string) uint64 {
@@ -39,22 +31,16 @@ func readCgroupV1Limit(path string) uint64 {
 	return v
 }
 
-func detectEffectiveMemoryBytes() uint64 {
-	var cgroupLimit uint64
-
+func detectMemoryLimits() (hostTotal uint64, cgroupLimit uint64) {
 	// Inspect /proc/self/cgroup first so systemd non-containerized MemoryMax slices are honored.
 	var v2Rel, v1MemRel string
 	if selfCg, err := os.ReadFile("/proc/self/cgroup"); err == nil {
 		v2Rel, v1MemRel = ParseProcSelfCgroupPaths(string(selfCg))
 	}
 
-	// 1. Try cgroup v2 (process slice first, then root /sys/fs/cgroup/memory.max)
-	if v2Rel != "" {
-		cgroupLimit = readCgroupV2Max(filepath.Join("/sys/fs/cgroup", v2Rel, "memory.max"))
-	}
-	if cgroupLimit == 0 {
-		cgroupLimit = readCgroupV2Max("/sys/fs/cgroup/memory.max")
-	}
+	// 1. Try cgroup v2: walk from leaf slice up to /sys/fs/cgroup to find tightest memory.max
+	// even when the leaf slice itself reports "max".
+	cgroupLimit = WalkCgroupV2TightestMax("/sys/fs/cgroup", v2Rel, os.ReadFile)
 
 	// 2. Fallback to cgroup v1 (process slice first, then root memory.limit_in_bytes)
 	if cgroupLimit == 0 && v1MemRel != "" {
@@ -65,7 +51,6 @@ func detectEffectiveMemoryBytes() uint64 {
 	}
 
 	// 3. Read host physical RAM from /proc/meminfo
-	var hostTotal uint64
 	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
 			if strings.HasPrefix(line, "MemTotal:") {
@@ -80,16 +65,12 @@ func detectEffectiveMemoryBytes() uint64 {
 		}
 	}
 
-	if cgroupLimit > 0 && hostTotal > 0 {
-		if cgroupLimit < hostTotal {
-			return cgroupLimit
-		}
-		return hostTotal
-	}
-	if cgroupLimit > 0 {
-		return cgroupLimit
-	}
-	return hostTotal
+	return hostTotal, cgroupLimit
+}
+
+func detectEffectiveMemoryBytes() uint64 {
+	hostTotal, cgroupLimit := detectMemoryLimits()
+	return EffectiveMemoryBytes(hostTotal, cgroupLimit)
 }
 
 func detectFreeDiskBytes(path string) (uint64, bool) {

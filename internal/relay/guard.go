@@ -157,18 +157,8 @@ func (g *IPGuard) ExtractClientIP(r *http.Request) netip.Addr {
 		return remoteIP
 	}
 
-	// Fallback to CF-Connecting-IP / X-Real-IP only when XFF is absent and proxy is trusted.
-	for _, hdr := range []string{"CF-Connecting-IP", "X-Real-IP"} {
-		vals := r.Header.Values(hdr)
-		if len(vals) == 1 {
-			if v := strings.TrimSpace(vals[0]); v != "" {
-				if addr, err := netip.ParseAddr(v); err == nil && addr.Zone() == "" {
-					return cleanIPAddr(addr)
-				}
-			}
-		}
-	}
-
+	// XFF-only default: never trust CF-Connecting-IP / X-Real-IP when X-Forwarded-For is absent,
+	// because basic reverse proxies/tunnels often pass client headers through unstripped.
 	return remoteIP
 }
 
