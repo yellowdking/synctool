@@ -196,6 +196,9 @@ func pairTwoClients(t *testing.T, ctx context.Context, alice, bob *client.Client
 		OnSASDisplay: func(sas string) {
 			sasCh <- sas
 		},
+		OnSASConfirm: func(sas string) error {
+			return nil
+		},
 	})
 	wg.Wait()
 	if errA != nil {
@@ -417,6 +420,7 @@ func TestE2E_Flow1A_QROOB_And_Flow1B_CommitSAS_OneShot_And_Burn(t *testing.T) {
 		return nil
 	}, client.ReceiveOptions{
 		OnSASDisplay: func(sas string) { sasCh <- sas },
+		OnSASConfirm: func(sas string) error { return nil },
 	})
 	wg.Wait()
 	if err != nil || sendErr != nil || gotSecret != "commit-reveal-sas-verified" {
@@ -452,6 +456,7 @@ func TestE2E_Flow1A_QROOB_And_Flow1B_CommitSAS_OneShot_And_Burn(t *testing.T) {
 		return errors.New("handler must never be called on SAS mismatch")
 	}, client.ReceiveOptions{
 		OnSASDisplay: func(sas string) { sasCh3 <- sas },
+		OnSASConfirm: func(sas string) error { return nil },
 	})
 	wg.Wait()
 	if !envelope.IsCode(badSendErr, envelope.ErrCodeSASMismatch) {
@@ -459,5 +464,96 @@ func TestE2E_Flow1A_QROOB_And_Flow1B_CommitSAS_OneShot_And_Burn(t *testing.T) {
 	}
 	if !envelope.IsCode(badRecvErr, envelope.ErrCodeRoomBurned) {
 		t.Fatalf("expected responder ERR_ROOM_BURNED, got %v", badRecvErr)
+	}
+}
+
+func TestE2E_Flow1B_ResponderOnSASConfirmMandatoryGate(t *testing.T) {
+	rr := startRealRelay(t, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	alice, _ := newSDKClient(t, rr, "alice-initiator", nil)
+	bobHijack, bobHijackKS := newSDKClient(t, rr, "bob-responder-gate", nil)
+
+	var wg sync.WaitGroup
+
+	// 4a. AcceptDeviceBind with OnSASConfirm == nil fails immediately and burns room.
+	offerCh4a := make(chan client.OfferReadyInfo, 1)
+	var initErr4a error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, initErr4a = alice.StartDeviceBind(ctx, client.PairOptions{
+			Mode:         synccrypto.ModeCommitSAS,
+			OnOfferReady: func(info client.OfferReadyInfo) { offerCh4a <- info },
+			OnSASInput:   func() (string, error) { return "000000", nil },
+		})
+	}()
+	offer4a := <-offerCh4a
+	_, respErr4a := bobHijack.AcceptDeviceBind(ctx, offer4a.DisplayCode, client.PairOptions{})
+	wg.Wait()
+	if !envelope.IsCode(respErr4a, envelope.ErrCodeSASMismatch) {
+		t.Fatalf("expected responder ERR_SAS_MISMATCH when OnSASConfirm is nil, got %v", respErr4a)
+	}
+	if !envelope.IsCode(initErr4a, envelope.ErrCodeRoomBurned) {
+		t.Fatalf("expected initiator ERR_ROOM_BURNED when responder rejects nil OnSASConfirm, got %v", initErr4a)
+	}
+	if devs, _ := bobHijackKS.ListDevices(); len(devs) != 0 {
+		t.Fatalf("CRITICAL: peer DeviceCard saved despite nil OnSASConfirm: %+v", devs)
+	}
+
+	// 4b. AcceptDeviceBind where OnSASConfirm rejects even when Initiator enters SAS and sends pair_bind.
+	offerCh4b := make(chan client.OfferReadyInfo, 1)
+	sasCh4b := make(chan string, 1)
+	var initErr4b error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, initErr4b = alice.StartDeviceBind(ctx, client.PairOptions{
+			Mode:         synccrypto.ModeCommitSAS,
+			OnOfferReady: func(info client.OfferReadyInfo) { offerCh4b <- info },
+			OnSASInput:   func() (string, error) { return <-sasCh4b, nil },
+		})
+	}()
+	offer4b := <-offerCh4b
+	_, respErr4b := bobHijack.AcceptDeviceBind(ctx, offer4b.DisplayCode, client.PairOptions{
+		OnSASDisplay: func(sas string) { sasCh4b <- sas },
+		OnSASConfirm: func(sas string) error { return errors.New("user spotted MITM SAS mismatch") },
+	})
+	wg.Wait()
+	if !envelope.IsCode(respErr4b, envelope.ErrCodeSASMismatch) {
+		t.Fatalf("expected responder ERR_SAS_MISMATCH when OnSASConfirm rejects, got %v", respErr4b)
+	}
+	if initErr4b == nil {
+		t.Fatal("expected initiator StartDeviceBind to fail when responder rejects OnSASConfirm")
+	}
+	if devs, _ := bobHijackKS.ListDevices(); len(devs) != 0 {
+		t.Fatalf("CRITICAL: peer DeviceCard saved despite rejected OnSASConfirm: %+v", devs)
+	}
+
+	// 4c. ReceiveOneShot where OnSASConfirm rejects MUST NEVER invoke ParcelHandler.
+	offerCh4c := make(chan client.OfferReadyInfo, 1)
+	sasCh4c := make(chan string, 1)
+	handlerInvoked := false
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = alice.StartOneShotSend(ctx, envelope.ParcelText("com.yellowdking.e2e", "forged-mitm-payload"), client.PairOptions{
+			Mode:         synccrypto.ModeCommitSAS,
+			OnOfferReady: func(info client.OfferReadyInfo) { offerCh4c <- info },
+			OnSASInput:   func() (string, error) { return <-sasCh4c, nil },
+		})
+	}()
+	offer4c := <-offerCh4c
+	_, respErr4c := bobHijack.ReceiveOneShot(ctx, offer4c.DisplayCode, func(p envelope.ReceivedParcel) error {
+		handlerInvoked = true
+		return nil
+	}, client.ReceiveOptions{
+		OnSASDisplay: func(sas string) { sasCh4c <- sas },
+		OnSASConfirm: func(sas string) error { return errors.New("responder rejected SAS") },
+	})
+	wg.Wait()
+	if !envelope.IsCode(respErr4c, envelope.ErrCodeSASMismatch) || handlerInvoked {
+		t.Fatalf("expected ERR_SAS_MISMATCH with handlerInvoked=false, got err=%v invoked=%v", respErr4c, handlerInvoked)
 	}
 }

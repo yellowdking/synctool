@@ -35,6 +35,13 @@ async function runSelfTest() {
     const p = parcelText('hello cross-platform world', 'com.example.notes');
     const safe = sanitizeFileName('..\\COM1.txt');
     const red = redactMessage('uri=synctool://pair?r=K7M9P2XQ&m=1&p=oneshot#s=ABCDEFGHIJKLMNOPQRSTUV');
+    const tmpCli = new SyncClient({
+      relay: { origin: 'https://sync.example.com:443', accessKey: 'K'.repeat(43) },
+      keyStore: store,
+      appId: 'com.example.notes',
+    });
+    await tmpCli.getIdentity();
+    await tmpCli.close();
     console.log(`ok: app=${p.appId} safe=${safe} redacted=${red}`);
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
@@ -49,18 +56,22 @@ async function main() {
 
   // 1. Initialize client from SYNCTOOL_RELAY + SYNCTOOL_CONFIG (NodeFileKeyStore 0600)
   const cli = SyncClient.fromEnv({ appId: 'com.example.notes', label: 'Node Quickstart' });
-  const ping = await cli.ping();
-  console.log(`connected: profile=${ping.profile} spool=${ping.spool_backend} rtt=${ping.rtt_ms}ms`);
+  try {
+    const ping = await cli.ping();
+    console.log(`connected: profile=${ping.profile} spool=${ping.spool_backend} rtt=${ping.rtt_ms}ms`);
 
-  // 2. Two-phase inbox preview + verified fetch & signed ACK burn (auto self-heals on nano restart)
-  const previews = await cli.listInbox({ appId: 'com.example.notes' });
-  for (const item of previews) {
-    await cli.fetchParcel(item.item_id, async ({ manifest, blobs }) => {
-      console.log('received note:', manifest.inline_payload);
-      for (const b of blobs) {
-        console.log(`attachment verified: ${b.safeName} (${b.descriptor.size} bytes)`);
-      }
-    });
+    // 2. Two-phase inbox preview + verified fetch & signed ACK burn (auto self-heals on nano restart)
+    const previews = await cli.listInbox({ appId: 'com.example.notes' });
+    for (const item of previews) {
+      await cli.fetchParcel(item.item_id, async ({ manifest, blobs }) => {
+        console.log('received note:', manifest.inline_payload);
+        for (const b of blobs) {
+          console.log(`attachment verified: ${b.safeName} (${b.descriptor.size} bytes)`);
+        }
+      });
+    }
+  } finally {
+    await cli.close();
   }
 }
 
