@@ -24,11 +24,12 @@ var (
 )
 
 type globalOpts struct {
-	configDir string
-	relayRef  string
-	appID     string
-	jsonMode  bool
-	quiet     bool
+	configDir     string
+	relayRef      string
+	relayFromArgv bool
+	appID         string
+	jsonMode      bool
+	quiet         bool
 }
 
 type multiStringFlag []string
@@ -148,9 +149,11 @@ func parseGlobalFlags(args []string) (globalOpts, []string, error) {
 				return opts, nil, envelope.NewError(envelope.ErrCodeBadRequest, false, 0, "--relay requires an id or alias", nil)
 			}
 			opts.relayRef = args[i+1]
+			opts.relayFromArgv = true
 			i += 2
 		case strings.HasPrefix(a, "--relay="):
 			opts.relayRef = strings.TrimPrefix(a, "--relay=")
+			opts.relayFromArgv = true
 			i++
 		case a == "--app":
 			if i+1 >= len(args) {
@@ -218,6 +221,9 @@ func openKeyStore(opts globalOpts) (*envelope.FileKeyStore, error) {
 func resolveRelayProfile(opts globalOpts, ks envelope.KeyStore, stderr io.Writer) (*envelope.RelayProfile, error) {
 	ref := strings.TrimSpace(opts.relayRef)
 	if ref != "" {
+		if opts.relayFromArgv {
+			warnSecretOnArgv(opts, stderr, ref)
+		}
 		if hasCaseInsensitivePrefix(ref, "synctool://") {
 			return envelope.ParseRelayURI(ref)
 		}
@@ -264,15 +270,65 @@ func openClient(opts globalOpts, ks envelope.KeyStore, overrideProfile *envelope
 	})
 }
 
-func readSecretLine(r io.Reader) (string, error) {
-	sc := bufio.NewScanner(r)
-	if !sc.Scan() {
-		if err := sc.Err(); err != nil {
-			return "", envelope.WrapError(envelope.ErrCodeStorageIO, false, 0, "read stdin", err)
+func readSecretLineFromBufio(br *bufio.Reader) (string, error) {
+	line, err := br.ReadString('\n')
+	if err != nil && len(line) == 0 {
+		if err == io.EOF {
+			return "", envelope.NewError(envelope.ErrCodeBadRequest, false, 0, "empty stdin input", nil)
 		}
+		return "", envelope.WrapError(envelope.ErrCodeStorageIO, false, 0, "read stdin", err)
+	}
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
 		return "", envelope.NewError(envelope.ErrCodeBadRequest, false, 0, "empty stdin input", nil)
 	}
-	return strings.TrimSpace(sc.Text()), nil
+	return trimmed, nil
+}
+
+func readSecretLine(r io.Reader) (string, error) {
+	if br, ok := r.(*bufio.Reader); ok {
+		return readSecretLineFromBufio(br)
+	}
+	return readSecretLineFromBufio(bufio.NewReader(r))
+}
+
+func promptInitiatorSAS(opts globalOpts, br *bufio.Reader, stdout, stderr io.Writer) (string, error) {
+	if opts.jsonMode {
+		emitEvent(opts, stdout, map[string]any{
+			"type":  "event",
+			"event": "awaiting_sas",
+			"role":  "initiator",
+		})
+	} else if !opts.quiet {
+		_, _ = fmt.Fprint(stderr, "Enter 6-digit SAS shown on peer device: ")
+	}
+	line, err := br.ReadString('\n')
+	if err != nil && len(line) == 0 {
+		return "", err
+	}
+	return strings.TrimSpace(line), nil
+}
+
+func confirmResponderSAS(opts globalOpts, br *bufio.Reader, stdout, stderr io.Writer, sas string) error {
+	if opts.jsonMode {
+		emitEvent(opts, stdout, map[string]any{
+			"type":  "event",
+			"event": "awaiting_sas",
+			"sas":   sas,
+			"role":  "responder",
+		})
+	} else if !opts.quiet {
+		_, _ = fmt.Fprintf(stderr, "Confirm SAS %s %s matches initiator device [y/yes or 6-digit SAS]: ", sas[:3], sas[3:])
+	}
+	line, err := br.ReadString('\n')
+	if err != nil && len(line) == 0 {
+		return envelope.NewError(envelope.ErrCodeSASMismatch, false, 0, "SAS confirmation rejected (EOF)", nil)
+	}
+	ans := strings.TrimSpace(line)
+	if strings.EqualFold(ans, "y") || strings.EqualFold(ans, "yes") || synccrypto.VerifySAS(sas, ans) == nil {
+		return nil
+	}
+	return envelope.NewError(envelope.ErrCodeSASMismatch, false, 0, "SAS confirmation rejected", nil)
 }
 
 // --- Subcommands ---
@@ -289,11 +345,12 @@ func cmdInit(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 		return envelope.NewError(envelope.ErrCodeBadRequest, false, 0, err.Error(), nil)
 	}
 
+	br := bufio.NewReader(stdin)
 	rawURI := strings.TrimSpace(*relayURI)
 	switch {
 	case *useStdin || *useRelayStdin:
 		var err error
-		rawURI, err = readSecretLine(stdin)
+		rawURI, err = readSecretLineFromBufio(br)
 		if err != nil {
 			return err
 		}
@@ -311,7 +368,7 @@ func cmdInit(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 			rawURI = envURI
 		} else {
 			var err error
-			rawURI, err = readSecretLine(stdin)
+			rawURI, err = readSecretLineFromBufio(br)
 			if err != nil {
 				return err
 			}
@@ -353,7 +410,7 @@ func cmdInit(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 		return err
 	}
 	if caps.Spool.Enabled {
-		if err := cli.EnsureMailboxRegistered(ctx); err != nil {
+		if err := cli.EnsureMailboxRegistered(ctx); err != nil && !envelope.IsCode(err, envelope.ErrCodeSpoolDisabled) {
 			return err
 		}
 	}
@@ -385,6 +442,11 @@ func cmdPing(ctx context.Context, opts globalOpts, args []string, stdout, stderr
 	if err := fs.Parse(args); err != nil {
 		return envelope.NewError(envelope.ErrCodeBadRequest, false, 0, err.Error(), nil)
 	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "relay" {
+			opts.relayFromArgv = true
+		}
+	})
 	opts.relayRef = *relayFlag
 
 	ks, err := openKeyStore(opts)
@@ -472,7 +534,7 @@ func cmdPair(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 						"pair_uri":     info.PairURI,
 						"expires_at":   info.ExpiresAt,
 					})
-				} else {
+				} else if !opts.quiet {
 					if mode == synccrypto.ModeQROOB {
 						_, _ = fmt.Fprintf(stderr, "Pair URI (scan or paste privately): %s\n", info.PairURI)
 					} else {
@@ -481,12 +543,7 @@ func cmdPair(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 				}
 			},
 			OnSASInput: func() (string, error) {
-				_, _ = fmt.Fprint(stderr, "Enter 6-digit SAS shown on peer device: ")
-				line, err := reader.ReadString('\n')
-				if err != nil && len(line) == 0 {
-					return "", err
-				}
-				return strings.TrimSpace(line), nil
+				return promptInitiatorSAS(opts, reader, stdout, stderr)
 			},
 		})
 		if err != nil {
@@ -503,10 +560,11 @@ func cmdPair(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 		if err := fs.Parse(subArgs); err != nil {
 			return envelope.NewError(envelope.ErrCodeBadRequest, false, 0, err.Error(), nil)
 		}
+		reader := bufio.NewReader(stdin)
 		var pairIn string
 		switch {
 		case *useStdin:
-			pairIn, err = readSecretLine(stdin)
+			pairIn, err = readSecretLineFromBufio(reader)
 			if err != nil {
 				return err
 			}
@@ -536,9 +594,12 @@ func cmdPair(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 				formatted := sas[:3] + " " + sas[3:]
 				if opts.jsonMode {
 					emitEvent(opts, stdout, map[string]any{"type": "event", "event": "sas_ready", "sas": sas})
-				} else {
+				} else if !opts.quiet {
 					_, _ = fmt.Fprintf(stderr, "Verify SAS on initiator device: %s\n", formatted)
 				}
+			},
+			OnSASConfirm: func(sas string) error {
+				return confirmResponderSAS(opts, reader, stdout, stderr, sas)
 			},
 		})
 		if err != nil {
