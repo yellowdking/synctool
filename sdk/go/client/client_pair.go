@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -85,6 +86,7 @@ func (c *Client) runInitiatorHandshake(ctx context.Context, purpose string, opts
 	if err != nil {
 		return nil, envelope.WrapError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, "generate n_a", err)
 	}
+	defer clear(nA)
 	pubA := ephA.PublicKey().Bytes()
 
 	var oob []byte
@@ -128,6 +130,8 @@ func (c *Client) runInitiatorHandshake(ctx context.Context, purpose string, opts
 	if opts.IncludeRelay {
 		offer.Endpoint = c.profile.Endpoint
 		offer.SPKISHA256 = c.profile.SPKISHA256
+		offer.SPKIPin = c.profile.SPKIPin
+		offer.SPKIPins = append([]string(nil), c.profile.SPKIPins...)
 		offer.AccessKey = c.profile.AccessKey
 	}
 	pairURI, err := envelope.FormatPairURI(offer)
@@ -174,9 +178,11 @@ func (c *Client) runInitiatorHandshake(ctx context.Context, purpose string, opts
 	pubB, err1 := base64.RawURLEncoding.DecodeString(m2.EB)
 	nB, err2 := base64.RawURLEncoding.DecodeString(m2.NB)
 	if err1 != nil || err2 != nil || len(pubB) != 32 || len(nB) != synccrypto.HSNonceSize {
+		clear(nB)
 		c.closeRoom(ctx, roomID, created.SenderToken, "verify_failed")
 		return nil, envelope.NewError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, "invalid M2 e_b/n_b", nil)
 	}
+	defer clear(nB)
 
 	var hs *synccrypto.HandshakeResult
 	if mode == synccrypto.ModeQROOB {
@@ -284,12 +290,29 @@ func (c *Client) runInitiatorHandshake(ctx context.Context, purpose string, opts
 	}, nil
 }
 
-func (c *Client) runResponderHandshake(ctx context.Context, joined *roomJoinResp, m1 hsM1Wire, oobSecret []byte, onSASDisplay func(string)) (*activeRoomSession, error) {
+func (c *Client) runResponderHandshake(
+	ctx context.Context,
+	joined *roomJoinResp,
+	m1 hsM1Wire,
+	oobSecret []byte,
+	onSASDisplay func(string),
+	onSASConfirm func(string) error,
+) (*activeRoomSession, error) {
 	roomID := joined.RoomID
 	token := joined.ReceiverToken
 	lastSeq := joined.Seq
 	mode := m1.Mode
 	purpose := m1.Purpose
+
+	if mode != synccrypto.ModeQROOB && mode != synccrypto.ModeCommitSAS {
+		c.closeRoom(ctx, roomID, token, "verify_failed")
+		return nil, envelope.NewError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, fmt.Sprintf("unsupported handshake mode %d", mode), nil)
+	}
+	// ST-P0-1: Mandatory fail-closed OnSASConfirm gate on Responder in Flow 1B (mode=2).
+	if mode == synccrypto.HandshakeModeSAS && onSASConfirm == nil {
+		c.closeRoom(ctx, roomID, token, "verify_failed")
+		return nil, envelope.NewError(envelope.ErrSASMismatch, false, 0, "OnSASConfirm callback is required for SAS mode", nil)
+	}
 
 	ephB, err := synccrypto.GenerateEphemeralX25519()
 	if err != nil {
@@ -301,6 +324,7 @@ func (c *Client) runResponderHandshake(ctx context.Context, joined *roomJoinResp
 		c.closeRoom(ctx, roomID, token, "cancelled")
 		return nil, envelope.WrapError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, "generate n_b", err)
 	}
+	defer clear(nB)
 	pubB := ephB.PublicKey().Bytes()
 
 	var hs *synccrypto.HandshakeResult
@@ -312,9 +336,11 @@ func (c *Client) runResponderHandshake(ctx context.Context, joined *roomJoinResp
 		pubA, err1 := base64.RawURLEncoding.DecodeString(m1.EA)
 		nA, err2 := base64.RawURLEncoding.DecodeString(m1.NA)
 		if err1 != nil || err2 != nil || len(pubA) != 32 || len(nA) != synccrypto.HSNonceSize {
+			clear(nA)
 			c.closeRoom(ctx, roomID, token, "verify_failed")
 			return nil, envelope.NewError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, "invalid M1 e_a/n_a", nil)
 		}
+		defer clear(nA)
 		hs, err = synccrypto.DeriveQROOBSession(purpose, roomID, ephB, pubA, pubA, nA, pubB, nB, oobSecret)
 		if err != nil {
 			c.closeRoom(ctx, roomID, token, "verify_failed")
@@ -397,9 +423,11 @@ func (c *Client) runResponderHandshake(ctx context.Context, joined *roomJoinResp
 		nA, err2 := base64.RawURLEncoding.DecodeString(m3.NA)
 		macA, err3 := base64.RawURLEncoding.DecodeString(m3.MacA)
 		if err1 != nil || err2 != nil || err3 != nil || len(pubA) != 32 || len(nA) != synccrypto.HSNonceSize {
+			clear(nA)
 			c.closeRoom(ctx, roomID, token, "verify_failed")
 			return nil, envelope.NewError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, "invalid M3 fields", nil)
 		}
+		defer clear(nA)
 		hs, err = synccrypto.DeriveSASSession(purpose, roomID, ephB, pubA, commitA, pubA, nA, pubB, nB)
 		if err != nil {
 			c.closeRoom(ctx, roomID, token, "verify_failed")
@@ -414,7 +442,8 @@ func (c *Client) runResponderHandshake(ctx context.Context, joined *roomJoinResp
 			return nil, envelope.NewError(envelope.ErrCodeSASMismatch, false, 0, "M3 mac_a mismatch — room burned", nil)
 		}
 
-		// Send M4 (mac_b) and display 6-digit SAS for initiator entry
+		// Send M4 (mac_b), emit OnSASDisplay immediately so Initiator's OnSASInput never deadlocks,
+		// and enforce mandatory blocking OnSASConfirm BEFORE trusting peer DeviceCard or accepting payloads!
 		m4Bytes, _ := json.Marshal(hsM4Wire{
 			ProtoV: 1,
 			Mode:   mode,
@@ -428,6 +457,14 @@ func (c *Client) runResponderHandshake(ctx context.Context, joined *roomJoinResp
 		lastSeq = seq
 		if onSASDisplay != nil {
 			onSASDisplay(hs.SASStr)
+		}
+		if err := onSASConfirm(hs.SASStr); err != nil {
+			hs.Zero()
+			c.closeRoom(ctx, roomID, token, "verify_failed")
+			if envelope.IsCode(err, envelope.ErrCodeSASMismatch) {
+				return nil, err
+			}
+			return nil, envelope.WrapError(envelope.ErrCodeSASMismatch, false, 0, "SAS confirmation rejected", err)
 		}
 	}
 
@@ -446,6 +483,7 @@ func (c *Client) buildLocalPairBind(ctx context.Context, label string) (envelope
 	if label == "" {
 		label = c.deviceLabel
 	}
+	// ST-P1-6: Always use local wall clock for Ed25519-signed DeviceCard.IssuedAt.
 	issuedAt := time.Now().Unix()
 	cardSig, err := synccrypto.SignDeviceCard(c.deviceKeys.SignPriv, c.deviceKeys.KEMPubBytes[:], issuedAt)
 	if err != nil {
@@ -463,31 +501,66 @@ func (c *Client) buildLocalPairBind(ctx context.Context, label string) (envelope
 		},
 	}
 
-	caps, err := c.Capabilities(ctx)
+	caps, err := c.capabilitiesInternal(ctx)
 	if err != nil {
 		return envelope.PairBindPayload{}, "", "", err
 	}
 	var inboundTokenID, inboundTokenHash string
 	if caps.Spool.Enabled {
-		if err := c.EnsureMailboxRegistered(ctx); err != nil {
-			return envelope.PairBindPayload{}, "", "", err
-		}
-		tokID, tokHash, rawTok, err := c.registerPeerDepositToken(ctx)
-		if err != nil {
-			return envelope.PairBindPayload{}, "", "", err
-		}
-		inboundTokenID = tokID
-		inboundTokenHash = tokHash
-		payload.Mailbox = &envelope.MailboxBindPayload{
-			RelayOrigin:  c.profile.Endpoint,
-			MailboxID:    c.mailboxKeys.MailboxID,
-			DepositToken: rawTok,
+		if err := c.syncMailboxInternal(ctx); err != nil {
+			if !envelope.IsCode(err, envelope.ErrCodeSpoolDisabled) {
+				return envelope.PairBindPayload{}, "", "", err
+			}
+		} else {
+			tokID, tokHash, rawTok, regErr := c.registerPeerDepositToken(ctx)
+			if regErr != nil {
+				// ST-P1-8: Gracefully treat 403 ERR_SPOOL_DISABLED as non-fatal so --spool=off relays pair cleanly.
+				if !envelope.IsCode(regErr, envelope.ErrCodeSpoolDisabled) {
+					return envelope.PairBindPayload{}, "", "", regErr
+				}
+			} else {
+				inboundTokenID = tokID
+				inboundTokenHash = tokHash
+				payload.Mailbox = &envelope.MailboxBindPayload{
+					RelayOrigin:  c.profile.Endpoint,
+					MailboxID:    c.mailboxKeys.MailboxID,
+					DepositToken: rawTok,
+				}
+			}
 		}
 	}
 	return payload, inboundTokenID, inboundTokenHash, nil
 }
 
-func (c *Client) verifyAndSavePeerBind(peerBind envelope.PairBindPayload, inboundTokenID, inboundTokenHash string) (*envelope.DeviceCard, error) {
+func (c *Client) deleteRelayDepositToken(ctx context.Context, tokenID string) error {
+	if tokenID == "" {
+		return nil
+	}
+	path := "/v1/mailboxes/" + c.mailboxKeys.MailboxID + "/deposit-tokens/" + tokenID
+	_, err := c.doControl(ctx, http.MethodDelete, path, nil, reqOptions{
+		MailboxID:     c.mailboxKeys.MailboxID,
+		MailboxAuthSK: c.mailboxKeys.AuthPriv,
+	})
+	if err != nil && !envelope.IsCode(err, envelope.ErrCodeNotFound) && !envelope.IsCode(err, envelope.ErrCodeSpoolDisabled) {
+		return err
+	}
+	return nil
+}
+
+func (c *Client) rollbackDepositTokenBestEffort(ctx context.Context, tokenID string) {
+	if tokenID == "" {
+		return
+	}
+	delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := c.deleteRelayDepositToken(delCtx, tokenID); err != nil {
+		if pks, ok := c.keyStore.(pendingTokenDeletesKeyStore); ok {
+			_ = pks.AddPendingTokenDelete(tokenID)
+		}
+	}
+}
+
+func (c *Client) verifyAndSavePeerBind(ctx context.Context, peerBind envelope.PairBindPayload, inboundTokenID, inboundTokenHash string) (*envelope.DeviceCard, error) {
 	signPK, err1 := base64.RawURLEncoding.DecodeString(peerBind.DeviceCard.SignPK)
 	kemPK, err2 := base64.RawURLEncoding.DecodeString(peerBind.DeviceCard.KEMPK)
 	cardSig, err3 := base64.RawURLEncoding.DecodeString(peerBind.DeviceCard.CardSig)
@@ -497,19 +570,25 @@ func (c *Client) verifyAndSavePeerBind(peerBind envelope.PairBindPayload, inboun
 	if err := synccrypto.VerifyDeviceCard(peerBind.DeviceCard.DeviceID, signPK, kemPK, peerBind.DeviceCard.IssuedAt, cardSig); err != nil {
 		return nil, envelope.WrapError(envelope.ErrCodeCryptoSignatureInvalid, false, 0, "peer device card signature invalid", err)
 	}
+
+	devID := strings.ToLower(peerBind.DeviceCard.DeviceID)
+	prev, _ := c.keyStore.GetDevice(devID)
+
 	card := envelope.DeviceCard{
-		DeviceID:         strings.ToLower(peerBind.DeviceCard.DeviceID),
-		Label:            peerBind.DeviceCard.Label,
-		Platform:         peerBind.DeviceCard.Platform,
-		SignPK:           peerBind.DeviceCard.SignPK,
-		KEMPK:            peerBind.DeviceCard.KEMPK,
-		IssuedAt:         peerBind.DeviceCard.IssuedAt,
-		CardSig:          peerBind.DeviceCard.CardSig,
-		RelayOrigin:      c.profile.Endpoint,
-		RelayID:          c.profile.RelayID,
-		InboundTokenID:   inboundTokenID,
-		InboundTokenHash: inboundTokenHash,
-		PairedAt:         time.Now().Unix(),
+		DeviceID:           devID,
+		Label:              peerBind.DeviceCard.Label,
+		Platform:           peerBind.DeviceCard.Platform,
+		SignPK:             peerBind.DeviceCard.SignPK,
+		KEMPK:              peerBind.DeviceCard.KEMPK,
+		IssuedAt:           peerBind.DeviceCard.IssuedAt,
+		CardSig:            peerBind.DeviceCard.CardSig,
+		RelayOrigin:        c.profile.Endpoint,
+		RelayID:            c.profile.RelayID,
+		InboundTokenID:     inboundTokenID,
+		InboundTokenHash:   inboundTokenHash,
+		PendingTokenDelete: false,
+		PairedAt:           time.Now().Unix(),
+		Revoked:            false,
 	}
 	if peerBind.Mailbox != nil {
 		card.RelayOrigin = peerBind.Mailbox.RelayOrigin
@@ -523,11 +602,33 @@ func (c *Client) verifyAndSavePeerBind(peerBind envelope.PairBindPayload, inboun
 	if err := c.keyStore.PutDevice(card); err != nil {
 		return nil, err
 	}
+
+	// ST-P1-8: Delete superseded relay deposit_token when re-pairing an existing device_id.
+	if prev != nil && prev.InboundTokenID != "" && prev.InboundTokenID != inboundTokenID {
+		if delErr := c.deleteRelayDepositToken(ctx, prev.InboundTokenID); delErr != nil {
+			if pks, ok := c.keyStore.(pendingTokenDeletesKeyStore); ok {
+				_ = pks.AddPendingTokenDelete(prev.InboundTokenID)
+			}
+		} else if pks, ok := c.keyStore.(pendingTokenDeletesKeyStore); ok {
+			_ = pks.RemovePendingTokenDelete(prev.InboundTokenID)
+		}
+	}
 	return &card, nil
+}
+
+// InitiateDeviceBind is an alias for StartDeviceBind.
+func (c *Client) InitiateDeviceBind(ctx context.Context, opts PairOptions) (*envelope.DeviceCard, error) {
+	return c.StartDeviceBind(ctx, opts)
 }
 
 // StartDeviceBind initiates a Flow 1 bidirectional DeviceCard pairing (compatible with --spool=off).
 func (c *Client) StartDeviceBind(ctx context.Context, opts PairOptions) (*envelope.DeviceCard, error) {
+	done, err := c.beginOp()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+
 	sess, err := c.runInitiatorHandshake(ctx, synccrypto.PurposePair, opts)
 	if err != nil {
 		return nil, err
@@ -539,8 +640,16 @@ func (c *Client) StartDeviceBind(ctx context.Context, opts PairOptions) (*envelo
 		c.closeRoom(ctx, sess.RoomID, sess.Token, "cancelled")
 		return nil, err
 	}
+	savedOk := false
+	defer func() {
+		if !savedOk && inboundTokenID != "" {
+			c.rollbackDepositTokenBestEffort(ctx, inboundTokenID)
+		}
+	}()
+
 	myJSON, _ := json.Marshal(myBind)
 	ctA, err := synccrypto.SealPairBind(sess.HS.SessionKey, sess.HS.PRK[:], sess.HS.TH[:], true, myJSON)
+	clear(myJSON)
 	if err != nil {
 		c.closeRoom(ctx, sess.RoomID, sess.Token, "cancelled")
 		return nil, envelope.WrapError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, "seal pair_bind A", err)
@@ -582,24 +691,35 @@ func (c *Client) StartDeviceBind(ctx context.Context, opts PairOptions) (*envelo
 	}
 	var peerBind envelope.PairBindPayload
 	if err := json.Unmarshal(ptB, &peerBind); err != nil {
+		clear(ptB)
 		c.closeRoom(ctx, sess.RoomID, sess.Token, "verify_failed")
 		return nil, envelope.WrapError(envelope.ErrCodeCryptoDecryptFailed, false, 0, "parse peer pair_bind", err)
 	}
-	card, err := c.verifyAndSavePeerBind(peerBind, inboundTokenID, inboundTokenHash)
+	clear(ptB)
+	card, err := c.verifyAndSavePeerBind(ctx, peerBind, inboundTokenID, inboundTokenHash)
 	if err != nil {
 		c.closeRoom(ctx, sess.RoomID, sess.Token, "verify_failed")
 		return nil, err
 	}
+	savedOk = true
 	c.closeRoom(ctx, sess.RoomID, sess.Token, "completed")
 	return card, nil
 }
 
 // AcceptDeviceBind accepts a Flow 1 pairing offer (synctool://pair URI or 8-char room code).
 func (c *Client) AcceptDeviceBind(ctx context.Context, pairInput string, opts PairOptions) (*envelope.DeviceCard, error) {
+	done, err := c.beginOp()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+
 	roomID, oob, err := parseRoomInput(pairInput)
 	if err != nil {
 		return nil, err
 	}
+	defer clear(oob)
+
 	joined, m1, err := c.joinAndReadM1(ctx, roomID)
 	if err != nil {
 		return nil, err
@@ -608,7 +728,7 @@ func (c *Client) AcceptDeviceBind(ctx context.Context, pairInput string, opts Pa
 		c.closeRoom(ctx, roomID, joined.ReceiverToken, "verify_failed")
 		return nil, envelope.NewError(envelope.ErrCodeInvalidState, false, 0, "room purpose is not pair", nil)
 	}
-	sess, err := c.runResponderHandshake(ctx, joined, m1, oob, opts.OnSASDisplay)
+	sess, err := c.runResponderHandshake(ctx, joined, m1, oob, opts.OnSASDisplay, opts.OnSASConfirm)
 	if err != nil {
 		return nil, err
 	}
@@ -642,23 +762,34 @@ func (c *Client) AcceptDeviceBind(ctx context.Context, pairInput string, opts Pa
 	}
 	var peerBind envelope.PairBindPayload
 	if err := json.Unmarshal(ptA, &peerBind); err != nil {
+		clear(ptA)
 		c.closeRoom(ctx, sess.RoomID, sess.Token, "verify_failed")
 		return nil, envelope.WrapError(envelope.ErrCodeCryptoDecryptFailed, false, 0, "parse peer pair_bind", err)
 	}
+	clear(ptA)
 
 	myBind, inboundTokenID, inboundTokenHash, err := c.buildLocalPairBind(ctx, opts.Label)
 	if err != nil {
 		c.closeRoom(ctx, sess.RoomID, sess.Token, "cancelled")
 		return nil, err
 	}
-	card, err := c.verifyAndSavePeerBind(peerBind, inboundTokenID, inboundTokenHash)
+	savedOk := false
+	defer func() {
+		if !savedOk && inboundTokenID != "" {
+			c.rollbackDepositTokenBestEffort(ctx, inboundTokenID)
+		}
+	}()
+
+	card, err := c.verifyAndSavePeerBind(ctx, peerBind, inboundTokenID, inboundTokenHash)
 	if err != nil {
 		c.closeRoom(ctx, sess.RoomID, sess.Token, "verify_failed")
 		return nil, err
 	}
 	myJSON, _ := json.Marshal(myBind)
 	ctB, err := synccrypto.SealPairBind(sess.HS.SessionKey, sess.HS.PRK[:], sess.HS.TH[:], false, myJSON)
+	clear(myJSON)
 	if err != nil {
+		c.closeRoom(ctx, sess.RoomID, sess.Token, "cancelled")
 		return nil, envelope.WrapError(envelope.ErrCodeCryptoHandshakeFailed, false, 0, "seal pair_bind B", err)
 	}
 	frameB, _ := json.Marshal(pairBindWire{
@@ -669,5 +800,6 @@ func (c *Client) AcceptDeviceBind(ctx context.Context, pairInput string, opts Pa
 	if _, err := c.postRoomMessage(ctx, sess.RoomID, sess.Token, "handshake", frameB); err != nil {
 		return nil, err
 	}
+	savedOk = true
 	return card, nil
 }
