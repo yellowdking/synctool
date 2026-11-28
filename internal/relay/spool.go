@@ -103,6 +103,7 @@ type spoolItem struct {
 	expiresAt          time.Time
 	parts              map[int]SpoolPartSpec
 	partOrder          []SpoolPartSpec
+	inFlight           map[chunkKey]int64
 	receivedSizes      map[chunkKey]int64
 	memChunks          map[chunkKey][]byte
 	downloads          map[chunkKey]int
@@ -125,6 +126,7 @@ type SpoolStore struct {
 	maxMailboxBytes        int64
 	maxItemBytes           int64
 	maxItemsPerMailbox     int
+	maxMailboxes           int
 	defaultTTLSec          int64
 	maxTTLSec              int64
 	maxTransportChunkBytes int64
@@ -146,6 +148,7 @@ func NewSpoolStore(cfg ResolvedConfig, bw *BandwidthLimiter, onActivity func()) 
 		maxMailboxBytes:        cfg.Preset.SpoolMaxMailboxBytes,
 		maxItemBytes:           cfg.Preset.SpoolMaxItemBytes,
 		maxItemsPerMailbox:     cfg.Preset.SpoolMaxItemsPerMailbox,
+		maxMailboxes:           cfg.Preset.MaxMailboxes,
 		defaultTTLSec:          cfg.Preset.SpoolDefaultTTLSec,
 		maxTTLSec:              cfg.Preset.SpoolMaxTTLSec,
 		maxTransportChunkBytes: cfg.Preset.MaxTransportChunkBytes,
@@ -197,6 +200,17 @@ func (s *SpoolStore) chunkFilePath(mailboxID, itemID string, partID int, txIdx u
 	return filepath.Join(s.itemDir(mailboxID, itemID), fmt.Sprintf("p%d_c%d.enc", partID, txIdx))
 }
 
+func readRegularMetaFile(path string, maxBytes int64) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxBytes {
+		return nil, fmt.Errorf("non-regular or oversized metadata file: %s", path)
+	}
+	return os.ReadFile(path)
+}
+
 func (s *SpoolStore) loadFromDisk(now time.Time) error {
 	prefixEntries, err := os.ReadDir(s.rootDir)
 	if err != nil {
@@ -209,7 +223,7 @@ func (s *SpoolStore) loadFromDisk(now time.Time) error {
 	for _, pe := range prefixEntries {
 		pName := pe.Name()
 		fullPrefix := filepath.Join(s.rootDir, pName)
-		if !pe.IsDir() || !isLowerHexLen(pName, 2) {
+		if !pe.IsDir() || pe.Type()&os.ModeSymlink != 0 || !isLowerHexLen(pName, 2) {
 			if strings.HasSuffix(pName, ".tmp") {
 				_ = os.Remove(fullPrefix)
 			}
@@ -222,13 +236,13 @@ func (s *SpoolStore) loadFromDisk(now time.Time) error {
 		for _, me := range mbEntries {
 			mbID := me.Name()
 			mbPath := filepath.Join(fullPrefix, mbID)
-			if !me.IsDir() || !isLowerHexLen(mbID, 32) || mbID[:2] != pName {
+			if !me.IsDir() || me.Type()&os.ModeSymlink != 0 || !isLowerHexLen(mbID, 32) || mbID[:2] != pName {
 				if strings.HasSuffix(mbID, ".tmp") {
 					_ = os.Remove(mbPath)
 				}
 				continue
 			}
-			metaBytes, err := os.ReadFile(filepath.Join(mbPath, "mailbox.json"))
+			metaBytes, err := readRegularMetaFile(filepath.Join(mbPath, "mailbox.json"), 64<<10)
 			if err != nil {
 				_ = os.RemoveAll(mbPath)
 				continue
@@ -268,11 +282,11 @@ func (s *SpoolStore) loadFromDisk(now time.Time) error {
 				if ieName == "mailbox.json" {
 					continue
 				}
-				if !ie.IsDir() || !isValidItemID(ieName) {
+				if !ie.IsDir() || ie.Type()&os.ModeSymlink != 0 || !isValidItemID(ieName) {
 					_ = os.RemoveAll(itemPath)
 					continue
 				}
-				imBytes, err := os.ReadFile(filepath.Join(itemPath, "item.json"))
+				imBytes, err := readRegularMetaFile(filepath.Join(itemPath, "item.json"), 128<<10)
 				if err != nil {
 					_ = os.RemoveAll(itemPath)
 					continue
@@ -347,8 +361,8 @@ func (s *SpoolStore) loadFromDisk(now time.Time) error {
 						if len(parts) == 2 {
 							pid, e1 := strconv.Atoi(parts[0])
 							cid, e2 := strconv.ParseUint(parts[1], 10, 32)
-							if e1 == nil && e2 == nil {
-								if info, serr := f.Info(); serr == nil && info.Size() > 0 {
+							if e1 == nil && e2 == nil && f.Type()&os.ModeSymlink == 0 {
+								if info, serr := f.Info(); serr == nil && info.Mode().IsRegular() && info.Size() > 0 {
 									it.receivedSizes[chunkKey{partID: pid, txIdx: uint32(cid)}] = info.Size()
 									continue
 								}
@@ -513,6 +527,17 @@ func (s *SpoolStore) RegisterMailboxWithTokens(mailboxID string, authPK ed25519.
 			}
 		}
 		return len(existing.depositTokens), nil
+	}
+
+	if s.maxMailboxes > 0 && len(s.mailboxes) >= s.maxMailboxes {
+		return 0, &apiError{
+			Status:      507,
+			Code:        "ERR_OFFLINE_QUOTA_EXCEEDED",
+			Message:     "relay maximum mailbox capacity reached",
+			Retryable:   false,
+			Scope:       "mailbox_count",
+			SuggestMode: "pipe",
+		}
 	}
 
 	pkCopy := make(ed25519.PublicKey, ed25519.PublicKeySize)
