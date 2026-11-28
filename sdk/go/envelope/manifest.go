@@ -207,43 +207,69 @@ type ReceivedBlob struct {
 }
 
 // SaveToDir safely moves/copies the verified attachment into outDir with mode 0600,
-// refusing symlinks and never overwriting existing files (auto-suffixing _1, _2 on collision).
+// refusing symlinks and never overwriting existing files (auto-suffixing _1, _2 on collision),
+// and calling fsync (out.Sync) before removing the staging file or returning.
 func (b ReceivedBlob) SaveToDir(outDir string) (string, error) {
 	if outDir == "" {
 		return "", NewError(ErrCodeStorageIO, false, 0, "empty output directory", nil)
 	}
-	if fi, err := os.Lstat(outDir); err == nil {
+	cleanOut := filepath.Clean(outDir)
+	if fi, err := os.Lstat(cleanOut); err == nil {
 		if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
 			return "", NewError(ErrCodeStorageIO, false, 0, "output directory must be a real directory, not a symlink or file", nil)
 		}
 	} else if !os.IsNotExist(err) {
 		return "", WrapError(ErrCodeStorageIO, false, 0, "lstat output directory", err)
-	} else if err := os.MkdirAll(outDir, 0o700); err != nil {
+	} else if err := os.MkdirAll(cleanOut, 0o700); err != nil {
 		return "", WrapError(ErrCodeStorageIO, false, 0, "create output directory", err)
 	}
-
-	baseName := b.SafeName
-	if baseName == "" {
-		baseName = b.Descriptor.Name
+	absOut, err := filepath.Abs(cleanOut)
+	if err != nil {
+		return "", WrapError(ErrCodeStorageIO, false, 0, "resolve output directory", err)
 	}
-	safeName := SanitizeFilename(baseName)
-	ext := filepath.Ext(safeName)
-	stem := strings.TrimSuffix(safeName, ext)
 
+	srcInfo, err := os.Lstat(b.SafePath)
+	if err != nil || !srcInfo.Mode().IsRegular() {
+		return "", WrapError(ErrCodeStorageIO, false, 0, "verified staging blob missing or irregular", err)
+	}
 	in, err := os.Open(b.SafePath)
 	if err != nil {
 		return "", WrapError(ErrCodeStorageIO, false, 0, "open verified blob", err)
 	}
 	defer in.Close()
 
+	baseName := b.SafeName
+	if baseName == "" {
+		baseName = b.Descriptor.Name
+	}
+	safeName := SanitizeFilename(baseName)
+	stem := safeName
+	ext := ""
+	if dot := strings.LastIndexByte(safeName, '.'); dot > 0 && len(safeName)-dot <= 16 {
+		stem = safeName[:dot]
+		ext = safeName[dot:]
+	}
+
 	var dst string
 	var out *os.File
 	for i := 0; i < 10000; i++ {
 		candName := safeName
 		if i > 0 {
-			candName = fmt.Sprintf("%s_%d%s", stem, i, ext)
+			candName = truncateUTF8Safe(fmt.Sprintf("%s_%d%s", stem, i, ext), maxSafeFilenameBytes)
 		}
-		cand := filepath.Join(outDir, candName)
+		cand := filepath.Join(cleanOut, candName)
+		absCand, absErr := filepath.Abs(cand)
+		if absErr != nil {
+			return "", WrapError(ErrCodeStorageIO, false, 0, "resolve destination file path", absErr)
+		}
+		rel, relErr := filepath.Rel(absOut, absCand)
+		if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.Dir(rel) != "." {
+			return "", NewError(ErrCodeStorageIO, false, 0, "refusing path escape outside output directory", nil)
+		}
+		if _, lerr := os.Lstat(cand); lerr == nil {
+			// Skip existing files, directories, and dangling symlinks cleanly.
+			continue
+		}
 		f, openErr := os.OpenFile(cand, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if openErr == nil {
 			dst = cand
@@ -370,8 +396,9 @@ type RelayCertExpiringEvent struct {
 	Severity      string `json:"severity"` // "warning" | "urgent"
 }
 
-// Validate checks every schema invariant on Manifest per ENVELOPE_AND_SDK.md §2.2.
-func (m *Manifest) Validate() error {
+const maxSafeFilenameBytes = 200
+
+func (m *Manifest) validateFields() error {
 	if m == nil {
 		return NewError(ErrCodeManifestInvalid, false, 0, "manifest is nil", nil)
 	}
@@ -444,7 +471,9 @@ func (m *Manifest) Validate() error {
 			return NewError(ErrCodeManifestInvalid, false, 0, fmt.Sprintf("blobs[%d].sha256 must be 64 lowercase hex", i), nil)
 		}
 		rawKey, err := base64.RawURLEncoding.DecodeString(blob.Key)
-		if err != nil || len(rawKey) != 32 {
+		keyLen := len(rawKey)
+		clear(rawKey)
+		if err != nil || keyLen != 32 {
 			return NewError(ErrCodeManifestInvalid, false, 0, fmt.Sprintf("blobs[%d].key must be 43-char b64u (32B)", i), nil)
 		}
 		if blob.Encoding != "" && blob.Encoding != "identity" && blob.Encoding != "gzip" && blob.Encoding != "zstd" {
@@ -457,6 +486,14 @@ func (m *Manifest) Validate() error {
 			}
 		}
 	}
+	return nil
+}
+
+// Validate checks every schema invariant on Manifest per ENVELOPE_AND_SDK.md §2.2.
+func (m *Manifest) Validate() error {
+	if err := m.validateFields(); err != nil {
+		return err
+	}
 	raw, err := json.Marshal(m)
 	if err != nil {
 		return WrapError(ErrCodeManifestInvalid, false, 0, "marshal manifest", err)
@@ -467,12 +504,12 @@ func (m *Manifest) Validate() error {
 	return nil
 }
 
-// MarshalManifest validates and encodes Manifest to UTF-8 JSON bytes.
+// MarshalManifest validates and encodes Manifest to UTF-8 JSON bytes in a single json.Marshal pass.
 func MarshalManifest(m *Manifest) ([]byte, error) {
 	if m != nil && m.Blobs == nil {
 		m.Blobs = []BlobDescriptor{}
 	}
-	if err := m.Validate(); err != nil {
+	if err := m.validateFields(); err != nil {
 		return nil, err
 	}
 	raw, err := json.Marshal(m)
@@ -480,7 +517,7 @@ func MarshalManifest(m *Manifest) ([]byte, error) {
 		return nil, WrapError(ErrCodeManifestInvalid, false, 0, "marshal manifest", err)
 	}
 	if len(raw) == 0 || len(raw) > MaxManifestBytes {
-		return nil, NewError(ErrCodeManifestInvalid, false, 0, "manifest size out of bounds", nil)
+		return nil, NewError(ErrCodeManifestInvalid, false, 0, fmt.Sprintf("manifest exceeds %d bytes", MaxManifestBytes), nil)
 	}
 	return raw, nil
 }
@@ -494,7 +531,7 @@ func ParseManifest(raw []byte) (*Manifest, error) {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, WrapError(ErrCodeManifestInvalid, false, 0, "parse manifest json", err)
 	}
-	if err := m.Validate(); err != nil {
+	if err := m.validateFields(); err != nil {
 		return nil, err
 	}
 	return &m, nil
@@ -510,7 +547,7 @@ func isBidiOrControlRune(r rune) bool {
 
 func isWindowsReservedDeviceStem(stem string) bool {
 	switch strings.ToUpper(strings.TrimSpace(stem)) {
-	case "CON", "PRN", "AUX", "NUL",
+	case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
 		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "COM\u00B9", "COM\u00B2", "COM\u00B3",
 		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "LPT\u00B9", "LPT\u00B2", "LPT\u00B3":
 		return true
@@ -523,24 +560,32 @@ func truncateUTF8Safe(s string, maxBytes int) string {
 	if len(s) <= maxBytes {
 		return s
 	}
-	ext := filepath.Ext(s)
-	if len(ext) > 16 || len(ext) >= maxBytes {
-		ext = ""
+	ext := ""
+	stem := s
+	if dot := strings.LastIndexByte(s, '.'); dot > 0 && len(s)-dot <= 16 {
+		ext = s[dot:]
+		stem = s[:dot]
 	}
-	stem := strings.TrimSuffix(s, ext)
 	budget := maxBytes - len(ext)
+	if budget <= 0 {
+		budget = maxBytes
+		ext = ""
+		stem = s
+	}
 	var b strings.Builder
-	for _, r := range stem {
-		rl := utf8.RuneLen(r)
-		if rl < 0 {
+	for len(stem) > 0 {
+		r, sz := utf8.DecodeRuneInString(stem)
+		if r == utf8.RuneError && sz == 1 {
+			stem = stem[1:]
 			continue
 		}
-		if b.Len()+rl > budget {
+		if b.Len()+sz > budget {
 			break
 		}
 		b.WriteRune(r)
+		stem = stem[sz:]
 	}
-	trimmedStem := strings.TrimRightFunc(b.String(), func(r rune) bool {
+	trimmedStem := strings.TrimFunc(b.String(), func(r rune) bool {
 		return r == '.' || unicode.IsSpace(r)
 	})
 	if trimmedStem == "" {
@@ -550,36 +595,41 @@ func truncateUTF8Safe(s string, maxBytes int) string {
 }
 
 // SanitizeFilename strips directory separators, traversal segments, NUL/control/Bidi runes,
-// leading/trailing dots & spaces, UTF-8 byte-split hazards, and Windows reserved device names.
+// leading/trailing dots & spaces, UTF-8 byte-split hazards, and Windows reserved device names (including CONIN$/CONOUT$).
 func SanitizeFilename(name string) string {
-	name = strings.ReplaceAll(name, "\\", "/")
-	if idx := strings.LastIndexByte(name, '/'); idx >= 0 {
-		name = name[idx+1:]
+	normalized := strings.ReplaceAll(name, "\\", "/")
+	if idx := strings.LastIndexByte(normalized, '/'); idx >= 0 {
+		normalized = normalized[idx+1:]
 	}
 	var b strings.Builder
-	for _, r := range name {
-		if r == utf8.RuneError {
-			continue
-		}
-		if (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069) || r == 0x200E || r == 0x200F || r == 0x061C {
-			continue
-		}
-		if isBidiOrControlRune(r) || r == '/' || r == '\\' || r == ':' || r == '*' || r == '?' || r == '"' || r == '<' || r == '>' || r == '|' {
+	for len(normalized) > 0 {
+		r, sz := utf8.DecodeRuneInString(normalized)
+		normalized = normalized[sz:]
+		if r == utf8.RuneError && sz == 1 {
 			b.WriteByte('_')
 			continue
 		}
-		b.WriteRune(r)
+		if isBidiOrControlRune(r) {
+			continue
+		}
+		switch r {
+		case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
+			b.WriteByte('_')
+		default:
+			b.WriteRune(r)
+		}
 	}
-	out := strings.TrimFunc(b.String(), func(r rune) bool {
-		return r == '.' || unicode.IsSpace(r)
-	})
+	trimDotsSpaces := func(s string) string {
+		return strings.TrimFunc(s, func(r rune) bool {
+			return r == '.' || unicode.IsSpace(r)
+		})
+	}
+	out := trimDotsSpaces(b.String())
 	if out == "" || strings.Trim(out, "._") == "" {
 		return "blob.bin"
 	}
-	out = truncateUTF8Safe(out, 199)
-	out = strings.TrimFunc(out, func(r rune) bool {
-		return r == '.' || unicode.IsSpace(r)
-	})
+	out = truncateUTF8Safe(out, maxSafeFilenameBytes)
+	out = trimDotsSpaces(out)
 	if out == "" || out == "." || out == ".." {
 		return "blob.bin"
 	}
@@ -589,6 +639,7 @@ func SanitizeFilename(name string) string {
 	}
 	if isWindowsReservedDeviceStem(stem) {
 		out = "_" + out
+		out = truncateUTF8Safe(out, maxSafeFilenameBytes)
 	}
 	return out
 }
