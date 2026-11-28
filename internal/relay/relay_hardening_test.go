@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -570,5 +572,379 @@ func TestParseProcSelfCgroupPaths(t *testing.T) {
 	v2, v1 = ParseProcSelfCgroupPaths("11:pids:/user.slice\n4:cpu,memory:/docker/abcdef123\n0::/\n")
 	if v2 != "" || v1 != "/docker/abcdef123" {
 		t.Fatalf("unexpected cgroup v1 parse: v2=%q v1=%q", v2, v1)
+	}
+
+	// Verify cgroup v2 ancestor walk finds tightest memory.max when leaf slice is "max".
+	cgRoot := t.TempDir()
+	leafDir := filepath.Join(cgRoot, "system.slice", "docker-xyz.scope", "init.scope")
+	if err := os.MkdirAll(leafDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(cgRoot, "memory.max"), []byte("max\n"), 0o600)
+	_ = os.WriteFile(filepath.Join(cgRoot, "system.slice", "memory.max"), []byte("536870912\n"), 0o600)                      // 512 MiB
+	_ = os.WriteFile(filepath.Join(cgRoot, "system.slice", "docker-xyz.scope", "memory.max"), []byte("268435456\n"), 0o600) // 256 MiB tightest!
+	_ = os.WriteFile(filepath.Join(leafDir, "memory.max"), []byte("max\n"), 0o600)
+
+	gotCg := WalkCgroupV2TightestMax(cgRoot, "/system.slice/docker-xyz.scope/init.scope", os.ReadFile)
+	if gotCg != 256<<20 {
+		t.Fatalf("expected ancestor walk tightest memory.max = 256MiB, got %d", gotCg)
+	}
+	if eff := EffectiveMemoryBytes(2048<<20, gotCg); eff != 256<<20 {
+		t.Fatalf("expected min(2048MiB, 256MiB) = 256MiB, got %d", eff)
+	}
+	if eff := EffectiveMemoryBytes(192<<20, 512<<20); eff != 192<<20 {
+		t.Fatalf("expected min(192MiB, 512MiB) = 192MiB, got %d", eff)
+	}
+
+	autoCfg := Config{
+		ListenAddr:          "127.0.0.1:0",
+		Profile:             ProfileAuto,
+		Spool:               SpoolMemory,
+		TLSMode:             TLSOff,
+		DataDir:             t.TempDir(),
+		DetectMemLimitsFunc: func() (uint64, uint64) { return 2048 << 20, gotCg },
+	}
+	rc, err := autoCfg.Resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rc.Preset.Name != ProfileStandard {
+		t.Fatalf("expected 256MiB cgroup container on 2GiB host to resolve auto->standard, got %s", rc.Preset.Name)
+	}
+	if rc.Preset.GoMemLimitBytes < 144<<20 || rc.Preset.GoMemLimitBytes > 156<<20 {
+		t.Fatalf("expected safe GOMEMLIMIT in [144MiB, 156MiB], got %d", rc.Preset.GoMemLimitBytes)
+	}
+}
+
+func TestCORSAllowlistPreflightZeroStrikesAndStealthDefault(t *testing.T) {
+	// 1. Default empty CORSOrigins: zero CORS headers, OPTIONS triggers Stealth 404 + strikes.
+	_, _, cliStealth, _ := newTestServerAndClient(t, nil)
+	optReq, _ := http.NewRequest(http.MethodOptions, cliStealth.baseURL+"/v1/ping", nil)
+	optReq.Header.Set("Origin", "https://app.example.com")
+	optReq.Header.Set("Access-Control-Request-Method", "GET")
+	optResp, err := cliStealth.http.Do(optReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = optResp.Body.Close()
+	if optResp.StatusCode != 404 || optResp.Header.Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("expected stealth 404 with zero CORS headers when --cors-origins is unset, got %d hdr=%v", optResp.StatusCode, optResp.Header)
+	}
+
+	// 2. Explicit allowlist: 20 preflights (> StrikeBanThreshold=10) return 204 No Content with zero strikes!
+	srvCORS, _, cliCORS, _ := newTestServerAndClient(t, func(c *Config) {
+		c.CORSOrigins = []string{"https://app.example.com", "http://localhost:5173"}
+	})
+	for i := 0; i < StrikeBanThreshold+10; i++ {
+		req, _ := http.NewRequest(http.MethodOptions, cliCORS.baseURL+"/v1/mailboxes/0123456789abcdef0123456789abcdef/items", nil)
+		req.Header.Set("Origin", "https://app.example.com")
+		req.Header.Set("Access-Control-Request-Method", "GET")
+		req.Header.Set("Access-Control-Request-Headers", "X-Sync-TS, X-Sync-Nonce, X-Sync-Sig, X-Sync-Mailbox-Sig")
+		resp, err := cliCORS.http.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("preflight #%d expected 204, got %d", i+1, resp.StatusCode)
+		}
+		if resp.Header.Get("Access-Control-Allow-Origin") != "https://app.example.com" ||
+			resp.Header.Get("Vary") != "Origin" ||
+			resp.Header.Get("Access-Control-Max-Age") != "86400" ||
+			!strings.Contains(resp.Header.Get("Access-Control-Expose-Headers"), "Retry-After") ||
+			!strings.Contains(resp.Header.Get("Access-Control-Allow-Headers"), "X-Sync-Sig") ||
+			!strings.Contains(resp.Header.Get("Access-Control-Allow-Headers"), "X-Sync-Mailbox-Sig") ||
+			!strings.Contains(resp.Header.Get("Access-Control-Allow-Headers"), "Last-Event-ID") {
+			t.Fatalf("unexpected CORS preflight headers: %v", resp.Header)
+		}
+	}
+	if srvCORS.Guard().IsBanned(netip.MustParseAddr("127.0.0.1"), cliCORS.clock.Now()) {
+		t.Fatal("CORS preflights recorded strikes and banned the client IP!")
+	}
+
+	// Authenticated request with allowed Origin receives Allow-Origin + Expose-Headers.
+	pingResp, _ := cliCORS.do(http.MethodGet, "/v1/ping", reqOpts{
+		extraHeaders: map[string]string{"Origin": "http://localhost:5173"},
+	})
+	if pingResp.StatusCode != 200 || pingResp.Header.Get("Access-Control-Allow-Origin") != "http://localhost:5173" ||
+		pingResp.Header.Get("Access-Control-Expose-Headers") != "Retry-After, Content-Length, Content-Type" {
+		t.Fatalf("expected CORS headers on authenticated GET, got status=%d hdr=%v", pingResp.StatusCode, pingResp.Header)
+	}
+
+	// Unlisted Origin receives ZERO CORS headers and Stealth 404 on OPTIONS.
+	evilReq, _ := http.NewRequest(http.MethodOptions, cliCORS.baseURL+"/v1/ping", nil)
+	evilReq.Header.Set("Origin", "https://evil.example.com")
+	evilReq.Header.Set("Access-Control-Request-Method", "GET")
+	evilResp, err := cliCORS.http.Do(evilReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = evilResp.Body.Close()
+	if evilResp.StatusCode != 404 || evilResp.Header.Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("expected unlisted Origin OPTIONS to get stealth 404 without CORS headers, got %d hdr=%v", evilResp.StatusCode, evilResp.Header)
+	}
+}
+
+func TestSpoolInFlightQuotaDuplicateRaceRangeStripMaxMailboxesAndHTTP2Ban(t *testing.T) {
+	dataDir := t.TempDir()
+	srv, _, cli, clk := newTestServerAndClient(t, func(c *Config) {
+		c.Profile = ProfileStandard
+		c.Spool = SpoolDisk
+		c.DataDir = dataDir
+		c.SpoolMaxMailboxes = 2
+		c.MaxChunkDuration = 120 * time.Millisecond
+	})
+
+	// 1. Verify HTTP server limits (MaxHeaderBytes=8192, ReadHeaderTimeout=5s).
+	hs := srv.NewHTTPServer()
+	if hs.MaxHeaderBytes != 8192 || hs.ReadHeaderTimeout != 5*time.Second {
+		t.Fatalf("expected MaxHeaderBytes=8192 & ReadHeaderTimeout=5s, got %d / %v", hs.MaxHeaderBytes, hs.ReadHeaderTimeout)
+	}
+
+	// 2. MaxMailboxes cap = 2: 2 mailboxes succeed, 3rd returns 507 (scope=mailbox_count), re-register #1 still works!
+	regMB := func() (string, ed25519.PrivateKey, string, int, []byte) {
+		pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+		mbID := DeriveMailboxID(pub)
+		tok, _ := GenerateAccessKey()
+		rb, _ := json.Marshal(map[string]any{
+			"auth_pk_b64":    base64.RawURLEncoding.EncodeToString(pub),
+			"deposit_tokens": []DepositTokenEntry{{TokenID: "dt_peer_01", TokenHashHex: HashDepositToken(tok)}},
+		})
+		r, b := cli.do(http.MethodPut, "/v1/mailboxes/"+mbID, reqOpts{body: rb, mailboxID: mbID, mailboxSK: priv})
+		return mbID, priv, tok, r.StatusCode, b
+	}
+	mb1, priv1, tok1, st1, _ := regMB()
+	_, _, _, st2, _ := regMB()
+	_, _, _, st3, b3 := regMB()
+	if st1 != 200 || st2 != 200 || st3 != 507 || !strings.Contains(string(b3), `"scope":"mailbox_count"`) {
+		t.Fatalf("expected mailbox registrations 200, 200, 507(mailbox_count); got %d, %d, %d (%s)", st1, st2, st3, b3)
+	}
+
+	// 3. In-flight uncommitted quota enforcement & duplicate concurrent chunk 409 guard.
+	ib, _ := json.Marshal(SpoolInitRequest{
+		MailboxID:          mb1,
+		DeclaredTotalBytes: 8192,
+		SealedHeader:       makeValidSealedHeaderB64(),
+		Parts:              []SpoolPartSpec{{PartID: 0, TotalBytes: 8192, ChunkCount: 2}},
+	})
+	_, initBody := cli.do(http.MethodPost, "/v1/spool/init", reqOpts{body: ib, depositToken: tok1})
+	var ir SpoolInitResponse
+	_ = json.Unmarshal(initBody, &ir)
+
+	pr, pw := io.Pipe()
+	entered := make(chan struct{})
+	put1Done := make(chan int, 1)
+	go func() {
+		putPath := "/v1/spool/" + ir.ItemID + "/parts/0/chunks/0"
+		tsStr := strconv.FormatInt(clk.Now().Unix(), 10)
+		nonce := randNonceHex(t)
+		req, _ := http.NewRequest(http.MethodPut, cli.baseURL+putPath, pr)
+		req.ContentLength = 8192
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.Header.Set(HeaderSyncTS, tsStr)
+		req.Header.Set(HeaderSyncNonce, nonce)
+		req.Header.Set(HeaderSyncSig, ComputeRelaySig(cli.hmacKey, http.MethodPut, putPath, tsStr, nonce, StreamBodyBinding(8192), ExtraTokenBinding("", ir.UploadToken)))
+		req.Header.Set(HeaderSyncUploadToken, ir.UploadToken)
+		close(entered)
+		resp, err := cli.http.Do(req)
+		if err != nil {
+			put1Done <- 0
+			return
+		}
+		_ = resp.Body.Close()
+		put1Done <- resp.StatusCode
+	}()
+	<-entered
+	_, _ = pw.Write(bytes.Repeat([]byte("A"), 1024))
+	time.Sleep(40 * time.Millisecond) // put1 is now actively inFlight holding 8192B!
+
+	// 3a. Concurrent duplicate PUT on same chunk (0,0) -> 409 ERR_CONFLICT!
+	dupResp, dupBody := cli.do(http.MethodPut, "/v1/spool/"+ir.ItemID+"/parts/0/chunks/0", reqOpts{
+		body:        bytes.Repeat([]byte("B"), 4096),
+		isStream:    true,
+		uploadToken: ir.UploadToken,
+	})
+	if dupResp.StatusCode != 409 || !strings.Contains(string(dupBody), "ERR_CONFLICT") {
+		t.Fatalf("expected 409 ERR_CONFLICT on concurrent duplicate chunk PUT, got %d %s", dupResp.StatusCode, dupBody)
+	}
+
+	// 3b. Concurrent PUT on sibling chunk (0,1) exceeding remaining part budget (8192 inFlight + 1024 > 8192) -> 400 ERR_BAD_REQUEST!
+	overResp, overBody := cli.do(http.MethodPut, "/v1/spool/"+ir.ItemID+"/parts/0/chunks/1", reqOpts{
+		body:        bytes.Repeat([]byte("C"), 1024),
+		isStream:    true,
+		uploadToken: ir.UploadToken,
+	})
+	if overResp.StatusCode != 400 || !strings.Contains(string(overBody), "ERR_BAD_REQUEST") {
+		t.Fatalf("expected 400 ERR_BAD_REQUEST when concurrent inFlight + new chunk exceeds part TotalBytes, got %d %s", overResp.StatusCode, overBody)
+	}
+	_, _ = pw.Write(bytes.Repeat([]byte("A"), 7168))
+	_ = pw.Close()
+	if st := <-put1Done; st != 200 {
+		t.Fatalf("expected put1 to finish 200, got %d", st)
+	}
+	_, _ = cli.do(http.MethodDelete, "/v1/spool/"+ir.ItemID, reqOpts{uploadToken: ir.UploadToken})
+
+	// 4. ServeChunk on SpoolDisk strips Range & If-Modified-Since (always 200 OK full payload via sendfile, never 206/304).
+	fullPayload := []byte("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_SENDFILE_FULL")
+	ib2, _ := json.Marshal(SpoolInitRequest{
+		MailboxID:          mb1,
+		DeclaredTotalBytes: int64(len(fullPayload)),
+		SealedHeader:       makeValidSealedHeaderB64(),
+		Parts:              []SpoolPartSpec{{PartID: 0, TotalBytes: int64(len(fullPayload)), ChunkCount: 1}},
+	})
+	_, b2 := cli.do(http.MethodPost, "/v1/spool/init", reqOpts{body: ib2, depositToken: tok1})
+	var ir2 SpoolInitResponse
+	_ = json.Unmarshal(b2, &ir2)
+	cli.do(http.MethodPut, "/v1/spool/"+ir2.ItemID+"/parts/0/chunks/0", reqOpts{body: fullPayload, isStream: true, uploadToken: ir2.UploadToken})
+	cli.do(http.MethodPost, "/v1/spool/"+ir2.ItemID+"/commit", reqOpts{body: []byte(`{}`), uploadToken: ir2.UploadToken})
+
+	rangeResp, rangeData := cli.do(http.MethodGet, "/v1/spool/"+ir2.ItemID+"/parts/0/chunks/0", reqOpts{
+		mailboxID: mb1,
+		mailboxSK: priv1,
+		extraHeaders: map[string]string{
+			"Range":             "bytes=0-4",
+			"If-Modified-Since": "Wed, 21 Oct 2099 07:28:00 GMT",
+			"If-None-Match":     `"etag"`,
+		},
+	})
+	if rangeResp.StatusCode != 200 || !bytes.Equal(rangeData, fullPayload) {
+		t.Fatalf("ServeChunk must ignore Range/If-* and return full 200 OK payload; got status=%d len=%d", rangeResp.StatusCode, len(rangeData))
+	}
+
+	// 5. RoomManager.Close terminal idempotency: verify_failed cannot be overwritten to completed or pinned past tombstone!
+	_, crb := cli.do(http.MethodPost, "/v1/rooms", reqOpts{body: []byte(`{"room_id":"R2M4T6B8"}`)})
+	var rm RoomCreateResult
+	_ = json.Unmarshal(crb, &rm)
+	cli.do(http.MethodPost, "/v1/rooms/R2M4T6B8/close", reqOpts{roomToken: rm.SenderToken, body: []byte(`{"reason":"verify_failed"}`)})
+	clk.Advance(10 * time.Second)
+	close2Resp, close2Body := cli.do(http.MethodPost, "/v1/rooms/R2M4T6B8/close", reqOpts{roomToken: rm.SenderToken, body: []byte(`{"reason":"completed"}`)})
+	if close2Resp.StatusCode != 200 || !strings.Contains(string(close2Body), `"burned"`) {
+		t.Fatalf("expected idempotent burned state on second close, got %d %s", close2Resp.StatusCode, close2Body)
+	}
+	evResp, evBody := cli.do(http.MethodGet, "/v1/rooms/R2M4T6B8/events?mode=poll&wait_sec=1", reqOpts{roomToken: rm.SenderToken})
+	if evResp.StatusCode != 200 || !strings.Contains(string(evBody), `"reason":"verify_failed"`) {
+		t.Fatalf("expected original verify_failed reason preserved, got %d %s", evResp.StatusCode, evBody)
+	}
+	// Advance 6s more (total 16s > 15s original TombstoneUntil) -> room MUST be swept (not pinned by close2!).
+	clk.Advance(6 * time.Second)
+	evSwept, _ := cli.do(http.MethodGet, "/v1/rooms/R2M4T6B8/events?mode=poll&wait_sec=1", reqOpts{roomToken: rm.SenderToken})
+	if evSwept.StatusCode != 404 {
+		t.Fatalf("expected tombstoned room to expire at +15s without extension, got %d", evSwept.StatusCode)
+	}
+
+	// 6. PipeHub per-chunk MaxChunkDuration (120ms) aborts 1-byte trickle tarpits!
+	_, crb2 := cli.do(http.MethodPost, "/v1/rooms", reqOpts{body: []byte(`{"room_id":"T2R4P6T8"}`)})
+	var rm2 RoomCreateResult
+	_ = json.Unmarshal(crb2, &rm2)
+	_, jnb2 := cli.do(http.MethodPost, "/v1/rooms/T2R4P6T8/join", reqOpts{body: []byte(`{}`)})
+	var jn2 RoomJoinResult
+	_ = json.Unmarshal(jnb2, &jn2)
+
+	tpr, tpw := io.Pipe()
+	go func() {
+		for i := 0; i < 6; i++ {
+			if _, err := tpw.Write([]byte("x")); err != nil {
+				return
+			}
+			time.Sleep(40 * time.Millisecond)
+		}
+		_ = tpw.Close()
+	}()
+	var recvWG sync.WaitGroup
+	recvWG.Add(1)
+	go func() {
+		defer recvWG.Done()
+		getURL := "/v1/pipe/" + rm2.PipeID + "/parts/0/chunks/0"
+		gTS := strconv.FormatInt(clk.Now().Unix(), 10)
+		gNonce := randNonceHex(t)
+		gReq, _ := http.NewRequest(http.MethodGet, cli.baseURL+getURL, nil)
+		gReq.Header.Set(HeaderSyncTS, gTS)
+		gReq.Header.Set(HeaderSyncNonce, gNonce)
+		gReq.Header.Set(HeaderSyncSig, ComputeRelaySig(cli.hmacKey, http.MethodGet, getURL, gTS, gNonce, EmptyBodySHA256Binding, ""))
+		gReq.Header.Set(HeaderSyncRoomToken, jn2.ReceiverToken)
+		if gResp, gErr := cli.http.Do(gReq); gErr == nil {
+			_, rbErr := io.ReadAll(gResp.Body)
+			_ = gResp.Body.Close()
+			if rbErr == nil {
+				t.Errorf("expected receiver mid-stream truncation error when MaxChunkDuration expires")
+			}
+		}
+	}()
+	putURL := "/v1/pipe/" + rm2.PipeID + "/parts/0/chunks/0"
+	tsStr := strconv.FormatInt(clk.Now().Unix(), 10)
+	tNonce := randNonceHex(t)
+	tReq, _ := http.NewRequest(http.MethodPut, cli.baseURL+putURL, tpr)
+	tReq.ContentLength = 4096
+	tReq.Header.Set("Content-Type", "application/octet-stream")
+	tReq.Header.Set(HeaderSyncTS, tsStr)
+	tReq.Header.Set(HeaderSyncNonce, tNonce)
+	tReq.Header.Set(HeaderSyncSig, ComputeRelaySig(cli.hmacKey, http.MethodPut, putURL, tsStr, tNonce, StreamBodyBinding(4096), ""))
+	tReq.Header.Set(HeaderSyncRoomToken, rm2.SenderToken)
+	tResp, tErr := cli.http.Do(tReq)
+	if tErr == nil {
+		_ = tResp.Body.Close()
+		if tResp.StatusCode == 200 {
+			t.Fatal("expected slow trickle exceeding MaxChunkDuration to fail, not return 200 OK")
+		}
+	}
+	recvWG.Wait()
+
+	// 7. Direct TLS 1.3 HTTP/2 banned connection is cleanly aborted, freeing LimitListener slot!
+	tlsCfg := Config{
+		ListenAddr:     "127.0.0.1:0",
+		PublicHost:     "127.0.0.1",
+		Profile:        ProfileNano,
+		Spool:          SpoolOff,
+		TLSMode:        TLSSelfSigned,
+		DataDir:        t.TempDir(),
+		AccessKey:      "h2_ban_test_access_key_32_characters_minimum_val",
+		DisableMemTune: true,
+	}
+	rcTLS, err := tlsCfg.Resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srvH2, err := NewServer(rcTLS, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srvH2.Close()
+	rawLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	limitLn := NewLimitListener(rawLn, srvH2.Guard(), 16, 16, time.Now)
+	httpSrvH2 := srvH2.NewHTTPServer()
+	tlsLn := tls.NewListener(limitLn, httpSrvH2.TLSConfig)
+	go func() { _ = httpSrvH2.Serve(tlsLn) }()
+	defer httpSrvH2.Close()
+
+	h2Transport := &http.Transport{
+		ForceAttemptHTTP2: true,
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13, NextProtos: []string{"h2"}},
+	}
+	h2Client := &http.Client{Transport: h2Transport, Timeout: 2 * time.Second}
+	for i := 0; i < StrikeBanThreshold; i++ {
+		r, err := h2Client.Get("https://" + rawLn.Addr().String() + "/v1/ping")
+		if err != nil {
+			break
+		}
+		_ = r.Body.Close()
+	}
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		limitLn.mu.Lock()
+		activeConns := limitLn.total
+		limitLn.mu.Unlock()
+		if activeConns == 0 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	limitLn.mu.Lock()
+	remConns := limitLn.total
+	limitLn.mu.Unlock()
+	if remConns != 0 {
+		t.Fatalf("expected banned HTTP/2 connection to be closed and release LimitListener slot, active=%d", remConns)
 	}
 }
