@@ -92,23 +92,45 @@ Usage:
   synctool-relay version                Print version
 
 Key Flags (env SYNCTOOL_* also supported):
-  --listen           Listen address (default ":54843", env SYNCTOOL_LISTEN)
-  --public-host      Public IP or domain for cert SAN & onboarding URI (env SYNCTOOL_PUBLIC_HOST)
-  --profile          VPS preset: auto|nano|standard|media (default "auto", env SYNCTOOL_PROFILE)
-  --spool            Offline spool backend: auto|off|memory|disk (default "auto", env SYNCTOOL_SPOOL)
-  --tls              TLS mode: selfsigned|cert|off (default "selfsigned", env SYNCTOOL_TLS)
-  --tls-cert         Certificate PEM path for --tls=cert (env SYNCTOOL_TLS_CERT)
-  --tls-key          Private key PEM path for --tls=cert (env SYNCTOOL_TLS_KEY)
-  --data-dir         State/cert/spool directory (default "/data", env SYNCTOOL_DATA_DIR)
-  --access-key       Private relay access key >=32 chars (env SYNCTOOL_ACCESS_KEY)
-  --trust-proxies    Comma-separated trusted reverse-proxy CIDRs (env SYNCTOOL_TRUSTED_PROXIES)
-  --max-bandwidth-mbps Optional global bandwidth cap in Mbps (env SYNCTOOL_MAX_BANDWIDTH_MBPS)`)
+  --listen             Listen address (default ":54843", env SYNCTOOL_LISTEN)
+  --public-host        Public IP or domain for cert SAN & onboarding URI (env SYNCTOOL_PUBLIC_HOST)
+  --profile            VPS preset: auto|nano|standard|media (default "auto", env SYNCTOOL_PROFILE)
+  --spool              Offline spool backend: auto|off|memory|disk (default "auto", env SYNCTOOL_SPOOL)
+  --tls                TLS mode: selfsigned|cert|off (default "selfsigned", env SYNCTOOL_TLS)
+  --tls-cert           Certificate PEM path for --tls=cert (env SYNCTOOL_TLS_CERT)
+  --tls-key            Private key PEM path for --tls=cert (env SYNCTOOL_TLS_KEY)
+  --data-dir           State/cert/spool directory (default "/data", env SYNCTOOL_DATA_DIR)
+  --access-key         Private relay access key >=32 chars (env SYNCTOOL_ACCESS_KEY)
+  --trust-proxies      Comma-separated trusted reverse-proxy CIDRs (env SYNCTOOL_TRUSTED_PROXIES)
+  --cors-origins       Comma-separated allowed CORS origins or * (env SYNCTOOL_CORS_ORIGINS)
+  --max-bandwidth-mbps Optional global bandwidth cap in Mbps (env SYNCTOOL_MAX_BANDWIDTH_MBPS)
+
+cert-rotate Flags:
+  --reuse-key          Re-sign fresh 730-day cert reusing existing P-256 key (SPKI pin unchanged)
+  --stage-next         Stage tls-next.crt / tls-next.key and output dual-pin URI (pin=<cur>,<next>)
+  --promote-staged     Atomically promote staged tls-next.crt/key to active cert.pem / key.pem
+  --print-uri          Include #k= onboarding URI in stdout (default true; false prints #k=<redacted>)`)
+}
+
+type extraCLIFlags struct {
+	reuseKey      bool
+	stageNext     bool
+	promoteStaged bool
+	printURI      bool
 }
 
 func parseConfigFlags(name string, args []string) (relay.Config, error) {
+	cfg, _, err := parseConfigFlagsExt(name, args, false)
+	return cfg, err
+}
+
+func parseConfigFlagsExt(name string, args []string, withRotateFlags bool) (relay.Config, extraCLIFlags, error) {
+	var ext extraCLIFlags
+	ext.printURI = true
+
 	cfg, err := relay.LoadConfigFromEnv(relay.DefaultConfig())
 	if err != nil {
-		return cfg, err
+		return cfg, ext, err
 	}
 
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
@@ -117,6 +139,7 @@ func parseConfigFlags(name string, args []string) (relay.Config, error) {
 		spoolStr   = string(cfg.Spool)
 		tlsStr     = string(cfg.TLSMode)
 		proxiesStr = ""
+		corsStr    = ""
 	)
 	fs.StringVar(&cfg.ListenAddr, "listen", cfg.ListenAddr, "listen address")
 	fs.StringVar(&cfg.PublicHost, "public-host", cfg.PublicHost, "public IP or domain for SAN and onboarding URI")
@@ -128,10 +151,17 @@ func parseConfigFlags(name string, args []string) (relay.Config, error) {
 	fs.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "persistent data directory")
 	fs.StringVar(&cfg.AccessKey, "access-key", cfg.AccessKey, "private relay access key (>=32 chars)")
 	fs.StringVar(&proxiesStr, "trust-proxies", "", "comma-separated trusted proxy CIDRs")
+	fs.StringVar(&corsStr, "cors-origins", "", "comma-separated allowed CORS origins or *")
 	fs.Float64Var(&cfg.MaxBandwidthMbps, "max-bandwidth-mbps", cfg.MaxBandwidthMbps, "optional global bandwidth cap (Mbps)")
+	fs.BoolVar(&ext.printURI, "print-uri", true, "print onboarding URI with #k= access key")
+	if withRotateFlags {
+		fs.BoolVar(&ext.reuseKey, "reuse-key", false, "re-sign fresh 730-day cert reusing existing ECDSA P-256 private key")
+		fs.BoolVar(&ext.stageNext, "stage-next", false, "stage tls-next.crt and tls-next.key and print dual-pin URI")
+		fs.BoolVar(&ext.promoteStaged, "promote-staged", false, "atomically promote staged tls-next.crt/key to active cert.pem/key.pem")
+	}
 
 	if err := fs.Parse(args); err != nil {
-		return cfg, err
+		return cfg, ext, err
 	}
 	cfg.Profile = relay.ProfileName(strings.ToLower(strings.TrimSpace(profileStr)))
 	cfg.Spool = relay.SpoolBackend(strings.ToLower(strings.TrimSpace(spoolStr)))
@@ -139,12 +169,19 @@ func parseConfigFlags(name string, args []string) (relay.Config, error) {
 	if strings.TrimSpace(proxiesStr) != "" {
 		prefixes, perr := relay.ParseTrustedProxies(proxiesStr)
 		if perr != nil {
-			return cfg, perr
+			return cfg, ext, perr
 		}
 		cfg.TrustedProxies = prefixes
 	}
+	if strings.TrimSpace(corsStr) != "" {
+		origins, cerr := relay.ParseCORSOrigins(corsStr)
+		if cerr != nil {
+			return cfg, ext, cerr
+		}
+		cfg.CORSOrigins = origins
+	}
 	cfg.ServerVersion = version
-	return cfg, nil
+	return cfg, ext, nil
 }
 
 func isTTY(f *os.File) bool {
@@ -155,8 +192,15 @@ func isTTY(f *os.File) bool {
 	return (info.Mode() & os.ModeCharDevice) != 0
 }
 
+func formatOutputRelayURI(origin, pinField, accessKey string, printURI bool) string {
+	if printURI {
+		return relay.BuildRelayURI(origin, pinField, accessKey)
+	}
+	return relay.BuildRedactedRelayURI(origin, pinField)
+}
+
 func runInit(args []string) int {
-	cfg, err := parseConfigFlags("init", args)
+	cfg, ext, err := parseConfigFlagsExt("init", args, false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "init error: %v\n", err)
 		return 2
@@ -172,14 +216,18 @@ func runInit(args []string) int {
 		return 1
 	}
 
-	origin := relay.CanonicalOrigin(rc.PublicHost, rc.ListenAddr, rc.TLSMode)
+	effectiveHost := strings.TrimSpace(rc.PublicHost)
 	spkiHex := ""
 	var expUnix int64
 	if b := cm.Current(); b != nil {
 		spkiHex = b.SPKISHA256Hex
 		expUnix = b.ExpiresAt
+		if effectiveHost == "" && b.Leaf != nil {
+			effectiveHost = relay.ExtractCertPublicHosts(b.Leaf)
+		}
 	}
-	uri := relay.BuildRelayURI(origin, spkiHex, rc.AccessKey)
+	origin := relay.CanonicalOrigin(effectiveHost, rc.ListenAddr, rc.TLSMode)
+	uri := formatOutputRelayURI(origin, spkiHex, rc.AccessKey, ext.printURI)
 
 	fmt.Printf("synctool-relay initialized (profile=%s, spool=%s, tls=%s)\n", rc.Preset.Name, rc.SpoolMode, rc.TLSMode)
 	fmt.Printf("Data directory : %s\n", rc.DataDir)
@@ -189,17 +237,36 @@ func runInit(args []string) int {
 		fmt.Printf("Cert Expires   : %s (730-day leaf cert)\n", time.Unix(expUnix, 0).UTC().Format(time.RFC3339))
 	}
 	fmt.Println("")
-	fmt.Println("Onboarding URI (KEEP SECRET — do NOT paste into public logs):")
+	if ext.printURI {
+		fmt.Println("Onboarding URI (KEEP SECRET — do NOT paste into public logs):")
+	} else {
+		fmt.Println("Onboarding URI (access key redacted; pass --print-uri to reveal #k=):")
+	}
 	fmt.Println(uri)
 	return 0
 }
 
 func runCertRotate(args []string) int {
-	cfg, err := parseConfigFlags("cert-rotate", args)
+	cfg, ext, err := parseConfigFlagsExt("cert-rotate", args, true)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cert-rotate error: %v\n", err)
 		return 2
 	}
+	modeCount := 0
+	if ext.reuseKey {
+		modeCount++
+	}
+	if ext.stageNext {
+		modeCount++
+	}
+	if ext.promoteStaged {
+		modeCount++
+	}
+	if modeCount > 1 {
+		fmt.Fprintln(os.Stderr, "cert-rotate error: --reuse-key, --stage-next, and --promote-staged are mutually exclusive")
+		return 2
+	}
+
 	rc, err := cfg.Resolve()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cert-rotate config error: %v\n", err)
@@ -209,25 +276,88 @@ func runCertRotate(args []string) int {
 		fmt.Fprintf(os.Stderr, "cert-rotate failed: only applies to --tls=selfsigned (current: %s)\n", rc.TLSMode)
 		return 1
 	}
+	now := time.Now()
+
+	if ext.stageNext {
+		cur, next, serr := relay.StageNextSelfSignedCert(rc.DataDir, rc.PublicHost, now)
+		if serr != nil {
+			fmt.Fprintf(os.Stderr, "cert-rotate --stage-next failed: %v\n", serr)
+			return 1
+		}
+		effectiveHost := strings.TrimSpace(rc.PublicHost)
+		if effectiveHost == "" {
+			effectiveHost = relay.ExtractCertPublicHosts(next.Leaf)
+		}
+		origin := relay.CanonicalOrigin(effectiveHost, rc.ListenAddr, rc.TLSMode)
+		dualPin := cur.SPKISHA256Hex + "," + next.SPKISHA256Hex
+		uri := formatOutputRelayURI(origin, dualPin, rc.AccessKey, ext.printURI)
+
+		fmt.Printf("Staged next 730-day self-signed certificate in %s (%s / %s)\n", rc.DataDir, relay.StagedCertFileName, relay.StagedKeyFileName)
+		fmt.Printf("Current SPKI SHA-256 : %s\n", cur.SPKISHA256Hex)
+		fmt.Printf("Staged SPKI SHA-256  : %s\n", next.SPKISHA256Hex)
+		fmt.Printf("Staged Expires At    : %s\n", time.Unix(next.ExpiresAt, 0).UTC().Format(time.RFC3339))
+		fmt.Println("")
+		fmt.Println("Zero-Downtime Dual-Pin Onboarding URI (import on clients BEFORE running --promote-staged):")
+		fmt.Println(uri)
+		return 0
+	}
+
+	if ext.promoteStaged {
+		promoted, perr := relay.PromoteStagedCert(rc.DataDir, now)
+		if perr != nil {
+			fmt.Fprintf(os.Stderr, "cert-rotate --promote-staged failed: %v\n", perr)
+			return 1
+		}
+		effectiveHost := strings.TrimSpace(rc.PublicHost)
+		if effectiveHost == "" {
+			effectiveHost = relay.ExtractCertPublicHosts(promoted.Leaf)
+		}
+		origin := relay.CanonicalOrigin(effectiveHost, rc.ListenAddr, rc.TLSMode)
+		uri := formatOutputRelayURI(origin, promoted.SPKISHA256Hex, rc.AccessKey, ext.printURI)
+
+		fmt.Printf("Promoted staged certificate to active cert.pem / key.pem in %s\n", rc.DataDir)
+		fmt.Printf("Active SPKI SHA-256 : %s\n", promoted.SPKISHA256Hex)
+		fmt.Printf("Active Expires At   : %s\n", time.Unix(promoted.ExpiresAt, 0).UTC().Format(time.RFC3339))
+		fmt.Println("Send SIGHUP to running synctool-relay (or restart) to serve the promoted certificate.")
+		fmt.Println("")
+		fmt.Println("Active Onboarding URI:")
+		fmt.Println(uri)
+		return 0
+	}
+
 	var certPath, keyPath string
 	if rc.DataDir != "" {
 		certPath = filepath.Join(rc.DataDir, "cert.pem")
 		keyPath = filepath.Join(rc.DataDir, "key.pem")
 	}
-	// Mint directly without pre-loading old cert so cert-rotate can self-heal corrupted/expired files.
-	b, err := relay.GenerateSelfSignedCert(rc.PublicHost, time.Now(), certPath, keyPath)
+
+	var b *relay.CertBundle
+	if ext.reuseKey {
+		b, err = relay.RotateSelfSignedReuseKey(rc.PublicHost, now, certPath, keyPath)
+	} else {
+		// Mint directly (inheriting SANs if old cert.pem is readable, or self-healing corrupted/expired files).
+		b, err = relay.GenerateSelfSignedCert(rc.PublicHost, now, certPath, keyPath)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cert-rotate failed: %v\n", err)
 		return 1
 	}
 
-	origin := relay.CanonicalOrigin(rc.PublicHost, rc.ListenAddr, rc.TLSMode)
-	uri := relay.BuildRelayURI(origin, b.SPKISHA256Hex, rc.AccessKey)
-	fmt.Printf("Rotated 730-day self-signed certificate in %s\n", rc.DataDir)
-	fmt.Printf("New SPKI SHA-256 : %s\n", b.SPKISHA256Hex)
-	fmt.Printf("New Expires At   : %s\n", time.Unix(b.ExpiresAt, 0).UTC().Format(time.RFC3339))
+	effectiveHost := strings.TrimSpace(rc.PublicHost)
+	if effectiveHost == "" && b.Leaf != nil {
+		effectiveHost = relay.ExtractCertPublicHosts(b.Leaf)
+	}
+	origin := relay.CanonicalOrigin(effectiveHost, rc.ListenAddr, rc.TLSMode)
+	uri := formatOutputRelayURI(origin, b.SPKISHA256Hex, rc.AccessKey, ext.printURI)
+	if ext.reuseKey {
+		fmt.Printf("Re-signed 730-day self-signed certificate in %s (reusing existing key; SPKI pin unchanged)\n", rc.DataDir)
+	} else {
+		fmt.Printf("Rotated 730-day self-signed certificate in %s\n", rc.DataDir)
+	}
+	fmt.Printf("SPKI SHA-256   : %s\n", b.SPKISHA256Hex)
+	fmt.Printf("New Expires At : %s\n", time.Unix(b.ExpiresAt, 0).UTC().Format(time.RFC3339))
 	fmt.Println("")
-	fmt.Println("Updated Onboarding URI (re-import on clients):")
+	fmt.Println("Updated Onboarding URI:")
 	fmt.Println(uri)
 	return 0
 }
@@ -391,7 +521,11 @@ func runHealthcheck(args []string) int {
 			},
 		}
 	} else if cfg.TLSMode == relay.TLSCert {
-		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS13}
+		serverName := relay.ResolveCertServerName(cfg.PublicHost, cfg.ListenAddr, cfg.TLSCertPath)
+		transport.TLSClientConfig = &tls.Config{
+			MinVersion: tls.VersionTLS13,
+			ServerName: serverName,
+		}
 	}
 
 	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
