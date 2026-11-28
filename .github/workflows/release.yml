@@ -17,7 +17,6 @@ on:
 
 permissions:
   contents: write
-  packages: write
 
 jobs:
   verify:
@@ -94,8 +93,6 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       commit: ${{ steps.meta.outputs.commit }}
       should_release: ${{ steps.meta.outputs.should_release }}
-      image_name: ${{ steps.meta.outputs.image_name }}
-      image_tags: ${{ steps.meta.outputs.image_tags }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -106,7 +103,6 @@ jobs:
         shell: bash
         env:
           INPUT_VERSION: ${{ inputs.version }}
-          REPO_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
 
@@ -156,23 +152,10 @@ jobs:
             SHOULD_RELEASE="true"
           fi
 
-          OWNER_LOWER="$(printf '%s' "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          VER_LOWER="$(printf '%s' "${VER}" | tr '[:upper:]' '[:lower:]')"
-          TAG_LOWER="v${VER_LOWER}"
-          IMAGE_NAME="ghcr.io/${OWNER_LOWER}/synctool"
-
-          MAJOR_MINOR="$(printf '%s' "${VER_LOWER}" | cut -d. -f1,2)"
-          TAGS="${IMAGE_NAME}:${TAG_LOWER},${IMAGE_NAME}:${VER_LOWER}"
-          if [[ "${VER_LOWER}" != *-* ]]; then
-            TAGS="${TAGS},${IMAGE_NAME}:${MAJOR_MINOR},${IMAGE_NAME}:latest"
-          fi
-
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
           echo "version=${VER}" >> "${GITHUB_OUTPUT}"
           echo "commit=${SHORT_COMMIT}" >> "${GITHUB_OUTPUT}"
           echo "should_release=${SHOULD_RELEASE}" >> "${GITHUB_OUTPUT}"
-          echo "image_name=${IMAGE_NAME}" >> "${GITHUB_OUTPUT}"
-          echo "image_tags=${TAGS}" >> "${GITHUB_OUTPUT}"
 
   build-binaries:
     name: Build Multi-Arch Static Binaries & GitHub Release
@@ -226,14 +209,13 @@ jobs:
           generate_release_notes: true
           files: dist/*
 
-  publish-images:
-    name: Publish Multi-Arch Docker Images (GHCR & Docker Hub)
+  publish-dockerhub:
+    name: Publish Multi-Arch Docker Image to Docker Hub
     needs: [prepare]
     if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -241,63 +223,49 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Resolve Docker Hub credentials & combined image tags
-        id: registries
+      - name: Resolve Docker Hub credentials & image tags
+        id: dockerhub
         shell: bash
         env:
           DH_USER: ${{ secrets.DOCKERHUB_USERNAME || secrets.DOCKER_HUB_USERNAME || secrets.DOCKER_USERNAME }}
           DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKER_HUB_TOKEN || secrets.DOCKER_TOKEN || secrets.DOCKER_PASSWORD }}
-          GHCR_TAGS: ${{ needs.prepare.outputs.image_tags }}
           VER: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          ALL_TAGS="${GHCR_TAGS}"
-
-          if [[ -n "${DH_USER}" && -n "${DH_TOKEN}" ]]; then
-            DH_USER_LOWER="$(printf '%s' "${DH_USER}" | tr '[:upper:]' '[:lower:]')"
-            VER_LOWER="$(printf '%s' "${VER}" | tr '[:upper:]' '[:lower:]')"
-            TAG_LOWER="v${VER_LOWER}"
-            DH_IMAGE="${DH_USER_LOWER}/synctool"
-            MAJOR_MINOR="$(printf '%s' "${VER_LOWER}" | cut -d. -f1,2)"
-
-            DH_TAGS="${DH_IMAGE}:${TAG_LOWER},${DH_IMAGE}:${VER_LOWER}"
-            if [[ "${VER_LOWER}" != *-* ]]; then
-              DH_TAGS="${DH_TAGS},${DH_IMAGE}:${MAJOR_MINOR},${DH_IMAGE}:latest"
-            fi
-
-            ALL_TAGS="${ALL_TAGS},${DH_TAGS}"
-            echo "dockerhub_enabled=true" >> "${GITHUB_OUTPUT}"
-            echo "dockerhub_image=${DH_IMAGE}" >> "${GITHUB_OUTPUT}"
-            echo "Docker Hub publishing enabled for ${DH_IMAGE}"
-          else
-            echo "dockerhub_enabled=false" >> "${GITHUB_OUTPUT}"
-            echo "Docker Hub secrets not configured; publishing to GHCR only."
+          if [[ -z "${DH_USER}" || -z "${DH_TOKEN}" ]]; then
+            echo "ERROR: Docker Hub credentials (DOCKERHUB_USERNAME / DOCKERHUB_TOKEN) are required." >&2
+            exit 1
           fi
 
-          echo "all_tags=${ALL_TAGS}" >> "${GITHUB_OUTPUT}"
+          DH_USER_LOWER="$(printf '%s' "${DH_USER}" | tr '[:upper:]' '[:lower:]')"
+          VER_LOWER="$(printf '%s' "${VER}" | tr '[:upper:]' '[:lower:]')"
+          TAG_LOWER="v${VER_LOWER}"
+          DH_IMAGE="${DH_USER_LOWER}/synctool"
+          MAJOR_MINOR="$(printf '%s' "${VER_LOWER}" | cut -d. -f1,2)"
+
+          DH_TAGS="${DH_IMAGE}:${TAG_LOWER},${DH_IMAGE}:${VER_LOWER}"
+          if [[ "${VER_LOWER}" != *-* ]]; then
+            DH_TAGS="${DH_TAGS},${DH_IMAGE}:${MAJOR_MINOR},${DH_IMAGE}:latest"
+          fi
+
+          echo "image=${DH_IMAGE}" >> "${GITHUB_OUTPUT}"
+          echo "tags=${DH_TAGS}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved Docker Hub target: ${DH_IMAGE}"
 
       - name: Log in to Docker Hub
-        if: steps.registries.outputs.dockerhub_enabled == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME || secrets.DOCKER_HUB_USERNAME || secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKER_HUB_TOKEN || secrets.DOCKER_TOKEN || secrets.DOCKER_PASSWORD }}
 
-      - name: Build and push linux/amd64,linux/arm64 (GHCR + Docker Hub)
+      - name: Build and push linux/amd64,linux/arm64 to Docker Hub
         uses: docker/build-push-action@v6
         with:
           context: .
           file: deploy/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.registries.outputs.all_tags }}
+          tags: ${{ steps.dockerhub.outputs.tags }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
