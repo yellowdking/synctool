@@ -6,6 +6,7 @@ import {
   AEAD_TAG_LEN,
   CHUNK_CIPHERTEXT_MAX,
   CHUNK_PLAINTEXT_MAX,
+  MANIFEST_PAD_BUCKET,
   PROTO_VERSION,
   b64uToBytes,
   bytesToB64u,
@@ -48,10 +49,13 @@ import {
 } from './envelope.js';
 import {
   DEFAULT_HANDSHAKE_TIMEOUT_MS,
+  DEFAULT_MAX_IN_MEMORY_BLOB_BYTES,
   StreamingSha256,
   computeBlobSha256,
+  sleepWithSignal,
 } from './client_transport.js';
 import {
+  burnOrCloseRoomOnError,
   closeRoom,
   postRoomMessage,
   runFlow1Initiator,
@@ -63,17 +67,26 @@ import {
 // Parcel Preparation & Streaming Chunk Upload/Download Engine
 // ============================================================================
 
+export function calcSpeedBps(bytesDone, startMs) {
+  if (bytesDone <= 0) return 0;
+  const elapsedSec = Math.max(0.001, (Date.now() - startMs) / 1000);
+  return Math.round(bytesDone / elapsedSec);
+}
+
 export async function prepareParcel(client, parcel, blocksPerChunk) {
+  if (!parcel || typeof parcel !== 'object') {
+    throw new SyncError(ErrorCode.ERR_BAD_REQUEST, 'parcel input object is required');
+  }
   const id = await client.getIdentity();
   const msgIdRaw = randomBytes(16);
   const msgId = bytesToHex(msgIdRaw);
-  const createdAt = Math.floor(Date.now() / 1000);
+  const createdAt = client._localNowSec(); // ST-P1-6: strictly local clock, never tainted by clockOffsetSec!
   const inputBlobs = parcel.blobs ?? [];
 
   const blobDescriptors = [];
   const blobSecrets = [];
   for (let i = 0; i < inputBlobs.length; i++) {
-    const b = inputBlobs[i];
+    const b = await inputBlobs[i];
     const partId = i + 1;
     const hashHex = await computeBlobSha256(b);
     const blobKey = randomBytes(32);
@@ -136,6 +149,13 @@ export async function prepareParcel(client, parcel, blocksPerChunk) {
     blobSecrets,
     partsMeta,
     declaredTotalBytes,
+    zero() {
+      zeroBytes(paddedManifest);
+      zeroBytes(manifestUtf8);
+      for (const s of blobSecrets) {
+        zeroBytes(s.blobKey);
+      }
+    },
   };
 }
 
@@ -174,8 +194,83 @@ export async function uploadPartStreaming({
   }
 }
 
+export function assertValidBlocksPerChunk(blocksPerChunk, contextLabel = 'blocks_per_chunk') {
+  if (!Number.isInteger(blocksPerChunk) || blocksPerChunk < 1 || blocksPerChunk > 64) {
+    throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, `invalid ${contextLabel}: ${blocksPerChunk}`);
+  }
+}
+
+export function assertValidPart0Layout(part0Meta, blocksPerChunk = null) {
+  if (
+    !part0Meta ||
+    !Number.isSafeInteger(part0Meta.total_bytes) ||
+    part0Meta.total_bytes <= 0 ||
+    part0Meta.total_bytes > MAX_ENCRYPTED_MANIFEST_BYTES ||
+    !Number.isInteger(part0Meta.chunk_count) ||
+    part0Meta.chunk_count < 1 ||
+    part0Meta.chunk_count > MAX_MANIFEST_CHUNKS
+  ) {
+    throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, 'part_id=0 layout missing or exceeds 128 KiB manifest bounds');
+  }
+  if (blocksPerChunk !== null) {
+    assertValidBlocksPerChunk(blocksPerChunk);
+    // Verify total_bytes corresponds to a valid 4 KiB-multiple padded manifest and matching chunk_count
+    let validBucket = false;
+    for (let padded = MANIFEST_PAD_BUCKET; padded <= 33 * MANIFEST_PAD_BUCKET; padded += MANIFEST_PAD_BUCKET) {
+      if (calcEncryptedPartSize(padded) === part0Meta.total_bytes) {
+        if (calcTransportChunkCount(padded, blocksPerChunk) === part0Meta.chunk_count) {
+          validBucket = true;
+        }
+        break;
+      }
+    }
+    if (!validBucket) {
+      throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, 'part_id=0 total_bytes/chunk_count layout mismatch');
+    }
+  }
+}
+
 /**
- * Stream-download, AEAD-verify, SHA-256-verify, and write one blob part_id chunk-by-chunk.
+ * Validate untrusted wire `PartLayout` strictly against signed `manifest.blobs[i]` BEFORE downloading chunks (ST-P0-2).
+ */
+export function assertValidBlobPartLayout(partMeta, blobDesc, blocksPerChunk = null) {
+  if (
+    !partMeta ||
+    !Number.isSafeInteger(partMeta.total_bytes) ||
+    partMeta.total_bytes < AEAD_TAG_LEN ||
+    !Number.isInteger(partMeta.chunk_count) ||
+    partMeta.chunk_count < 1
+  ) {
+    throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, `invalid part layout for part_id=${blobDesc.part_id}`);
+  }
+  const expectedTotalBytes = calcEncryptedPartSize(blobDesc.size);
+  if (partMeta.total_bytes !== expectedTotalBytes) {
+    throw new SyncError(
+      ErrorCode.ERR_MANIFEST_INVALID,
+      `part_id=${blobDesc.part_id} wire total_bytes (${partMeta.total_bytes}) does not match signed manifest size (${expectedTotalBytes})`,
+    );
+  }
+  const totalBlocks = calcBlockCount(blobDesc.size);
+  if (partMeta.chunk_count > totalBlocks) {
+    throw new SyncError(
+      ErrorCode.ERR_MANIFEST_INVALID,
+      `part_id=${blobDesc.part_id} wire chunk_count (${partMeta.chunk_count}) exceeds total blocks (${totalBlocks})`,
+    );
+  }
+  if (blocksPerChunk !== null) {
+    assertValidBlocksPerChunk(blocksPerChunk);
+    const expectedChunks = calcTransportChunkCount(blobDesc.size, blocksPerChunk);
+    if (partMeta.chunk_count !== expectedChunks) {
+      throw new SyncError(
+        ErrorCode.ERR_MANIFEST_INVALID,
+        `part_id=${blobDesc.part_id} wire chunk_count (${partMeta.chunk_count}) does not match expected (${expectedChunks})`,
+      );
+    }
+  }
+}
+
+/**
+ * Stream-download, AEAD-verify (with `sawFinal` hard stop), SHA-256-verify, and write one blob part_id chunk-by-chunk.
  */
 export async function downloadBlobStreaming({
   blobDesc,
@@ -184,35 +279,108 @@ export async function downloadBlobStreaming({
   msgIdRaw,
   getChunkFn,
   createBlobSink,
+  maxInMemoryBlobBytes = DEFAULT_MAX_IN_MEMORY_BLOB_BYTES,
   startTxIdx = 0,
   resumePrefixBytes = null,
+  resumePrefixReader = null,
   onChunkDone,
 }) {
+  if (!createBlobSink && blobDesc.size > maxInMemoryBlobBytes) {
+    throw new SyncError(
+      ErrorCode.ERR_STORAGE_IO,
+      `blob "${blobDesc.name}" (${blobDesc.size} bytes) exceeds maxInMemoryBlobBytes (${maxInMemoryBlobBytes}); pass createBlobSink (e.g. createNodeFileBlobSink)`,
+    );
+  }
+  if (!Number.isInteger(startTxIdx) || startTxIdx < 0 || startTxIdx > chunkCount) {
+    throw new SyncError(ErrorCode.ERR_BAD_REQUEST, `invalid resume checkpoint startTxIdx=${startTxIdx} for part ${blobDesc.part_id}`);
+  }
+
   const blobKey = b64uToBytes(blobDesc.key);
   const { encKey, noncePrefix } = await deriveBlobPartKeys(blobKey, msgIdRaw, blobDesc.part_id);
   const totalBlocks = calcBlockCount(blobDesc.size);
+  const expectedEncryptedBytes = calcEncryptedPartSize(blobDesc.size);
   const hasher = new StreamingSha256();
   const sink = createBlobSink ? await createBlobSink(blobDesc) : null;
   const collected = sink ? null : [];
 
-  let blockIdx = startTxIdx * blocksPerChunk;
+  let blockIdx = Math.min(totalBlocks, startTxIdx * blocksPerChunk);
   let totalDecrypted = 0;
+  let totalCipherSeen = 0;
   let sawFinal = false;
 
-  if (startTxIdx > 0 && resumePrefixBytes) {
-    hasher.update(resumePrefixBytes);
-    totalDecrypted += resumePrefixBytes.length;
-    if (collected) collected.push(resumePrefixBytes);
-  }
-
   try {
+    if (startTxIdx > 0) {
+      const expectedPrefixLen = startTxIdx === chunkCount
+        ? blobDesc.size
+        : blockIdx * CHUNK_PLAINTEXT_MAX;
+      if (resumePrefixReader) {
+        let off = 0;
+        while (off < expectedPrefixLen) {
+          const sliceLen = Math.min(CHUNK_PLAINTEXT_MAX, expectedPrefixLen - off);
+          const slice = await resumePrefixReader(off, sliceLen);
+          if (!(slice instanceof Uint8Array) || slice.length !== sliceLen) {
+            throw new SyncError(
+              ErrorCode.ERR_STORAGE_IO,
+              `resumePrefixReader returned short slice at offset ${off} for part ${blobDesc.part_id}`,
+            );
+          }
+          hasher.update(slice);
+          totalDecrypted += slice.length;
+          if (collected) collected.push(slice);
+          off += sliceLen;
+        }
+      } else if (resumePrefixBytes instanceof Uint8Array) {
+        if (resumePrefixBytes.length !== expectedPrefixLen) {
+          throw new SyncError(
+            ErrorCode.ERR_BAD_REQUEST,
+            `resumePrefixes length (${resumePrefixBytes.length}) does not match checkpoint offset (${expectedPrefixLen}) for part ${blobDesc.part_id}`,
+          );
+        }
+        hasher.update(resumePrefixBytes);
+        totalDecrypted += resumePrefixBytes.length;
+        if (collected) collected.push(resumePrefixBytes);
+      } else {
+        throw new SyncError(
+          ErrorCode.ERR_BAD_REQUEST,
+          `resumeCheckpoints for part_id=${blobDesc.part_id} requires resumePrefixReaders or resumePrefixes to verify full-blob SHA-256`,
+        );
+      }
+      totalCipherSeen = startTxIdx === chunkCount
+        ? expectedEncryptedBytes
+        : blockIdx * CHUNK_CIPHERTEXT_MAX;
+      if (startTxIdx === chunkCount) {
+        sawFinal = true;
+      }
+    }
+
     for (let txIdx = startTxIdx; txIdx < chunkCount; txIdx++) {
+      if (sawFinal || blockIdx >= totalBlocks) {
+        throw new SyncError(
+          ErrorCode.ERR_STREAM_TRUNCATED,
+          `unexpected trailing chunk ${txIdx} after final block in part ${blobDesc.part_id}`,
+        );
+      }
       const chunkBytes = await getChunkFn(blobDesc.part_id, txIdx);
       if (chunkBytes.length < AEAD_TAG_LEN) {
         throw new SyncError(ErrorCode.ERR_STREAM_TRUNCATED, `chunk ${txIdx} of part ${blobDesc.part_id} too short`);
       }
+      totalCipherSeen += chunkBytes.length;
+      if (totalCipherSeen > expectedEncryptedBytes) {
+        throw new SyncError(
+          ErrorCode.ERR_STREAM_TRUNCATED,
+          `part ${blobDesc.part_id} ciphertext stream exceeded signed manifest bound (${totalCipherSeen} > ${expectedEncryptedBytes})`,
+        );
+      }
+
       let offset = 0;
       while (offset < chunkBytes.length) {
+        // ST-P0-2: hard-stop before blockIdx === totalBlocks - 1 can ever evaluate false on post-final blocks!
+        if (sawFinal || blockIdx >= totalBlocks) {
+          throw new SyncError(
+            ErrorCode.ERR_STREAM_TRUNCATED,
+            `trailing ciphertext after final STREAM block at block ${blockIdx} of part ${blobDesc.part_id}`,
+          );
+        }
         const end = Math.min(offset + CHUNK_CIPHERTEXT_MAX, chunkBytes.length);
         const ctBlock = chunkBytes.subarray(offset, end);
         const isFinal = blockIdx === totalBlocks - 1;
@@ -261,21 +429,9 @@ export async function downloadBlobStreaming({
   }
 }
 
-export function assertValidPart0Layout(part0Meta) {
-  if (
-    !part0Meta ||
-    !Number.isInteger(part0Meta.total_bytes) ||
-    part0Meta.total_bytes <= 0 ||
-    part0Meta.total_bytes > MAX_ENCRYPTED_MANIFEST_BYTES ||
-    !Number.isInteger(part0Meta.chunk_count) ||
-    part0Meta.chunk_count < 1 ||
-    part0Meta.chunk_count > MAX_MANIFEST_CHUNKS
-  ) {
-    throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, 'part_id=0 layout missing or exceeds 128 KiB manifest bounds');
-  }
-}
-
 export async function putPipeChunkWithRetry(client, pipeId, roomToken, partId, txIdx, bytes, deadlineMs, signal) {
+  const maxPeerTimeoutRetries = partId === 0 && txIdx === 0 ? 12 : 2;
+  let peerTimeouts = 0;
   while (true) {
     try {
       await client._signedRequest({
@@ -288,8 +444,15 @@ export async function putPipeChunkWithRetry(client, pipeId, roomToken, partId, t
       });
       return;
     } catch (err) {
-      if (err instanceof SyncError && err.code === ErrorCode.ERR_PIPE_PEER_TIMEOUT && Date.now() < deadlineMs && !signal?.aborted) {
-        await new Promise((r) => setTimeout(r, 50));
+      if (
+        err instanceof SyncError &&
+        err.code === ErrorCode.ERR_PIPE_PEER_TIMEOUT &&
+        peerTimeouts < maxPeerTimeoutRetries &&
+        Date.now() < deadlineMs &&
+        !signal?.aborted
+      ) {
+        peerTimeouts++;
+        await sleepWithSignal(Math.min(100, Math.max(10, deadlineMs - Date.now())), signal);
         continue;
       }
       throw err;
@@ -298,6 +461,8 @@ export async function putPipeChunkWithRetry(client, pipeId, roomToken, partId, t
 }
 
 export async function getPipeChunkWithRetry(client, pipeId, roomToken, partId, txIdx, deadlineMs, signal) {
+  const maxPeerTimeoutRetries = partId === 0 && txIdx === 0 ? 12 : 2;
+  let peerTimeouts = 0;
   while (true) {
     try {
       const res = await client._signedRequest({
@@ -308,8 +473,15 @@ export async function getPipeChunkWithRetry(client, pipeId, roomToken, partId, t
       });
       return new Uint8Array(await res.arrayBuffer());
     } catch (err) {
-      if (err instanceof SyncError && err.code === ErrorCode.ERR_PIPE_PEER_TIMEOUT && Date.now() < deadlineMs && !signal?.aborted) {
-        await new Promise((r) => setTimeout(r, 50));
+      if (
+        err instanceof SyncError &&
+        err.code === ErrorCode.ERR_PIPE_PEER_TIMEOUT &&
+        peerTimeouts < maxPeerTimeoutRetries &&
+        Date.now() < deadlineMs &&
+        !signal?.aborted
+      ) {
+        peerTimeouts++;
+        await sleepWithSignal(Math.min(100, Math.max(10, deadlineMs - Date.now())), signal);
         continue;
       }
       throw err;
@@ -325,21 +497,37 @@ export async function startOneShotSendImpl(client, parcel, opts = {}) {
   const caps = await client.capabilities({ signal: opts.signal });
   const blocksPerChunk = caps.streaming.blocks_per_chunk;
   const prep = await prepareParcel(client, parcel, blocksPerChunk);
-  const { roomId, pipeId, roomToken, seq: s0, hs } = await runFlow1Initiator(client, {
-    purpose: 'oneshot',
-    mode: opts.mode ?? 1,
-    includeRelay: opts.includeRelay ?? false,
-    onOfferReady: opts.onOfferReady,
-    onSASInput: opts.onSASInput,
-    timeoutMs: opts.timeoutMs,
-    preferPoll: opts.preferPoll,
-    signal: opts.signal,
-  });
-
-  const { part0Key, part0NoncePrefix } = await deriveOneshotPart0Keys(hs.sessionKey, prep.msgIdRaw);
-  const { ctrlKey, ctrlNoncePrefix } = await derivePipeCtrlKeys(hs.sessionKey, hs.th);
+  let roomId = null;
+  let roomToken = null;
+  let hs = null;
+  let part0Key = null;
+  let ctrlKey = null;
 
   try {
+    const hsRes = await runFlow1Initiator(client, {
+      purpose: 'oneshot',
+      mode: opts.mode ?? 1,
+      includeRelay: opts.includeRelay ?? false,
+      ttlSec: opts.ttlSec ?? 300,
+      onOfferReady: opts.onOfferReady,
+      onSASInput: opts.onSASInput,
+      timeoutMs: opts.timeoutMs,
+      preferPoll: opts.preferPoll,
+      signal: opts.signal,
+    });
+    roomId = hsRes.roomId;
+    roomToken = hsRes.roomToken;
+    hs = hsRes.hs;
+    const pipeId = hsRes.pipeId;
+    const s0 = hsRes.seq;
+
+    const p0Keys = await deriveOneshotPart0Keys(hs.sessionKey, prep.msgIdRaw);
+    part0Key = p0Keys.part0Key;
+    const part0NoncePrefix = p0Keys.part0NoncePrefix;
+    const ctrlKeys = await derivePipeCtrlKeys(hs.sessionKey, hs.th);
+    ctrlKey = ctrlKeys.ctrlKey;
+    const ctrlNoncePrefix = ctrlKeys.ctrlNoncePrefix;
+
     const startFrame = await sealPipeCtrlFrame(ctrlKey, ctrlNoncePrefix, hs.th, 0, {
       op: 'pipe_start',
       msg_id: prep.msgId,
@@ -349,13 +537,14 @@ export async function startOneShotSendImpl(client, parcel, opts = {}) {
     const sent = await postRoomMessage(client, roomId, roomToken, 'control', startFrame, opts.signal);
 
     const deadlineMs = Date.now() + (opts.timeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS);
+    const startMs = Date.now();
     let bytesDone = 0;
-    const emit = (partId, partDone, partTotal) => {
+    const emit = (stage, partId, partDone, partTotal) => {
       if (!opts.onProgress) return;
       opts.onProgress({
         type: 'event',
         event: 'transfer_progress',
-        stage: 'transferring',
+        stage,
         direction: 'send',
         mode: 'pipe',
         msg_id: prep.msgId,
@@ -365,7 +554,7 @@ export async function startOneShotSendImpl(client, parcel, opts = {}) {
         bytes_total: prep.declaredTotalBytes,
         part_bytes_done: partDone,
         part_bytes_total: partTotal,
-        speed_bps: 0,
+        speed_bps: calcSpeedBps(bytesDone, startMs),
         resumed: false,
         ts: Math.floor(Date.now() / 1000),
       });
@@ -382,7 +571,11 @@ export async function startOneShotSendImpl(client, parcel, opts = {}) {
       msgIdRaw: prep.msgIdRaw,
       blocksPerChunk,
       putChunkFn: (pid, tx, buf) => putPipeChunkWithRetry(client, pipeId, roomToken, pid, tx, buf, deadlineMs, opts.signal),
-      onChunkDone: (_tx, len) => { bytesDone += len; p0Done += len; emit(0, p0Done, prep.partsMeta[0].total_bytes); },
+      onChunkDone: (_tx, len) => {
+        bytesDone += len;
+        p0Done += len;
+        emit('transferring', 0, p0Done, prep.partsMeta[0].total_bytes);
+      },
     });
 
     // Upload blobs part_id=1..N
@@ -400,21 +593,32 @@ export async function startOneShotSendImpl(client, parcel, opts = {}) {
           msgIdRaw: prep.msgIdRaw,
           blocksPerChunk,
           putChunkFn: (pid, tx, buf) => putPipeChunkWithRetry(client, pipeId, roomToken, pid, tx, buf, deadlineMs, opts.signal),
-          onChunkDone: (_tx, len) => { bytesDone += len; pDone += len; emit(partId, pDone, pTotal); },
+          onChunkDone: (_tx, len) => {
+            bytesDone += len;
+            pDone += len;
+            emit('transferring', partId, pDone, pTotal);
+          },
         });
       } finally {
         zeroBytes(encKey);
-        zeroBytes(blobKey);
       }
     }
 
     // Wait for encrypted pipe_ack (ctrl_seq = 1, odd parity)
     const { msg: ackMsg } = await waitRoomMessage(
-      client, roomId, roomToken, Math.max(s0, sent.seq),
+      client,
+      roomId,
+      roomToken,
+      Math.max(s0, sent.seq),
       (m) => m.from === 'receiver' && m.kind === 'control',
       { timeoutMs: opts.timeoutMs, preferPoll: opts.preferPoll, signal: opts.signal },
     );
-    const ackFrame = JSON.parse(utf8Decode(b64uToBytes(ackMsg.msg_b64)));
+    let ackFrame;
+    try {
+      ackFrame = JSON.parse(utf8Decode(b64uToBytes(ackMsg.msg_b64)));
+    } catch (err) {
+      throw new SyncError(ErrorCode.ERR_CRYPTO_DECRYPT_FAILED, 'malformed pipe_ack frame', { cause: err });
+    }
     const { payload: ackPayload } = await openPipeCtrlFrame(ctrlKey, ctrlNoncePrefix, hs.th, ackFrame, {
       expectedParity: 1,
       lastSeenSeq: -1,
@@ -422,10 +626,21 @@ export async function startOneShotSendImpl(client, parcel, opts = {}) {
     if (ackPayload.op !== 'pipe_ack' || ackPayload.msg_id !== prep.msgId) {
       throw new SyncError(ErrorCode.ERR_CRYPTO_DECRYPT_FAILED, 'invalid pipe_ack payload');
     }
+    emit('completed', prep.partsMeta.length - 1, 0, 0);
     await closeRoom(client, roomId, roomToken, 'completed');
+    roomToken = null;
     return { mode: 'pipe', msgId: prep.msgId, totalBytes: prep.declaredTotalBytes };
+  } catch (err) {
+    if (roomId && roomToken) {
+      await burnOrCloseRoomOnError(client, roomId, roomToken, err, opts.signal);
+    }
+    throw err;
   } finally {
-    zeroBytes(hs.sessionKey);
+    prep.zero();
+    if (hs) {
+      zeroBytes(hs.sessionKey);
+      zeroBytes(hs.prk);
+    }
     zeroBytes(part0Key);
     zeroBytes(ctrlKey);
   }
@@ -440,60 +655,116 @@ export async function receiveOneShotJoinedImpl(client, pairInput, preJoined, han
     expectedPurpose: 'oneshot',
     preJoined,
     onSASDisplay: opts.onSASDisplay,
+    onSASConfirm: opts.onSASConfirm,
     timeoutMs: opts.timeoutMs,
     preferPoll: opts.preferPoll,
     signal: opts.signal,
   });
   const { ctrlKey, ctrlNoncePrefix } = await derivePipeCtrlKeys(hs.sessionKey, hs.th);
+  let part0Key = null;
 
   try {
     const { msg: startMsg } = await waitRoomMessage(
-      client, roomId, roomToken, s0,
+      client,
+      roomId,
+      roomToken,
+      s0,
       (m) => m.from === 'sender' && m.kind === 'control',
       { timeoutMs: opts.timeoutMs, preferPoll: opts.preferPoll, signal: opts.signal },
     );
-    const startFrame = JSON.parse(utf8Decode(b64uToBytes(startMsg.msg_b64)));
+    let startFrame;
+    try {
+      startFrame = JSON.parse(utf8Decode(b64uToBytes(startMsg.msg_b64)));
+    } catch (err) {
+      throw new SyncError(ErrorCode.ERR_CRYPTO_DECRYPT_FAILED, 'malformed pipe_start frame', { cause: err });
+    }
     const { payload: startPayload } = await openPipeCtrlFrame(ctrlKey, ctrlNoncePrefix, hs.th, startFrame, {
       expectedParity: 0,
       lastSeenSeq: -1,
     });
-    if (startPayload.op !== 'pipe_start' || !startPayload.msg_id || !Array.isArray(startPayload.parts)) {
+    if (startPayload.op !== 'pipe_start' || typeof startPayload.msg_id !== 'string' || !/^[0-9a-f]{32}$/.test(startPayload.msg_id) || !Array.isArray(startPayload.parts)) {
       throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, 'invalid pipe_start control command');
     }
+    const blocksPerChunk = startPayload.blocks_per_chunk ?? 16;
+    assertValidBlocksPerChunk(blocksPerChunk, 'pipe_start.blocks_per_chunk');
 
     const msgIdRaw = hexToBytes(startPayload.msg_id);
-    const { part0Key, part0NoncePrefix } = await deriveOneshotPart0Keys(hs.sessionKey, msgIdRaw);
+    const p0Keys = await deriveOneshotPart0Keys(hs.sessionKey, msgIdRaw);
+    part0Key = p0Keys.part0Key;
+    const part0NoncePrefix = p0Keys.part0NoncePrefix;
     const deadlineMs = Date.now() + (opts.timeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS);
 
     const part0Meta = startPayload.parts.find((p) => p.part_id === 0);
-    assertValidPart0Layout(part0Meta);
+    assertValidPart0Layout(part0Meta, blocksPerChunk);
+
+    const startMs = Date.now();
+    const totalDeclaredBytes = startPayload.parts.reduce((acc, p) => acc + (Number.isSafeInteger(p?.total_bytes) ? p.total_bytes : 0), 0);
+    let bytesDone = 0;
 
     const p0Chunks = [];
     let p0Total = 0;
     for (let tx = 0; tx < part0Meta.chunk_count; tx++) {
       const ch = await getPipeChunkWithRetry(client, pipeId, roomToken, 0, tx, deadlineMs, opts.signal);
       p0Total += ch.length;
-      if (p0Total > MAX_ENCRYPTED_MANIFEST_BYTES) {
-        throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, 'part_id=0 stream exceeded maximum manifest byte budget');
+      if (p0Total > MAX_ENCRYPTED_MANIFEST_BYTES || p0Total > part0Meta.total_bytes) {
+        throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, 'part_id=0 stream exceeded declared manifest byte budget');
       }
       p0Chunks.push(ch);
+      bytesDone += ch.length;
     }
+    if (p0Total !== part0Meta.total_bytes) {
+      throw new SyncError(ErrorCode.ERR_STREAM_TRUNCATED, 'part_id=0 stream shorter than declared total_bytes');
+    }
+
     const paddedManifest = await decryptPartBytes(part0Key, part0NoncePrefix, msgIdRaw, 0, p0Chunks);
     const manifestUtf8 = unpadManifest(paddedManifest);
     const manifest = JSON.parse(utf8Decode(manifestUtf8));
     validateManifest(manifest, { expectedMsgId: startPayload.msg_id });
 
-    const blobs = [];
+    // Validate ALL wire PartLayouts BEFORE downloading any blob chunks (ST-P0-2)
     for (const blobDesc of manifest.blobs) {
       const pm = startPayload.parts.find((p) => p.part_id === blobDesc.part_id);
       if (!pm) throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, `missing part_id=${blobDesc.part_id} in pipe_start`);
-      blobs.push(await downloadBlobStreaming({
-        blobDesc,
-        chunkCount: pm.chunk_count,
-        msgIdRaw,
-        getChunkFn: (pid, tx) => getPipeChunkWithRetry(client, pipeId, roomToken, pid, tx, deadlineMs, opts.signal),
-        createBlobSink: opts.createBlobSink,
-      }));
+      assertValidBlobPartLayout(pm, blobDesc, blocksPerChunk);
+    }
+
+    const maxInMemoryBlobBytes = opts.maxInMemoryBlobBytes ?? client._maxInMemoryBlobBytes;
+    const blobs = [];
+    for (const blobDesc of manifest.blobs) {
+      const pm = startPayload.parts.find((p) => p.part_id === blobDesc.part_id);
+      let partDone = 0;
+      blobs.push(
+        await downloadBlobStreaming({
+          blobDesc,
+          chunkCount: pm.chunk_count,
+          blocksPerChunk,
+          msgIdRaw,
+          getChunkFn: (pid, tx) => getPipeChunkWithRetry(client, pipeId, roomToken, pid, tx, deadlineMs, opts.signal),
+          createBlobSink: opts.createBlobSink,
+          maxInMemoryBlobBytes,
+          onChunkDone: (_tx, len) => {
+            bytesDone += len;
+            partDone += len;
+            opts.onProgress?.({
+              type: 'event',
+              event: 'transfer_progress',
+              stage: 'transferring',
+              direction: 'recv',
+              mode: 'pipe',
+              msg_id: startPayload.msg_id,
+              part_id: blobDesc.part_id,
+              parts_total: startPayload.parts.length,
+              bytes_done: bytesDone,
+              bytes_total: totalDeclaredBytes,
+              part_bytes_done: partDone,
+              part_bytes_total: pm.total_bytes,
+              speed_bps: calcSpeedBps(bytesDone, startMs),
+              resumed: false,
+              ts: Math.floor(Date.now() / 1000),
+            });
+          },
+        }),
+      );
     }
 
     await handler({ manifest, blobs });
@@ -503,11 +774,32 @@ export async function receiveOneShotJoinedImpl(client, pairInput, preJoined, han
       msg_id: startPayload.msg_id,
     });
     await postRoomMessage(client, roomId, roomToken, 'control', ackFrame, opts.signal);
+    opts.onProgress?.({
+      type: 'event',
+      event: 'transfer_progress',
+      stage: 'completed',
+      direction: 'recv',
+      mode: 'pipe',
+      msg_id: startPayload.msg_id,
+      part_id: manifest.blobs.length,
+      parts_total: startPayload.parts.length,
+      bytes_done: bytesDone,
+      bytes_total: totalDeclaredBytes,
+      part_bytes_done: 0,
+      part_bytes_total: 0,
+      speed_bps: calcSpeedBps(bytesDone, startMs),
+      resumed: false,
+      ts: Math.floor(Date.now() / 1000),
+    });
     // Do NOT close room here: sender closes room after reading & verifying pipe_ack (prevents wipe race).
-    zeroBytes(part0Key);
     return manifest;
+  } catch (err) {
+    await burnOrCloseRoomOnError(client, roomId, roomToken, err, opts.signal);
+    throw err;
   } finally {
+    zeroBytes(part0Key);
     zeroBytes(hs.sessionKey);
+    zeroBytes(hs.prk);
     zeroBytes(ctrlKey);
   }
 }
@@ -533,76 +825,131 @@ export async function sendDirectModeAImpl(client, prep, sealed, blocksPerChunk, 
     signal: opts.signal,
   });
   const room = await createRes.json();
-  const roomToken = room.sender_token;
+  let roomToken = room.sender_token;
   const pipeId = room.pipe_id;
-  const pairUri = formatPairURI({
-    roomId,
-    mode: 0,
-    purpose: 'direct',
-    relayOrigin: opts.includeRelay ? client.relay.origin : null,
-    spkiPin: opts.includeRelay ? client.relay.spkiPin : null,
-    accessKey: opts.includeRelay ? client.relay.accessKey : null,
-    expiresAt: room.expires_at,
-  });
 
-  if (opts.onOfferReady) {
-    await opts.onOfferReady({
+  try {
+    const pairUri = formatPairURI({
       roomId,
-      formattedRoomId: formatRoomId(roomId),
-      pairUri,
       mode: 0,
       purpose: 'direct',
+      relayOrigin: opts.includeRelay ? client.relay.origin : null,
+      spkiPin: opts.includeRelay ? client.relay.spkiPin : null,
+      spkiPins: opts.includeRelay ? client.relay.spkiPins : null,
+      accessKey: opts.includeRelay ? client.relay.accessKey : null,
       expiresAt: room.expires_at,
     });
-  }
 
-  const deadlineMs = Date.now() + (opts.timeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS);
-  await uploadPartStreaming({
-    partId: 0,
-    plaintextSize: prep.paddedManifest.length,
-    readPlaintextSlice: async (off, len) => prep.paddedManifest.subarray(off, off + len),
-    encKey: sealed.part0Key,
-    noncePrefix: sealed.part0NoncePrefix,
-    msgIdRaw: prep.msgIdRaw,
-    blocksPerChunk,
-    putChunkFn: (pid, tx, buf) => putPipeChunkWithRetry(client, pipeId, roomToken, pid, tx, buf, deadlineMs, opts.signal),
-  });
-
-  for (const { partId, blobKey, input } of prep.blobSecrets) {
-    const { encKey, noncePrefix } = await deriveBlobPartKeys(blobKey, prep.msgIdRaw, partId);
-    try {
-      await uploadPartStreaming({
-        partId,
-        plaintextSize: input.size,
-        readPlaintextSlice: (off, len) => input.readSlice(off, len),
-        encKey,
-        noncePrefix,
-        msgIdRaw: prep.msgIdRaw,
-        blocksPerChunk,
-        putChunkFn: (pid, tx, buf) => putPipeChunkWithRetry(client, pipeId, roomToken, pid, tx, buf, deadlineMs, opts.signal),
+    if (opts.onOfferReady) {
+      await opts.onOfferReady({
+        roomId,
+        formattedRoomId: formatRoomId(roomId),
+        pairUri,
+        mode: 0,
+        purpose: 'direct',
+        expiresAt: room.expires_at,
       });
-    } finally {
-      zeroBytes(encKey);
-      zeroBytes(blobKey);
     }
-  }
 
-  const { msg: ackMsg } = await waitRoomMessage(
-    client, roomId, roomToken, room.seq ?? 1,
-    (m) => m.from === 'receiver' && m.kind === 'control',
-    { timeoutMs: opts.timeoutMs, preferPoll: opts.preferPoll, signal: opts.signal },
-  );
-  const ackPayload = JSON.parse(utf8Decode(b64uToBytes(ackMsg.msg_b64)));
-  if (ackPayload.op !== 'pipe_ack' || ackPayload.msg_id !== prep.msgId || typeof ackPayload.ack_mac !== 'string') {
-    throw new SyncError(ErrorCode.ERR_CRYPTO_SIGNATURE_INVALID, 'malformed Flow 2 direct pipe_ack');
+    const deadlineMs = Date.now() + (opts.timeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS);
+    const startMs = Date.now();
+    let bytesDone = 0;
+    const emit = (stage, partId, partDone, partTotal) => {
+      if (!opts.onProgress) return;
+      opts.onProgress({
+        type: 'event',
+        event: 'transfer_progress',
+        stage,
+        direction: 'send',
+        mode: 'pipe',
+        msg_id: prep.msgId,
+        part_id: partId,
+        parts_total: prep.partsMeta.length,
+        bytes_done: bytesDone,
+        bytes_total: prep.declaredTotalBytes,
+        part_bytes_done: partDone,
+        part_bytes_total: partTotal,
+        speed_bps: calcSpeedBps(bytesDone, startMs),
+        resumed: false,
+        ts: Math.floor(Date.now() / 1000),
+      });
+    };
+
+    let p0Done = 0;
+    await uploadPartStreaming({
+      partId: 0,
+      plaintextSize: prep.paddedManifest.length,
+      readPlaintextSlice: async (off, len) => prep.paddedManifest.subarray(off, off + len),
+      encKey: sealed.part0Key,
+      noncePrefix: sealed.part0NoncePrefix,
+      msgIdRaw: prep.msgIdRaw,
+      blocksPerChunk,
+      putChunkFn: (pid, tx, buf) => putPipeChunkWithRetry(client, pipeId, roomToken, pid, tx, buf, deadlineMs, opts.signal),
+      onChunkDone: (_tx, len) => {
+        bytesDone += len;
+        p0Done += len;
+        emit('transferring', 0, p0Done, prep.partsMeta[0].total_bytes);
+      },
+    });
+
+    for (const { partId, blobKey, input } of prep.blobSecrets) {
+      const { encKey, noncePrefix } = await deriveBlobPartKeys(blobKey, prep.msgIdRaw, partId);
+      let pDone = 0;
+      const pTotal = prep.partsMeta[partId].total_bytes;
+      try {
+        await uploadPartStreaming({
+          partId,
+          plaintextSize: input.size,
+          readPlaintextSlice: (off, len) => input.readSlice(off, len),
+          encKey,
+          noncePrefix,
+          msgIdRaw: prep.msgIdRaw,
+          blocksPerChunk,
+          putChunkFn: (pid, tx, buf) => putPipeChunkWithRetry(client, pipeId, roomToken, pid, tx, buf, deadlineMs, opts.signal),
+          onChunkDone: (_tx, len) => {
+            bytesDone += len;
+            pDone += len;
+            emit('transferring', partId, pDone, pTotal);
+          },
+        });
+      } finally {
+        zeroBytes(encKey);
+      }
+    }
+
+    const { msg: ackMsg } = await waitRoomMessage(
+      client,
+      roomId,
+      roomToken,
+      room.seq ?? 1,
+      (m) => m.from === 'receiver' && m.kind === 'control',
+      { timeoutMs: opts.timeoutMs, preferPoll: opts.preferPoll, signal: opts.signal },
+    );
+    let ackPayload;
+    try {
+      ackPayload = JSON.parse(utf8Decode(b64uToBytes(ackMsg.msg_b64)));
+    } catch (err) {
+      throw new SyncError(ErrorCode.ERR_CRYPTO_SIGNATURE_INVALID, 'malformed Flow 2 direct pipe_ack', { cause: err });
+    }
+    if (ackPayload.op !== 'pipe_ack' || ackPayload.msg_id !== prep.msgId || typeof ackPayload.ack_mac !== 'string') {
+      throw new SyncError(ErrorCode.ERR_CRYPTO_SIGNATURE_INVALID, 'malformed Flow 2 direct pipe_ack');
+    }
+    const ok = await verifyDirectAckMac(sealed.part0Key, prep.msgIdRaw, b64uToBytes(ackPayload.ack_mac));
+    if (!ok) {
+      await closeRoom(client, roomId, roomToken, 'verify_failed');
+      roomToken = null;
+      throw new SyncError(ErrorCode.ERR_CRYPTO_SIGNATURE_INVALID, 'Flow 2 direct ack_mac verification failed');
+    }
+    emit('completed', prep.partsMeta.length - 1, 0, 0);
+    await closeRoom(client, roomId, roomToken, 'completed');
+    roomToken = null;
+    return { mode: 'pipe', roomId, msgId: prep.msgId, totalBytes: prep.declaredTotalBytes };
+  } catch (err) {
+    if (roomToken) {
+      await burnOrCloseRoomOnError(client, roomId, roomToken, err, opts.signal);
+    }
+    throw err;
   }
-  const ok = await verifyDirectAckMac(sealed.part0Key, prep.msgIdRaw, b64uToBytes(ackPayload.ack_mac));
-  if (!ok) {
-    await closeRoom(client, roomId, roomToken, 'verify_failed');
-    throw new SyncError(ErrorCode.ERR_CRYPTO_SIGNATURE_INVALID, 'Flow 2 direct ack_mac verification failed');
-  }
-  await closeRoom(client, roomId, roomToken, 'completed');
-  return { mode: 'pipe', roomId, msgId: prep.msgId, totalBytes: prep.declaredTotalBytes };
 }
 
 /**
@@ -627,7 +974,13 @@ export async function receiveDirectImpl(client, pairInput, handler, opts = {}) {
     await closeRoom(client, roomId, roomToken, 'verify_failed');
     throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'direct room missing initial M1');
   }
-  const m1 = JSON.parse(utf8Decode(b64uToBytes(m1Msg.msg_b64)));
+  let m1;
+  try {
+    m1 = JSON.parse(utf8Decode(b64uToBytes(m1Msg.msg_b64)));
+  } catch (err) {
+    await closeRoom(client, roomId, roomToken, 'verify_failed');
+    throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'malformed direct room M1', { cause: err });
+  }
   if (Number.isInteger(m1.proto_v) && m1.proto_v > PROTO_VERSION) {
     await closeRoom(client, roomId, roomToken, 'verify_failed');
     throw new SyncError(ErrorCode.ERR_UNSUPPORTED_VERSION, `unsupported direct M1 proto_v: ${m1.proto_v}`, {
@@ -645,14 +998,27 @@ export async function receiveDirectJoinedImpl(client, roomId, joined, m1, handle
     throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'invalid direct M1 payload');
   }
 
-  const selfId = await client.getIdentity();
+  const blocksPerChunk = m1.blocks_per_chunk ?? 16;
+  try {
+    assertValidBlocksPerChunk(blocksPerChunk, 'direct M1 blocks_per_chunk');
+  } catch (err) {
+    await closeRoom(client, roomId, roomToken, 'verify_failed');
+    throw err;
+  }
+
+  const [selfId, watermarkSec] = await Promise.all([
+    client.getIdentity(),
+    client._getReplayWatermarkSec(),
+  ]);
   let header;
   try {
     header = await openPaired0RTTHeader({
       sealedHeader: m1.sealed_header,
       recipientKemSk: selfId.kemSk,
       recipientDeviceIdRaw: selfId.deviceIdRaw,
-      hasSeenMsgId: (id) => client.keyStore.hasSeenMsgID(id),
+      nowSec: client._localNowSec(),
+      replayWatermarkSec: watermarkSec,
+      hasSeenMsgId: async (id) => client._inFlightMsgIds.has(id) || (await client.keyStore.hasSeenMsgID(id)),
       lookupSenderCard: (id) => client.keyStore.getDevice(id),
     });
   } catch (err) {
@@ -660,21 +1026,38 @@ export async function receiveDirectJoinedImpl(client, roomId, joined, m1, handle
     throw err;
   }
 
+  if (client._inFlightMsgIds.has(header.msgId)) {
+    zeroBytes(header.part0Key);
+    zeroBytes(header.part0NoncePrefix);
+    await closeRoom(client, roomId, roomToken, 'verify_failed');
+    throw new SyncError(ErrorCode.ERR_MSG_REPLAY_DETECTED, `msg_id is already in flight: ${header.msgId}`);
+  }
+  client._inFlightMsgIds.add(header.msgId);
+
   try {
     const deadlineMs = Date.now() + (opts.timeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS);
     const part0Meta = m1.parts.find((p) => p.part_id === 0);
-    assertValidPart0Layout(part0Meta);
+    assertValidPart0Layout(part0Meta, blocksPerChunk);
+
+    const startMs = Date.now();
+    const totalDeclaredBytes = m1.parts.reduce((acc, p) => acc + (Number.isSafeInteger(p?.total_bytes) ? p.total_bytes : 0), 0);
+    let bytesDone = 0;
 
     const p0Chunks = [];
     let p0Total = 0;
     for (let tx = 0; tx < part0Meta.chunk_count; tx++) {
       const ch = await getPipeChunkWithRetry(client, pipeId, roomToken, 0, tx, deadlineMs, opts.signal);
       p0Total += ch.length;
-      if (p0Total > MAX_ENCRYPTED_MANIFEST_BYTES) {
+      if (p0Total > MAX_ENCRYPTED_MANIFEST_BYTES || p0Total > part0Meta.total_bytes) {
         throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, 'part_id=0 stream exceeded maximum manifest byte budget');
       }
       p0Chunks.push(ch);
+      bytesDone += ch.length;
     }
+    if (p0Total !== part0Meta.total_bytes) {
+      throw new SyncError(ErrorCode.ERR_STREAM_TRUNCATED, 'part_id=0 stream shorter than declared total_bytes');
+    }
+
     const paddedManifest = await decryptPartBytes(header.part0Key, header.part0NoncePrefix, header.msgIdRaw, 0, p0Chunks);
     const manifestUtf8 = unpadManifest(paddedManifest);
     const actualManifestSha = await sha256(manifestUtf8);
@@ -687,31 +1070,93 @@ export async function receiveDirectJoinedImpl(client, roomId, joined, m1, handle
       throw new SyncError(ErrorCode.ERR_CRYPTO_SIGNATURE_INVALID, 'manifest sender/created_at mismatch with SealedHeader');
     }
 
-    const blobs = [];
+    // Validate ALL wire PartLayouts BEFORE downloading any blob chunks (ST-P0-2)
     for (const blobDesc of manifest.blobs) {
       const pm = m1.parts.find((p) => p.part_id === blobDesc.part_id);
       if (!pm) throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, `missing part_id=${blobDesc.part_id}`);
-      blobs.push(await downloadBlobStreaming({
-        blobDesc,
-        chunkCount: pm.chunk_count,
-        msgIdRaw: header.msgIdRaw,
-        getChunkFn: (pid, tx) => getPipeChunkWithRetry(client, pipeId, roomToken, pid, tx, deadlineMs, opts.signal),
-        createBlobSink: opts.createBlobSink,
-      }));
+      assertValidBlobPartLayout(pm, blobDesc, blocksPerChunk);
+    }
+
+    const maxInMemoryBlobBytes = opts.maxInMemoryBlobBytes ?? client._maxInMemoryBlobBytes;
+    const blobs = [];
+    for (const blobDesc of manifest.blobs) {
+      const pm = m1.parts.find((p) => p.part_id === blobDesc.part_id);
+      let partDone = 0;
+      blobs.push(
+        await downloadBlobStreaming({
+          blobDesc,
+          chunkCount: pm.chunk_count,
+          blocksPerChunk,
+          msgIdRaw: header.msgIdRaw,
+          getChunkFn: (pid, tx) => getPipeChunkWithRetry(client, pipeId, roomToken, pid, tx, deadlineMs, opts.signal),
+          createBlobSink: opts.createBlobSink,
+          maxInMemoryBlobBytes,
+          onChunkDone: (_tx, len) => {
+            bytesDone += len;
+            partDone += len;
+            opts.onProgress?.({
+              type: 'event',
+              event: 'transfer_progress',
+              stage: 'transferring',
+              direction: 'recv',
+              mode: 'pipe',
+              msg_id: header.msgId,
+              part_id: blobDesc.part_id,
+              parts_total: m1.parts.length,
+              bytes_done: bytesDone,
+              bytes_total: totalDeclaredBytes,
+              part_bytes_done: partDone,
+              part_bytes_total: pm.total_bytes,
+              speed_bps: calcSpeedBps(bytesDone, startMs),
+              resumed: false,
+              ts: Math.floor(Date.now() / 1000),
+            });
+          },
+        }),
+      );
     }
 
     await handler({ manifest, senderCard: header.senderCard, blobs });
-    await client.keyStore.markSeenMsgID(header.msgId, header.createdAt);
+    await client.keyStore.markSeenMsgID(header.msgId, header.createdAt, client._localNowSec());
 
     const ackMac = await computeDirectAckMac(header.part0Key, header.msgIdRaw);
-    await postRoomMessage(client, roomId, roomToken, 'control', {
-      op: 'pipe_ack',
+    await postRoomMessage(
+      client,
+      roomId,
+      roomToken,
+      'control',
+      {
+        op: 'pipe_ack',
+        msg_id: header.msgId,
+        ack_mac: bytesToB64u(ackMac),
+      },
+      opts.signal,
+    );
+    opts.onProgress?.({
+      type: 'event',
+      event: 'transfer_progress',
+      stage: 'completed',
+      direction: 'recv',
+      mode: 'pipe',
       msg_id: header.msgId,
-      ack_mac: bytesToB64u(ackMac),
-    }, opts.signal);
+      part_id: manifest.blobs.length,
+      parts_total: m1.parts.length,
+      bytes_done: bytesDone,
+      bytes_total: totalDeclaredBytes,
+      part_bytes_done: 0,
+      part_bytes_total: 0,
+      speed_bps: calcSpeedBps(bytesDone, startMs),
+      resumed: false,
+      ts: Math.floor(Date.now() / 1000),
+    });
     // Do NOT close room here: sender closes room after verifying ack_mac (prevents wipe race).
     return manifest;
+  } catch (err) {
+    await burnOrCloseRoomOnError(client, roomId, roomToken, err, opts.signal);
+    throw err;
   } finally {
+    client._inFlightMsgIds.delete(header.msgId);
     zeroBytes(header.part0Key);
+    zeroBytes(header.part0NoncePrefix);
   }
 }
