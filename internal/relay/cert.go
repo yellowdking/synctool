@@ -21,6 +21,11 @@ import (
 	"time"
 )
 
+const (
+	StagedCertFileName = "tls-next.crt"
+	StagedKeyFileName  = "tls-next.key"
+)
+
 type CertBundle struct {
 	TLSCert       tls.Certificate
 	Leaf          *x509.Certificate
@@ -98,10 +103,177 @@ func LoadCertBundle(certPath, keyPath string) (*CertBundle, error) {
 	}, nil
 }
 
-func GenerateSelfSignedCert(publicHosts string, now time.Time, certPath, keyPath string) (*CertBundle, error) {
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+func ReadLeafCert(certPath string) (*x509.Certificate, error) {
+	raw, err := os.ReadFile(certPath)
 	if err != nil {
 		return nil, err
+	}
+	for len(raw) > 0 {
+		var blk *pem.Block
+		blk, raw = pem.Decode(raw)
+		if blk == nil {
+			break
+		}
+		if blk.Type == "CERTIFICATE" {
+			return x509.ParseCertificate(blk.Bytes)
+		}
+	}
+	return nil, fmt.Errorf("no CERTIFICATE PEM block found in %s", certPath)
+}
+
+func LoadECPrivateKey(keyPath string) (*ecdsa.PrivateKey, error) {
+	raw, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, err
+	}
+	defer clear(raw)
+
+	for rest := raw; len(rest) > 0; {
+		var blk *pem.Block
+		blk, rest = pem.Decode(rest)
+		if blk == nil {
+			break
+		}
+		switch blk.Type {
+		case "EC PRIVATE KEY":
+			priv, perr := x509.ParseECPrivateKey(blk.Bytes)
+			if perr != nil {
+				return nil, perr
+			}
+			if priv.Curve != elliptic.P256() {
+				return nil, fmt.Errorf("unsupported ECDSA curve in %s (expected P-256)", keyPath)
+			}
+			return priv, nil
+		case "PRIVATE KEY":
+			pk, perr := x509.ParsePKCS8PrivateKey(blk.Bytes)
+			if perr != nil {
+				return nil, perr
+			}
+			ecPriv, ok := pk.(*ecdsa.PrivateKey)
+			if !ok || ecPriv.Curve != elliptic.P256() {
+				return nil, fmt.Errorf("unsupported PKCS#8 key type in %s (expected ECDSA P-256)", keyPath)
+			}
+			return ecPriv, nil
+		}
+	}
+	return nil, fmt.Errorf("no ECDSA P-256 private key PEM block found in %s", keyPath)
+}
+
+// ExtractCertPublicHosts returns comma-separated non-loopback IPAddresses and non-localhost DNSNames from leaf.
+func ExtractCertPublicHosts(leaf *x509.Certificate) string {
+	if leaf == nil {
+		return ""
+	}
+	var out []string
+	seen := make(map[string]bool)
+	for _, ip := range leaf.IPAddresses {
+		if ip == nil || ip.IsLoopback() {
+			continue
+		}
+		s := ip.String()
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	for _, dns := range leaf.DNSNames {
+		d := strings.ToLower(strings.TrimSpace(dns))
+		if d == "" || d == "localhost" {
+			continue
+		}
+		if !seen[d] {
+			seen[d] = true
+			out = append(out, d)
+		}
+	}
+	return strings.Join(out, ",")
+}
+
+func extractPrimaryHostToken(raw string) string {
+	h := strings.TrimSpace(raw)
+	if h == "" {
+		return ""
+	}
+	if idx := strings.IndexByte(h, ','); idx >= 0 {
+		h = strings.TrimSpace(h[:idx])
+	}
+	if strings.Contains(h, "://") {
+		if u, err := url.Parse(h); err == nil && u.Hostname() != "" {
+			return strings.Trim(u.Hostname(), "[]")
+		}
+	}
+	if hostOnly, _, err := net.SplitHostPort(h); err == nil && hostOnly != "" {
+		h = hostOnly
+	}
+	return strings.Trim(h, "[]")
+}
+
+// ResolveCertServerName derives the TLS SNI / hostname verification target for healthcheck under --tls=cert.
+func ResolveCertServerName(publicHost, listenAddr, certPath string) string {
+	if h := extractPrimaryHostToken(publicHost); h != "" {
+		return h
+	}
+	if certPath != "" {
+		if leaf, err := ReadLeafCert(certPath); err == nil {
+			for _, d := range leaf.DNSNames {
+				d = strings.TrimSpace(d)
+				if d != "" && !strings.EqualFold(d, "localhost") && !strings.HasPrefix(d, "*.") {
+					return d
+				}
+			}
+			for _, d := range leaf.DNSNames {
+				d = strings.TrimSpace(d)
+				if strings.HasPrefix(d, "*.") && len(d) > 2 {
+					return "healthcheck." + d[2:]
+				}
+				if d != "" {
+					return d
+				}
+			}
+			for _, ip := range leaf.IPAddresses {
+				if ip != nil && !ip.IsLoopback() {
+					return ip.String()
+				}
+			}
+			for _, ip := range leaf.IPAddresses {
+				if ip != nil {
+					return ip.String()
+				}
+			}
+			if cn := strings.TrimSpace(leaf.Subject.CommonName); cn != "" && !strings.HasPrefix(cn, "*.") {
+				return cn
+			}
+		}
+	}
+	if host, _, err := net.SplitHostPort(listenAddr); err == nil {
+		trimmed := strings.Trim(host, "[]")
+		if trimmed != "" && trimmed != "0.0.0.0" && trimmed != "::" {
+			return trimmed
+		}
+	}
+	return "localhost"
+}
+
+func GenerateSelfSignedCert(publicHosts string, now time.Time, certPath, keyPath string) (*CertBundle, error) {
+	return GenerateSelfSignedCertWithKey(nil, publicHosts, now, certPath, keyPath)
+}
+
+func GenerateSelfSignedCertWithKey(priv *ecdsa.PrivateKey, publicHosts string, now time.Time, certPath, keyPath string) (*CertBundle, error) {
+	// Inherit non-loopback IP/DNS SANs from existing certificate when publicHosts is omitted.
+	if strings.TrimSpace(publicHosts) == "" && certPath != "" {
+		if oldLeaf, err := ReadLeafCert(certPath); err == nil {
+			publicHosts = ExtractCertPublicHosts(oldLeaf)
+		}
+	}
+
+	var err error
+	if priv == nil {
+		priv, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			return nil, err
+		}
+	} else if priv.Curve != elliptic.P256() {
+		return nil, fmt.Errorf("expected ECDSA P-256 private key")
 	}
 	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serial, err := rand.Int(rand.Reader, serialLimit)
@@ -230,11 +402,97 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 		}
 		return cerr
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
+	var renameErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		if renameErr = os.Rename(tmp, path); renameErr == nil {
+			return nil
+		}
+		time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
 	}
-	return nil
+	_ = os.Remove(tmp)
+	return renameErr
+}
+
+// RotateSelfSignedReuseKey re-signs a fresh 730-day leaf certificate reusing the existing ECDSA P-256 private key
+// so the SPKI SHA-256 pin remains unchanged across routine renewals.
+func RotateSelfSignedReuseKey(publicHosts string, now time.Time, certPath, keyPath string) (*CertBundle, error) {
+	if certPath == "" || keyPath == "" {
+		return nil, fmt.Errorf("certPath and keyPath are required for --reuse-key")
+	}
+	priv, err := LoadECPrivateKey(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("load existing private key %s: %w", keyPath, err)
+	}
+	return GenerateSelfSignedCertWithKey(priv, publicHosts, now, certPath, keyPath)
+}
+
+// StageNextSelfSignedCert generates tls-next.crt and tls-next.key alongside the active cert.pem/key.pem
+// without modifying the active certificate, returning both current and staged bundles for dual-pin rollout.
+func StageNextSelfSignedCert(dataDir, publicHosts string, now time.Time) (current *CertBundle, staged *CertBundle, err error) {
+	if strings.TrimSpace(dataDir) == "" {
+		return nil, nil, fmt.Errorf("data-dir is required for --stage-next")
+	}
+	curCertPath := filepath.Join(dataDir, "cert.pem")
+	curKeyPath := filepath.Join(dataDir, "key.pem")
+	cur, err := LoadCertBundle(curCertPath, curKeyPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load active certificate in %s: %w", dataDir, err)
+	}
+	if strings.TrimSpace(publicHosts) == "" {
+		publicHosts = ExtractCertPublicHosts(cur.Leaf)
+	}
+	nextCertPath := filepath.Join(dataDir, StagedCertFileName)
+	nextKeyPath := filepath.Join(dataDir, StagedKeyFileName)
+	next, err := GenerateSelfSignedCertWithKey(nil, publicHosts, now, nextCertPath, nextKeyPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("generate staged certificate: %w", err)
+	}
+	return cur, next, nil
+}
+
+// PromoteStagedCert validates tls-next.crt/tls-next.key and atomically promotes them to cert.pem/key.pem.
+func PromoteStagedCert(dataDir string, now time.Time) (*CertBundle, error) {
+	if strings.TrimSpace(dataDir) == "" {
+		return nil, fmt.Errorf("data-dir is required for --promote-staged")
+	}
+	nextCertPath := filepath.Join(dataDir, StagedCertFileName)
+	nextKeyPath := filepath.Join(dataDir, StagedKeyFileName)
+	staged, err := LoadCertBundle(nextCertPath, nextKeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("load staged certificate (%s / %s): %w", StagedCertFileName, StagedKeyFileName, err)
+	}
+	if !now.Before(staged.Leaf.NotAfter) {
+		return nil, fmt.Errorf("staged certificate in %s has already expired (%s)", StagedCertFileName, staged.Leaf.NotAfter.UTC().Format(time.RFC3339))
+	}
+
+	nextCertPEM, err := os.ReadFile(nextCertPath)
+	if err != nil {
+		return nil, err
+	}
+	nextKeyPEM, err := os.ReadFile(nextKeyPath)
+	if err != nil {
+		return nil, err
+	}
+	defer clear(nextKeyPEM)
+
+	curCertPath := filepath.Join(dataDir, "cert.pem")
+	curKeyPath := filepath.Join(dataDir, "key.pem")
+	oldKeyPEM, _ := os.ReadFile(curKeyPath)
+	defer clear(oldKeyPEM)
+
+	if err := atomicWriteFile(curKeyPath, nextKeyPEM, 0o600); err != nil {
+		return nil, fmt.Errorf("promote %s -> key.pem: %w", StagedKeyFileName, err)
+	}
+	if err := atomicWriteFile(curCertPath, nextCertPEM, 0o600); err != nil {
+		if len(oldKeyPEM) > 0 {
+			_ = atomicWriteFile(curKeyPath, oldKeyPEM, 0o600)
+		}
+		return nil, fmt.Errorf("promote %s -> cert.pem: %w", StagedCertFileName, err)
+	}
+	_ = os.Remove(nextCertPath)
+	_ = os.Remove(nextKeyPath)
+
+	return LoadCertBundle(curCertPath, curKeyPath)
 }
 
 func SPKISHA256Hex(cert *x509.Certificate) string {
@@ -258,7 +516,29 @@ func (cm *CertManager) RotateSelfSigned(publicHosts string, now time.Time) (*Cer
 	if cm.mode != TLSSelfSigned {
 		return nil, fmt.Errorf("cert-rotate only applies to tls=selfsigned (current: %s)", cm.mode)
 	}
+	if strings.TrimSpace(publicHosts) == "" {
+		if cur := cm.current.Load(); cur != nil && cur.Leaf != nil {
+			publicHosts = ExtractCertPublicHosts(cur.Leaf)
+		}
+	}
 	b, err := GenerateSelfSignedCert(publicHosts, now, cm.certPath, cm.keyPath)
+	if err != nil {
+		return nil, err
+	}
+	cm.current.Store(b)
+	return b, nil
+}
+
+func (cm *CertManager) RotateSelfSignedReuseKey(publicHosts string, now time.Time) (*CertBundle, error) {
+	if cm.mode != TLSSelfSigned {
+		return nil, fmt.Errorf("cert-rotate only applies to tls=selfsigned (current: %s)", cm.mode)
+	}
+	if strings.TrimSpace(publicHosts) == "" {
+		if cur := cm.current.Load(); cur != nil && cur.Leaf != nil {
+			publicHosts = ExtractCertPublicHosts(cur.Leaf)
+		}
+	}
+	b, err := RotateSelfSignedReuseKey(publicHosts, now, cm.certPath, cm.keyPath)
 	if err != nil {
 		return nil, err
 	}
@@ -297,6 +577,7 @@ func (cm *CertManager) TLSConfig() *tls.Config {
 }
 
 // BuildRelayURI formats the canonical synctool://relay onboarding URI.
+// Supports single 64-hex pin or comma-separated multi-pin ("<cur>,<next>").
 // Sensitive access_key is placed strictly in #fragment per spec/PROTOCOL.md §7.4.
 func BuildRelayURI(canonicalOrigin, spkiHex, accessKey string) string {
 	var b strings.Builder
@@ -309,6 +590,11 @@ func BuildRelayURI(canonicalOrigin, spkiHex, accessKey string) string {
 	b.WriteString("#k=")
 	b.WriteString(accessKey)
 	return b.String()
+}
+
+// BuildRedactedRelayURI formats the synctool://relay URI with #k=<redacted> for safe non-secret output.
+func BuildRedactedRelayURI(canonicalOrigin, spkiHex string) string {
+	return BuildRelayURI(canonicalOrigin, spkiHex, "<redacted>")
 }
 
 func CanonicalOrigin(publicHost, listenAddr string, tlsMode TLSMode) string {
