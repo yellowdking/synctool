@@ -655,7 +655,7 @@ Permanently destroys the spooled item after end-to-end verification and local pe
 1. **Docker One-Click (Primary for 512MB+ VPS)**:
    - Multi-arch `FROM scratch` static Go binary (`linux/amd64`, `linux/arm64`, ~6–10 MiB), `USER 65532:65532`, `cap_drop: ALL`, `no-new-privileges:true`, `read_only: true` rootfs (mount named volume `synctool_data:/data` for persisted certs/key and `spool=disk`, `mem_limit: 256m`, `SYNCTOOL_PROFILE=standard`).
    - Docker `HEALTHCHECK` invokes `synctool-relay healthcheck` (no `curl`/`wget` needed in `scratch`; supports both `selfsigned` SPKI pinning and `cert` SNI derivation).
-   - CI publishes canonical multi-arch images to **GHCR (`ghcr.io/yellowdking/synctool`)**, plus SHA-256-verified standalone static binaries (`linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, `windows/arm64`) on **GitHub Releases**.
+   - CI publishes canonical multi-arch images to **Docker Hub (`bbplin/synctool`)**, plus SHA-256-verified standalone static binaries (`linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, `windows/arm64`) on **GitHub Releases**.
 2. **Standalone Static Binary + `systemd` Unit (For 256MB Low-RAM VPS)**:
    - Avoids `dockerd`/`containerd`'s 80–120 MiB RAM tax, verifying downloaded binaries against `SHA256SUMS.txt`.
    - Reference `systemd` unit aligns `MemoryMax` by tier (`256M` `nano`, `384M` `standard`, `1024M` `media`), `User=synctool`, `ProtectSystem=strict`, `NoNewPrivileges=yes`, keeping idle RSS **`< 15 MiB`**.
