@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Optional SemVer override (e.g. 0.1.0); defaults to VERSION file"
+        description: "Optional SemVer override (e.g. 0.3.0); defaults to VERSION file"
         required: false
         type: string
 
@@ -20,14 +20,79 @@ permissions:
   packages: write
 
 jobs:
+  verify:
+    name: Verify Go, TS & Kotlin Test Suites + Tag Version Gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify git tag matches VERSION file
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG_VER="${GITHUB_REF_NAME#v}"
+            if [[ ! -f VERSION ]]; then
+              echo "ERROR: VERSION file is missing" >&2
+              exit 1
+            fi
+            FILE_VER="$(tr -d '[:space:]' < VERSION)"
+            FILE_VER="${FILE_VER#v}"
+            if [[ "${TAG_VER}" != "${FILE_VER}" ]]; then
+              echo "ERROR: pushed tag '${GITHUB_REF_NAME}' (${TAG_VER}) does not match VERSION (${FILE_VER})" >&2
+              exit 1
+            fi
+          fi
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Verify zero third-party Go dependencies, vet & race tests
+        run: |
+          if grep -E '^\s*require\b' go.mod; then
+            echo "ERROR: go.mod must have zero third-party dependencies"
+            exit 1
+          fi
+          go vet ./...
+          go test -race -count=1 ./...
+
+      - name: Run TypeScript / WebCrypto SDK tests
+        working-directory: sdk/ts
+        run: node --test test/*.test.mjs
+
+      - name: Run Kotlin SDK tests & live Go Relay E2E
+        run: |
+          gradle -p sdk/kotlin test --info
+          go build -o /tmp/synctool-relay-e2e ./cmd/synctool-relay
+          SYNCTOOL_RELAY_BIN=/tmp/synctool-relay-e2e gradle -p sdk/kotlin test --tests "*CrossLangRelayE2ETest*" --rerun-tasks --info
+
   prepare:
     name: Prepare Release Tag & Metadata
+    needs: [verify]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
+      commit: ${{ steps.meta.outputs.commit }}
       should_release: ${{ steps.meta.outputs.should_release }}
       image_name: ${{ steps.meta.outputs.image_name }}
       image_tags: ${{ steps.meta.outputs.image_tags }}
@@ -48,6 +113,7 @@ jobs:
           SHOULD_RELEASE="false"
           TAG=""
           VER=""
+          SHORT_COMMIT="${GITHUB_SHA::8}"
 
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             TAG="${GITHUB_REF_NAME}"
@@ -78,6 +144,7 @@ jobs:
               echo "Tag ${TAG} already exists on origin; skipping idempotently."
               echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
               echo "version=${VER}" >> "${GITHUB_OUTPUT}"
+              echo "commit=${SHORT_COMMIT}" >> "${GITHUB_OUTPUT}"
               echo "should_release=false" >> "${GITHUB_OUTPUT}"
               exit 0
             fi
@@ -102,6 +169,7 @@ jobs:
 
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
           echo "version=${VER}" >> "${GITHUB_OUTPUT}"
+          echo "commit=${SHORT_COMMIT}" >> "${GITHUB_OUTPUT}"
           echo "should_release=${SHOULD_RELEASE}" >> "${GITHUB_OUTPUT}"
           echo "image_name=${IMAGE_NAME}" >> "${GITHUB_OUTPUT}"
           echo "image_tags=${TAGS}" >> "${GITHUB_OUTPUT}"
@@ -131,7 +199,7 @@ jobs:
           COMMIT="${GITHUB_SHA::8}"
           LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}"
 
-          for target in "linux/amd64" "linux/arm64" "darwin/amd64" "darwin/arm64" "windows/amd64"; do
+          for target in "linux/amd64" "linux/arm64" "darwin/amd64" "darwin/arm64" "windows/amd64" "windows/arm64"; do
             GOOS="${target%/*}"
             GOARCH="${target#*/}"
             EXT=""
@@ -195,4 +263,4 @@ jobs:
             org.opencontainers.image.licenses=MIT
           build-args: |
             VERSION=${{ needs.prepare.outputs.tag }}
-            COMMIT=${{ github.sha }}
+            COMMIT=${{ needs.prepare.outputs.commit }}
