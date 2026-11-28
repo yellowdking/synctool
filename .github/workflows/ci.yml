@@ -117,17 +117,40 @@ jobs:
           done
 
       - name: Build Go binaries & run Swift SDK tests (01..07 vectors + live Relay/CLI E2E)
+        shell: bash
         run: |
-          swift build
+          emit_diag() {
+            python3 - "$1" "$2" <<'PY'
+          import pathlib, sys
+          label, p = sys.argv[1], pathlib.Path(sys.argv[2])
+          if p.is_file():
+              lines = [l.strip() for l in p.read_text(errors="replace").splitlines() if l.strip()]
+              errs = [l for l in lines if any(k in l for k in ("error:", "Error:", "FAIL", "fatal", "XCTAssert", "failed"))]
+              chosen = (errs[-40:] + lines[-20:]) if errs else lines[-45:]
+              for i in range(0, len(chosen), 7):
+                  print(f"::error title={label}_{i}::{' || '.join(chosen[i:i+7])[:3500]}")
+          PY
+          }
+          set -o pipefail
+          if ! swift build 2>&1 | tee /tmp/swift-root.log; then
+            emit_diag "SWIFT_ROOT_BUILD" /tmp/swift-root.log
+            exit 1
+          fi
           go build -o /tmp/synctool-relay-e2e ./cmd/synctool-relay
           go build -o /tmp/synctool-cli-e2e ./cmd/synctool
-          SYNCTOOL_RELAY_BIN=/tmp/synctool-relay-e2e \
-          SYNCTOOL_CLI_BIN=/tmp/synctool-cli-e2e \
-          swift test --package-path sdk/swift
+          if ! SYNCTOOL_RELAY_BIN=/tmp/synctool-relay-e2e SYNCTOOL_CLI_BIN=/tmp/synctool-cli-e2e swift test --package-path sdk/swift 2>&1 | tee /tmp/swift-test.log; then
+            emit_diag "SWIFT_TEST" /tmp/swift-test.log
+            exit 1
+          fi
 
       - name: Build SyncToolSDK for iOS Simulator
+        shell: bash
         run: |
-          (cd sdk/swift && xcodebuild build -scheme SyncToolSDK -destination "generic/platform=iOS Simulator" CODE_SIGNING_ALLOWED=NO -quiet)
+          set -o pipefail
+          if ! (cd sdk/swift && xcodebuild build -scheme SyncToolSDK -destination "generic/platform=iOS Simulator" CODE_SIGNING_ALLOWED=NO) 2>&1 | tee /tmp/swift-ios-sim.log; then
+            python3 -c 'import pathlib; lines=[l.strip() for l in pathlib.Path("/tmp/swift-ios-sim.log").read_text(errors="replace").splitlines() if "error:" in l or "failed" in l.lower()][-35:]; [print(f"::error title=IOS_SIM_{i}::" + " || ".join(lines[i:i+7])[:3500]) for i in range(0,len(lines),7)]'
+            exit 1
+          fi
 
   cross-lang-e2e:
     name: Cross-Language E2E (Go <-> Relay <-> TS <-> Kotlin)

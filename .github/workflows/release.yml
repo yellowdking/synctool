@@ -109,7 +109,9 @@ jobs:
           done
 
       - name: Build Go binaries & run Swift SDK tests + live Relay/CLI E2E
+        shell: bash
         run: |
+          set -o pipefail
           swift build
           go build -o /tmp/synctool-relay-e2e ./cmd/synctool-relay
           go build -o /tmp/synctool-cli-e2e ./cmd/synctool
@@ -118,8 +120,9 @@ jobs:
           swift test --package-path sdk/swift
 
       - name: Build SyncToolSDK for iOS Simulator
+        shell: bash
         run: |
-          (cd sdk/swift && xcodebuild build -scheme SyncToolSDK -destination "generic/platform=iOS Simulator" CODE_SIGNING_ALLOWED=NO -quiet)
+          (cd sdk/swift && xcodebuild build -scheme SyncToolSDK -destination "generic/platform=iOS Simulator" CODE_SIGNING_ALLOWED=NO)
 
   prepare:
     name: Prepare Release Tag & Metadata
