@@ -166,3 +166,133 @@ func TestReceivedBlobSaveToDirAndEnvHelpers(t *testing.T) {
 		t.Fatalf("RelayProfileFromEnv failed: %+v %v", prof, err)
 	}
 }
+
+func TestMultiPinSPKIURIRoundTripAndStrictPairValidation(t *testing.T) {
+	pin1 := strings.Repeat("a", 64)
+	pin2 := strings.Repeat("b", 64)
+	key := strings.Repeat("K", 43)
+
+	// Uppercase & whitespace in comma-separated pins normalize to lowercase and sync SPKIPins[0] <-> SPKISHA256 / SPKIPin.
+	rawRelay := "synctool://relay?v=1&u=https%3A%2F%2F1.2.3.4%3A54843&pin=" + strings.ToUpper(pin1) + ",%20" + pin2 + "#k=" + key
+	prof, err := ParseRelayURI(rawRelay)
+	if err != nil {
+		t.Fatalf("ParseRelayURI multi-pin failed: %v", err)
+	}
+	if len(prof.SPKIPins) != 2 || prof.SPKIPins[0] != pin1 || prof.SPKIPins[1] != pin2 || prof.SPKISHA256 != pin1 || prof.SPKIPin != pin1 {
+		t.Fatalf("unexpected multi-pin RelayProfile: %+v", prof)
+	}
+	formatted, err := FormatRelayURI(prof)
+	if err != nil || !strings.Contains(formatted, "&pin="+pin1+","+pin2+"#k=") {
+		t.Fatalf("FormatRelayURI multi-pin mismatch: %q err=%v", formatted, err)
+	}
+
+	// 9 pins (> MaxSPKIPins=8) MUST fail.
+	nine := make([]string, 9)
+	for i := range nine {
+		nine[i] = strings.Repeat(string(rune('0'+i)), 64)
+	}
+	if _, err := ParseRelayURI("synctool://relay?v=1&u=https%3A%2F%2F1.2.3.4%3A54843&pin=" + strings.Join(nine, ",") + "#k=" + key); !IsCode(err, ErrCodeURIInvalid) {
+		t.Fatalf("expected >8 pins to fail with ERR_URI_INVALID, got %v", err)
+	}
+	if _, err := ParseRelayURI("synctool://relay?v=1&u=https%3A%2F%2Frelay.example.com%3A443&pin=#k=" + key); !IsCode(err, ErrCodeURIInvalid) {
+		t.Fatalf("expected empty pin= to fail, got %v", err)
+	}
+
+	// PairURI multi-pin round-trip + strict bare-IP, orphan-pin, exp<=0, and short #k= checks.
+	pairStr, err := FormatPairURI(&PairOffer{
+		RoomID:    "K7M9P2XQ",
+		Mode:      2,
+		Purpose:   "pair",
+		Endpoint:  "https://1.2.3.4:54843",
+		SPKIPins:  []string{pin1, pin2},
+		ExpiresAt: 1764246000,
+		AccessKey: key,
+	})
+	if err != nil {
+		t.Fatalf("FormatPairURI multi-pin: %v", err)
+	}
+	po, err := ParsePairURI(pairStr)
+	if err != nil || len(po.SPKIPins) != 2 || po.SPKISHA256 != pin1 || po.SPKIPin != pin1 {
+		t.Fatalf("ParsePairURI multi-pin: %+v err=%v", po, err)
+	}
+	if _, err := FormatPairURI(&PairOffer{RoomID: "K7M9P2XQ", Mode: 2, Purpose: "pair", Endpoint: "https://1.2.3.4:54843"}); !IsCode(err, ErrCodeURIInvalid) {
+		t.Fatalf("expected FormatPairURI bare IP without pin to fail, got %v", err)
+	}
+	if _, err := ParsePairURI("synctool://pair?r=K7M9P2XQ&m=2&p=pair&pin=" + pin1); !IsCode(err, ErrCodeURIInvalid) {
+		t.Fatalf("expected ParsePairURI orphan pin without u to fail, got %v", err)
+	}
+	if _, err := ParsePairURI("synctool://pair?r=K7M9P2XQ&m=2&p=pair&exp=0"); !IsCode(err, ErrCodeURIInvalid) {
+		t.Fatalf("expected ParsePairURI exp=0 to fail, got %v", err)
+	}
+}
+
+func TestFullRedactionDetailsCauseAndKeyStoreSealing(t *testing.T) {
+	// 1. Full redaction of multi-param fragments, uppercase #K=, query ?k=/&s=, Details, and Cause.
+	msg := "err #s=SEC_ONE&k=SEC_TWO and #K=SEC_THREE and https://admin:SEC_PW@host:443/p?k=SEC_QK&x=1#SEC_F"
+	red := RedactMessage(msg)
+	if strings.Contains(red, "SEC_") {
+		t.Fatalf("RedactMessage leaked secret: %q", red)
+	}
+	se := NewError(ErrCodeURIInvalid, false, 0, "ok", map[string]any{
+		"nested": map[string]any{"uri": "synctool://relay?v=1&k=SEC_DET_Q#k=SEC_DET_F"},
+	})
+	nested := se.Details["nested"].(map[string]any)["uri"].(string)
+	if strings.Contains(nested, "SEC_DET") {
+		t.Fatalf("NewError failed to redact Details: %q", nested)
+	}
+	we := WrapError(ErrCodeURIInvalid, false, 0, "failed", errors.New("raw #k=SEC_CAUSE_KEY"))
+	if strings.Contains(errors.Unwrap(we).Error(), "SEC_CAUSE_KEY") {
+		t.Fatalf("WrapError Unwrap leaked secret: %q", errors.Unwrap(we).Error())
+	}
+
+	// 2. CONIN$ / CONOUT$ reserved Windows console stems.
+	for _, in := range []string{"CONIN$", "conout$.log"} {
+		if got := SanitizeFilename(in); !strings.HasPrefix(got, "_") {
+			t.Fatalf("expected %q to be prefixed with '_', got %q", in, got)
+		}
+	}
+
+	// 3. FileKeyStore LocalMetaKey AES-256-GCM sealing for ManifestCache on disk!
+	ksDir := t.TempDir()
+	ks, err := NewFileKeyStore(ksDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ks.LoadOrCreateMasterSeed(); err != nil {
+		t.Fatal(err)
+	}
+	err = ks.PutCachedManifest(CachedManifestEntry{
+		ItemID:         "itm_test1",
+		CachedAt:       1764246000,
+		ExpiresAt:      1764249600,
+		ManifestSHA256: strings.Repeat("f", 64),
+		Manifest: Manifest{
+			EnvelopeVersion: 1,
+			MsgID:           strings.Repeat("1", 32),
+			AppID:           "com.yellowdking.notes",
+			Schema:          "note.v1",
+			CreatedAt:       1764246000,
+			Sender:          SenderInfo{DeviceID: strings.Repeat("2", 32), Label: "SecretLabel"},
+			InlinePayload:   map[string]any{"secret_note": "PLAINTEXT_MUST_NOT_APPEAR_ON_DISK"},
+			Blobs:           []BlobDescriptor{},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawDisk, err := os.ReadFile(filepath.Join(ksDir, "keystore.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rawDisk), "PLAINTEXT_MUST_NOT_APPEAR_ON_DISK") || strings.Contains(string(rawDisk), "SecretLabel") {
+		t.Fatalf("CachedManifestEntry leaked plaintext Manifest onto disk: %s", string(rawDisk))
+	}
+	ksReopen, err := NewFileKeyStore(ksDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotCached, err := ksReopen.GetCachedManifest("itm_test1")
+	if err != nil || gotCached == nil || gotCached.Manifest.InlinePayload["secret_note"] != "PLAINTEXT_MUST_NOT_APPEAR_ON_DISK" {
+		t.Fatalf("failed to decrypt sealed cached manifest on reopen: %+v err=%v", gotCached, err)
+	}
+}
