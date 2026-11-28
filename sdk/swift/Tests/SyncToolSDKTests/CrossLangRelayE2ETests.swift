@@ -410,53 +410,63 @@ final class CrossLangRelayE2ETests: XCTestCase {
             let cliCfg = dir.appendingPathComponent("cli-cfg", isDirectory: true)
             try FileManager.default.createDirectory(at: cliCfg, withIntermediateDirectories: true)
 
+            var env = ProcessInfo.processInfo.environment
+            env["SYNCTOOL_RELAY"] = relayUri
+
+            let cliInit = Process()
+            cliInit.executableURL = URL(fileURLWithPath: cliBin)
+            cliInit.arguments = ["--json", "--config", cliCfg.path, "init", "--label", "GoCLI-Sender"]
+            cliInit.environment = env
+            let cliInitPipe = Pipe()
+            cliInit.standardOutput = cliInitPipe
+            cliInit.standardError = cliInitPipe
+            try cliInit.run()
+            let cliInitData = cliInitPipe.fileHandleForReading.readDataToEndOfFile()
+            cliInit.waitUntilExit()
+            XCTAssertEqual(0, cliInit.terminationStatus, "synctool CLI init failed: \(Redact.message(String(decoding: cliInitData, as: UTF8.self)))")
+
+            let cliOutFile = dir.appendingPathComponent("cli_stdout.ndjson")
+            let cliErrFile = dir.appendingPathComponent("cli_stderr.log")
+            try Data().write(to: cliOutFile)
+            try Data().write(to: cliErrFile)
+            let outFH = try FileHandle(forWritingTo: cliOutFile)
+            let errFH = try FileHandle(forWritingTo: cliErrFile)
+            defer {
+                try? outFH.close()
+                try? errFH.close()
+            }
+
             let cliProc = Process()
             cliProc.executableURL = URL(fileURLWithPath: cliBin)
             cliProc.arguments = ["--json", "--config", cliCfg.path, "--app", "com.yellowdking.gravityssh", "send", "--oneshot", "--mode", "qr", "--file", "\(cliFile.path):note"]
-            var env = ProcessInfo.processInfo.environment
-            env["SYNCTOOL_RELAY"] = relayUri
             cliProc.environment = env
-            let outPipe = Pipe()
-            let errPipe = Pipe()
-            cliProc.standardOutput = outPipe
-            cliProc.standardError = errPipe
+            cliProc.standardOutput = outFH
+            cliProc.standardError = errFH
             try cliProc.run()
-            try? outPipe.fileHandleForWriting.close()
-            try? errPipe.fileHandleForWriting.close()
             defer { if cliProc.isRunning { cliProc.terminate() } }
 
-            let uriSig = AsyncSignal<String>()
-            let readHandle = outPipe.fileHandleForReading
-            Task.detached {
-                var buf = Data()
-                var scratch = [UInt8](repeating: 0, count: 1024)
-                while true {
-                    let n = withExtendedLifetime(readHandle) {
-                        scratch.withUnsafeMutableBytes { ptr in
-                            Darwin.read(readHandle.fileDescriptor, ptr.baseAddress, ptr.count)
-                        }
-                    }
-                    if n < 0 && errno == EINTR { continue }
-                    if n <= 0 { break }
-                    buf.append(contentsOf: scratch[0..<n])
-                    while let nl = buf.firstIndex(of: 0x0A) {
-                        let line = Data(buf[..<nl])
-                        buf.removeSubrange(...nl)
-                        if let obj = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
+            var cliPairUri = ""
+            for _ in 0..<200 {
+                let rawOut = (try? Data(contentsOf: cliOutFile)) ?? Data()
+                if let lastNL = rawOut.lastIndex(of: 0x0A) {
+                    let completeSlice = rawOut[...lastNL]
+                    for lineSlice in completeSlice.split(separator: 0x0A) {
+                        if let obj = (try? JSONSerialization.jsonObject(with: Data(lineSlice))) as? [String: Any],
                            (obj["event"] as? String) == "offer_ready",
                            let pairUri = obj["pair_uri"] as? String {
-                            await uriSig.complete(pairUri)
+                            cliPairUri = pairUri
+                            break
                         }
                     }
                 }
-                await uriSig.complete("")
+                if !cliPairUri.isEmpty || !cliProc.isRunning { break }
+                try await Task.sleep(nanoseconds: 50_000_000)
             }
-            let cliPairUri = try await uriSig.wait()
             if cliPairUri.isEmpty {
                 cliProc.waitUntilExit()
-                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-                let errText = Redact.message(String(decoding: errData, as: UTF8.self))
-                XCTFail("synctool CLI exited without offer_ready (status=\(cliProc.terminationStatus)): \(errText)")
+                let outText = Redact.message(String(decoding: (try? Data(contentsOf: cliOutFile)) ?? Data(), as: UTF8.self))
+                let errText = Redact.message(String(decoding: (try? Data(contentsOf: cliErrFile)) ?? Data(), as: UTF8.self))
+                XCTFail("synctool CLI exited without offer_ready (status=\(cliProc.terminationStatus)) stdout=\(outText) stderr=\(errText)")
                 return
             }
             let fromGoCli = try await receiver.receiveOneShot(pairInput: cliPairUri)
