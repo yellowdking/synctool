@@ -40,11 +40,12 @@ const (
 )
 
 var (
-	ErrStreamTruncated  = errors.New("stream truncated: missing authenticated final block")
-	ErrStreamTooLarge   = errors.New("stream exceeds maximum 2^32 block limit")
-	ErrInvalidPadding   = errors.New("invalid manifest 4 KiB padding")
-	ErrInvalidBlockSize = errors.New("invalid ciphertext block length")
-	ErrInvalidPartID    = errors.New("part_id out of range 0..63")
+	ErrStreamTruncated   = errors.New("stream truncated: missing authenticated final block")
+	ErrStreamTooLarge    = errors.New("stream exceeds maximum 2^32 block limit")
+	ErrInvalidPadding    = errors.New("invalid manifest 4 KiB padding")
+	ErrInvalidBlockSize  = errors.New("invalid ciphertext block length")
+	ErrInvalidPartID     = errors.New("part_id out of range 0..63")
+	ErrIntegrityMismatch = errors.New("stream integrity mismatch: trailing or out-of-bounds data")
 )
 
 // DeriveBlobPartKeys derives per-blob (enc_key, nonce_prefix) for part_id >= 1 per CRYPTO_AND_AUTH.md §6.2:
