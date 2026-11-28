@@ -207,8 +207,12 @@ public struct RelayProfile: Codable, Sendable, Equatable, CustomStringConvertibl
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        let ep = (try c.decodeIfPresent(String.self, forKey: .endpoint)) ?? (try c.decodeIfPresent(String.self, forKey: .origin)) ?? ""
-        let merged = Self.mergePins(try c.decodeIfPresent([String].self, forKey: .spkiPins) ?? [], try c.decodeIfPresent(String.self, forKey: .legacySpkiSha256) ?? "")
+        let epPrimary = try c.decodeIfPresent(String.self, forKey: .endpoint)
+        let epFallback = try c.decodeIfPresent(String.self, forKey: .origin)
+        let ep = epPrimary ?? epFallback ?? ""
+        let rawPins = try c.decodeIfPresent([String].self, forKey: .spkiPins) ?? []
+        let rawLegacy = try c.decodeIfPresent(String.self, forKey: .legacySpkiSha256) ?? ""
+        let merged = Self.mergePins(rawPins, rawLegacy)
         self.relayId = try c.decodeIfPresent(String.self, forKey: .relayId) ?? ""
         self.alias = try c.decodeIfPresent(String.self, forKey: .alias) ?? ""
         self.endpoint = ep; self.accessKey = try c.decodeIfPresent(String.self, forKey: .accessKey) ?? ""
@@ -355,7 +359,10 @@ public struct PairBindPayload: Codable, Sendable, Equatable {
 }
 
 public struct PipeStartPayload: Codable, Sendable, Equatable {
-    public var op: String = "pipe_start", msgId: String, blocksPerChunk: Int, parts: [PartLayout]
+    public var op: String = "pipe_start"
+    public var msgId: String
+    public var blocksPerChunk: Int
+    public var parts: [PartLayout]
     enum CodingKeys: String, CodingKey { case op, msgId = "msg_id", blocksPerChunk = "blocks_per_chunk", parts }
     public init(op: String = "pipe_start", msgId: String, blocksPerChunk: Int, parts: [PartLayout]) {
         self.op = op; self.msgId = msgId; self.blocksPerChunk = blocksPerChunk; self.parts = parts
@@ -363,7 +370,9 @@ public struct PipeStartPayload: Codable, Sendable, Equatable {
 }
 
 public struct PipeAckPayload: Codable, Sendable, Equatable {
-    public var op: String = "pipe_ack", msgId: String, ackMac: String?
+    public var op: String = "pipe_ack"
+    public var msgId: String
+    public var ackMac: String?
     enum CodingKeys: String, CodingKey { case op, msgId = "msg_id", ackMac = "ack_mac" }
     public init(op: String = "pipe_ack", msgId: String, ackMac: String? = nil) {
         self.op = op; self.msgId = msgId; self.ackMac = ackMac
@@ -371,8 +380,12 @@ public struct PipeAckPayload: Codable, Sendable, Equatable {
 }
 
 public struct DirectRoomInitPayload: Codable, Sendable, Equatable {
-    public var protoV: Int = 1, mode: Int = 0, purpose: String = "direct"
-    public var sealedHeader: String, blocksPerChunk: Int, parts: [PartLayout]
+    public var protoV: Int = 1
+    public var mode: Int = 0
+    public var purpose: String = "direct"
+    public var sealedHeader: String
+    public var blocksPerChunk: Int
+    public var parts: [PartLayout]
     enum CodingKeys: String, CodingKey {
         case protoV = "proto_v", mode, purpose, sealedHeader = "sealed_header", blocksPerChunk = "blocks_per_chunk", parts
     }
@@ -382,7 +395,8 @@ public struct DirectRoomInitPayload: Codable, Sendable, Equatable {
 }
 
 public struct TransferEvent: Codable, Sendable, Equatable {
-    public var type: String = "event", event: String = "transfer_progress"
+    public var type: String = "event"
+    public var event: String = "transfer_progress"
     public var stage: String, direction: String, mode: String, msgId: String
     public var partId: Int, partsTotal: Int
     public var bytesDone: Int64, bytesTotal: Int64, partBytesDone: Int64, partBytesTotal: Int64, speedBps: Int64
