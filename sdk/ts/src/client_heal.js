@@ -31,24 +31,60 @@ export async function resolveDeviceCard(keyStore, query) {
   throw new SyncError(ErrorCode.ERR_DEVICE_UNTRUSTED, `target device not found or untrusted: "${q}"`);
 }
 
+async function tryDeleteRelayToken(client, mailboxId, tokenId, signal) {
+  try {
+    await client._signedRequest({
+      method: 'DELETE',
+      path: `/v1/mailboxes/${mailboxId}/deposit-tokens/${tokenId}`,
+      signMailbox: true,
+      mailboxId,
+      signal,
+    });
+    return true;
+  } catch (err) {
+    if (err instanceof SyncError && (err.code === ErrorCode.ERR_NOT_FOUND || err.code === ErrorCode.ERR_SPOOL_DISABLED)) {
+      return true;
+    }
+    return false;
+  }
+}
+
 /**
- * Idempotently register this device's blinded mailbox and restore all active per-peer deposit token hashes
- * from KeyStore (1-RTT atomic restore on v1.1+ relays, with per-token POST fallback for v1.0 relays/mocks).
+ * Idempotently register this device's blinded mailbox, flush any pending 2-phase revoked/superseded
+ * deposit tokens (ST-P1-8), and restore all active per-peer deposit token hashes from KeyStore.
+ * Gracefully returns `{ registered: false }` on `403 ERR_SPOOL_DISABLED` (`--spool=off`) unless `opts.strict === true`.
  */
 export async function syncMailboxImpl(client, opts = {}) {
-  const [mb, relayId, cards] = await Promise.all([
+  const [mb, relayId] = await Promise.all([
     client.getMailboxIdentity(),
     client.getRelayId(),
-    client.keyStore.listDevices(),
   ]);
+  const allCards = await client.keyStore.listDevices({ includeRevoked: true });
 
+  // Backfill missing relay_id on active cards (ST-Opt-8) and collect active deposit_tokens + pending deletes (ST-P1-8)
   const specs = [];
   const seenIds = new Set();
-  for (const card of cards) {
-    if (card.revoked || !card.inbound_token_id || typeof card.inbound_token_hash !== 'string' || card.inbound_token_hash.length !== 64) {
+  const revokedCards = [];
+  const cardsWithStaleTokens = [];
+
+  for (const card of allCards) {
+    if (card.revoked) {
+      revokedCards.push(card);
       continue;
     }
-    if (card.relay_id && card.relay_id !== relayId) continue;
+    let effectiveRelayId = card.relay_id;
+    if (!effectiveRelayId) {
+      effectiveRelayId = relayId;
+      await client.keyStore.putDevice({ ...card, relay_id: relayId }).catch(() => {});
+    }
+    if (effectiveRelayId !== relayId) continue;
+
+    if (Array.isArray(card.stale_inbound_token_ids) && card.stale_inbound_token_ids.length > 0) {
+      cardsWithStaleTokens.push(card);
+    }
+    if (!card.inbound_token_id || typeof card.inbound_token_hash !== 'string' || card.inbound_token_hash.length !== 64) {
+      continue;
+    }
     if (seenIds.has(card.inbound_token_id)) continue;
     seenIds.add(card.inbound_token_id);
     specs.push({
@@ -73,7 +109,7 @@ export async function syncMailboxImpl(client, opts = {}) {
     });
     regData = await res.json();
   } catch (err) {
-    if (!opts.throwOnDisabled && err instanceof SyncError && err.code === ErrorCode.ERR_SPOOL_DISABLED) {
+    if (!opts.strict && err instanceof SyncError && err.code === ErrorCode.ERR_SPOOL_DISABLED) {
       return { mailbox_id: mb.mailboxId, registered: false, deposit_token_count: 0 };
     }
     throw err;
@@ -98,6 +134,39 @@ export async function syncMailboxImpl(client, opts = {}) {
     }
     regData = { ...regData, deposit_token_count: Math.max(regData?.deposit_token_count ?? 0, specs.length) };
   }
+
+  // Retry pending 2-phase revoked device token deletions (ST-P1-8)
+  for (const rev of revokedCards) {
+    if (rev.relay_id && rev.relay_id !== relayId) continue;
+    const tokList = [
+      ...(rev.inbound_token_id ? [rev.inbound_token_id] : []),
+      ...(Array.isArray(rev.stale_inbound_token_ids) ? rev.stale_inbound_token_ids : []),
+    ];
+    let allCleaned = true;
+    for (const tokId of tokList) {
+      const ok = await tryDeleteRelayToken(client, mb.mailboxId, tokId, opts.signal);
+      if (!ok) allCleaned = false;
+    }
+    if (allCleaned) {
+      await client.keyStore.deleteDevice(rev.device_id).catch(() => {});
+    }
+  }
+
+  // Retry cleanup of superseded tokens from re-paired active devices (ST-P1-8)
+  for (const card of cardsWithStaleTokens) {
+    const remaining = [];
+    for (const tokId of card.stale_inbound_token_ids) {
+      const ok = await tryDeleteRelayToken(client, mb.mailboxId, tokId, opts.signal);
+      if (!ok) remaining.push(tokId);
+    }
+    if (remaining.length !== card.stale_inbound_token_ids.length) {
+      const updated = { ...card };
+      if (remaining.length > 0) updated.stale_inbound_token_ids = remaining;
+      else delete updated.stale_inbound_token_ids;
+      await client.keyStore.putDevice(updated).catch(() => {});
+    }
+  }
+
   return regData;
 }
 
@@ -128,7 +197,13 @@ export async function receiveFromRoomImpl(client, pairInput, handler, opts = {})
   const roomToken = joined.receiver_token;
   const m1Msg = (joined.messages || []).find((m) => m.from === 'sender' && m.kind === 'handshake');
   if (m1Msg) {
-    const m1 = JSON.parse(utf8Decode(b64uToBytes(m1Msg.msg_b64)));
+    let m1;
+    try {
+      m1 = JSON.parse(utf8Decode(b64uToBytes(m1Msg.msg_b64)));
+    } catch (err) {
+      await closeRoom(client, parsed.roomId, roomToken, 'verify_failed');
+      throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'malformed room M1 payload', { cause: err });
+    }
     if (Number.isInteger(m1.proto_v) && m1.proto_v > PROTO_VERSION) {
       await closeRoom(client, parsed.roomId, roomToken, 'verify_failed');
       throw new SyncError(ErrorCode.ERR_UNSUPPORTED_VERSION, `unsupported room M1 proto_v: ${m1.proto_v}`, {
