@@ -108,7 +108,7 @@ Key Flags (env SYNCTOOL_* also supported):
 cert-rotate Flags:
   --reuse-key          Re-sign fresh 730-day cert reusing existing P-256 key (SPKI pin unchanged)
   --stage-next         Stage tls-next.crt / tls-next.key and output dual-pin URI (pin=<cur>,<next>)
-  --promote-staged     Atomically promote staged tls-next.crt/key to active cert.pem / key.pem
+  --promote-staged     Atomically promote staged tls-next.crt / tls-next.key to cert.pem / key.pem
   --print-uri          Include #k= onboarding URI in stdout (default true; false prints #k=<redacted>)`)
 }
 
