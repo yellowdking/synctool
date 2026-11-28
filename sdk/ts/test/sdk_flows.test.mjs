@@ -23,7 +23,7 @@ import {
 test('SyncClient handles 409 ERR_CLOCK_SKEW auto-retry, cert expiry event, Mode B two-phase pull + cache + ACK burn', async () => {
   const accessKey = 'K'.repeat(43);
   const relayOrigin = 'https://sync.example.com:443';
-  const serverNow = 1764246000;
+  const serverNow = Math.floor(Date.now() / 1000) - 3600;
   let skewTriggered = false;
   let part0GetCount = 0;
 
@@ -228,7 +228,7 @@ test('SyncClient handles 409 ERR_CLOCK_SKEW auto-retry, cert expiry event, Mode 
 test('SyncClient full room & Mode A flows: Flow 1A/1B bind (--spool=off), OneShot pipe, Flow 2 direct pipe & Mode B resume', async () => {
   const accessKey = 'M'.repeat(43);
   const relayOrigin = 'https://sync.example.com:443';
-  const serverNow = 1764246000;
+  const serverNow = Math.floor(Date.now() / 1000) - 3600;
   let spoolEnabled = false;
 
   // Stateful mock relay supporting rooms (long-poll), Mode A pipe rendezvous, mailboxes & spool
@@ -410,6 +410,7 @@ test('SyncClient full room & Mode A flows: Flow 1A/1B bind (--spool=off), OneSho
   const bindB = bob.acceptDeviceBind(offeredRoom, {
     preferPoll: true,
     onSASDisplay: ({ sas }) => { resolveSas(sas); },
+    onSASConfirm: async () => true,
   });
   const [cardBOnA, cardAOnB] = await Promise.all([bindA, bindB]);
   assert.equal(cardBOnA.mailbox_id, null);
