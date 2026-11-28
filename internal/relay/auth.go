@@ -226,17 +226,53 @@ func isValidItemID(s string) bool {
 	return strings.HasPrefix(s, "itm_") && isLowerHexLen(s[4:], 32)
 }
 
-// NonceCache enforces bounded O(1) replay detection (max 8,192 entries, 120s TTL).
+type NonceResult int
+
+const (
+	NonceAccepted NonceResult = iota
+	NonceReplay
+	NonceCacheFull
+)
+
+func decodeLowerHex16(s string) ([16]byte, bool) {
+	var out [16]byte
+	if len(s) != 32 {
+		return out, false
+	}
+	for i := 0; i < 16; i++ {
+		hi, ok1 := fromLowerHexNibble(s[2*i])
+		lo, ok2 := fromLowerHexNibble(s[2*i+1])
+		if !ok1 || !ok2 {
+			return out, false
+		}
+		out[i] = (hi << 4) | lo
+	}
+	return out, true
+}
+
+func fromLowerHexNibble(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	default:
+		return 0, false
+	}
+}
+
+// NonceCache enforces bounded O(1) replay detection using compact [16]byte keys and 125s TTL.
+// Never silently evicts unexpired (live) nonces; returns NonceCacheFull when saturated.
 type NonceCache struct {
 	mu         sync.Mutex
 	maxEntries int
 	ttl        time.Duration
 	order      *list.List
-	items      map[string]*list.Element
+	items      map[[16]byte]*list.Element
 }
 
 type nonceEntry struct {
-	nonce     string
+	nonce     [16]byte
 	expiresAt time.Time
 }
 
@@ -251,12 +287,18 @@ func NewNonceCache(maxEntries int, ttl time.Duration) *NonceCache {
 		maxEntries: maxEntries,
 		ttl:        ttl,
 		order:      list.New(),
-		items:      make(map[string]*list.Element, 256),
+		items:      make(map[[16]byte]*list.Element, 256),
 	}
 }
 
-// CheckAndAdd returns true if nonce is fresh and was recorded, false if already seen.
-func (nc *NonceCache) CheckAndAdd(nonce string, now time.Time) bool {
+// CheckAndAddStatus checks and records a 32-char lowercase hex nonce.
+// Returns NonceAccepted if fresh, NonceReplay if duplicate/malformed, or NonceCacheFull if all slots hold live nonces.
+func (nc *NonceCache) CheckAndAddStatus(nonce string, now time.Time) NonceResult {
+	key, ok := decodeLowerHex16(nonce)
+	if !ok {
+		return NonceReplay
+	}
+
 	nc.mu.Lock()
 	defer nc.mu.Unlock()
 
@@ -273,32 +315,41 @@ func (nc *NonceCache) CheckAndAdd(nonce string, now time.Time) bool {
 		e = next
 	}
 
-	if existing, ok := nc.items[nonce]; ok {
+	// Always check duplicate replay BEFORE checking capacity!
+	if existing, exists := nc.items[key]; exists {
 		ent := existing.Value.(*nonceEntry)
 		if now.Before(ent.expiresAt) {
-			return false
+			return NonceReplay
 		}
 		nc.order.Remove(existing)
-		delete(nc.items, nonce)
+		delete(nc.items, key)
 	}
 
-	// Enforce hard entry ceiling by evicting oldest.
+	// Never evict an unexpired (live) nonce when full!
 	for nc.order.Len() >= nc.maxEntries {
 		front := nc.order.Front()
 		if front == nil {
 			break
 		}
 		ent := front.Value.(*nonceEntry)
+		if now.Before(ent.expiresAt) {
+			return NonceCacheFull
+		}
 		nc.order.Remove(front)
 		delete(nc.items, ent.nonce)
 	}
 
 	el := nc.order.PushBack(&nonceEntry{
-		nonce:     nonce,
+		nonce:     key,
 		expiresAt: now.Add(nc.ttl),
 	})
-	nc.items[nonce] = el
-	return true
+	nc.items[key] = el
+	return NonceAccepted
+}
+
+// CheckAndAdd returns true if nonce is fresh and was recorded, false otherwise.
+func (nc *NonceCache) CheckAndAdd(nonce string, now time.Time) bool {
+	return nc.CheckAndAddStatus(nonce, now) == NonceAccepted
 }
 
 func (nc *NonceCache) Len() int {
