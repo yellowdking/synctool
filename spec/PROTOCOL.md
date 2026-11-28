@@ -107,10 +107,24 @@ Requests MUST execute in this **strict order**:
    - Legitimate clients holding `RELAY_ACCESS_KEY` (over verified TLS/SPKI Pin) cache the clock offset and retry once with a fresh `X-Sync-Nonce`.
 6. **Bounded Replay Nonce Cache Check**:
    - Only reached after Steps 4 & 5 pass (prevents unauthenticated memory exhaustion).
-   - Bounded cache: **`max_entries = 8,192`**, TTL **`120s`**, oldest-evict when full.
-   - If nonce already present → strike (+1), return **`401 Unauthorized`** `{"error":"ERR_REPLAY_DETECTED","message":"nonce already consumed","retryable":true}`.
+   - Bounded compact `[16]byte` cache: **`max_entries = 16,384` (`nano`) / `65,536` (`standard`) / `262,144` (`media`)**, TTL **`125s`** (`2 × 60s + 5s`, covering the full `±60s` window plus second boundaries).
+   - If nonce is already live in cache → strike (+1), return **`401 Unauthorized`** `{"error":"ERR_REPLAY_DETECTED","message":"nonce already consumed","retryable":true}`.
+   - If cache is at `max_entries` and the oldest entry is still unexpired (`live`), **NEVER silently evict a live nonce**: return **`429 Too Many Requests`** (`Retry-After: 5`) `{"error":"ERR_RATE_LIMITED","message":"replay nonce cache saturated","retryable":true}`.
    - Otherwise insert `(X-Sync-Nonce, now)`.
 7. **Endpoint-Specific Auth & Handler**: Verify `X-Sync-Room-Token`, `X-Sync-Mailbox-Sig`, `X-Sync-Deposit-Token`, or `X-Sync-Upload-Token`.
+
+### 3.4 Opt-In Browser / PWA / WebView CORS (`--cors-origins` / `SYNCTOOL_CORS_ORIGINS`)
+
+- **Default (`""` empty)**: **Zero `Access-Control-*` headers** are emitted on any response, and `OPTIONS` requests fall through Step 3 (recording +1 strike and returning Silent Stealth `404`).
+- **When configured** (comma-separated exact origins `scheme://host[:port]` or `*`):
+  - After Step 2 (`AllowRequest` rate limit & ban check, so banned IPs still receive pure Stealth `404`), if the request carries a single `Origin` header matching the allowlist:
+    - Emit `Access-Control-Allow-Origin: <origin|*>` (with `Vary: Origin`) and `Access-Control-Expose-Headers: Retry-After, Content-Length, Content-Type`.
+  - **Preflight Handling (`OPTIONS /v1/...` with non-empty `Access-Control-Request-Method` and matched `Origin`)**:
+    - Handled **after** `AllowRequest` rate-limiting (returning `429 ERR_RATE_LIMITED` + `Retry-After: 5` if rate-limited) and **before** auth/HMAC/strike recording (**zero IP strikes recorded**).
+    - Responds **`204 No Content`** with:
+      - `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS`
+      - `Access-Control-Allow-Headers: Authorization, Content-Type, X-Sync-TS, X-Sync-Nonce, X-Sync-Sig, X-Sync-Client, X-Sync-Room-Token, X-Sync-Mailbox-Sig, X-Sync-Deposit-Token, X-Sync-Upload-Token, Last-Event-ID`
+      - `Access-Control-Max-Age: 86400`
 
 ---
 
@@ -590,30 +604,33 @@ Permanently destroys the spooled item after end-to-end verification and local pe
 
 - **`--profile` / `SYNCTOOL_PROFILE`**: `auto` *(default)* | `nano` | `standard` | `media`.
   - When `auto`:
-    1. Determine effective memory `M`: read Linux cgroup v2 `/sys/fs/cgroup/memory.max` → fallback cgroup v1 `/sys/fs/cgroup/memory/memory.limit_in_bytes` → fallback OS physical RAM.
-    2. `M < 768 MiB` → `nano`; `768 MiB <= M < 2048 MiB` → `standard`; `M >= 2048 MiB` → `media`.
-    3. If resolved profile selects `spool=disk`, verify `--data-dir` is writable with `>= 256 MiB` free space; otherwise downgrade `spool` to `memory` and log a warning.
+    1. Determine effective memory `M = min(host_MemTotal, tightest_cgroup_limit)`: walk Linux cgroup v2 ancestor slices from `/proc/self/cgroup` up to `/sys/fs/cgroup` taking the minimum positive `memory.max` (handling leaf `"max"` slices) → fallback cgroup v1 `memory.limit_in_bytes` → clamp against OS `/proc/meminfo` `MemTotal`.
+    2. `M < 224 MiB` → `nano`; `224 MiB <= M < 1536 MiB` (including `256 MiB` Docker containers & `384 MiB` systemd slices) → `standard`; `M >= 1536 MiB` → `media`.
+    3. Compute safe `GOMEMLIMIT` at ~58.6% (`75/128`) of `M` (so `256 MiB` yields `150 MiB`), bounded by per-profile ceilings (`96 MiB` / `256 MiB` / `768 MiB`).
+    4. If resolved profile selects `spool=disk`, verify `--data-dir` is writable with `>= 256 MiB` free space; otherwise downgrade `spool` to `memory` and log a warning.
 - **`--spool` / `SYNCTOOL_SPOOL`**: `auto` *(default, inherits profile)* | **`off`** *(explicit manual kill-switch disabling all Mode B offline storage)* | `memory` | `disk`.
   - Any explicit `--spool` setting **strictly overrides** `--profile`'s default backend (e.g., `--profile=auto --spool=off` keeps optimal streaming limits while guaranteeing zero offline persistence).
 
 ### 6.2 Frozen Three-Tier Resource Matrix
 
-| Parameter (CLI / `SYNCTOOL_*`) | `nano` (<768MB VPS / NAT) | `standard` (768MB–2GB, Default) | `media` (2GB+ High-Cap VPS) |
+| Parameter (CLI / `SYNCTOOL_*`) | `nano` (<224MB Container / Low-RAM NAT) | `standard` (256MB+ Container / Default) | `media` (1.5GB+ High-Cap VPS) |
 | :--- | :---: | :---: | :---: |
-| Target Container RAM / `GOMEMLIMIT` | `64 MiB` / `48 MiB` | `192 MiB` / `144 MiB` | `512 MiB` / `384 MiB` |
+| Target Container RAM / Base `GOMEMLIMIT` | `128–256 MiB` / `48 MiB` (~58.6% of `M`) | `256–384 MiB` / `144–150 MiB` (~58.6% of `M`) | `1024 MiB+` / `384–600 MiB` (~58.6% of `M`) |
 | `GOGC` default | `50` | `50` | `100` |
 | Stream Copy Buffer (`sync.Pool`) | `32 KiB` | `64 KiB` | `64 KiB` |
 | `blocks_per_chunk` (`N × 65,552 B`) | `4` (`262,208 B`) | `16` (`1,048,832 B`) | `32` (`2,097,664 B`) |
 | Mode A Streaming Pipe | Enabled (0 disk) | Enabled (0 disk) | Enabled (0 disk) |
 | Max Active Rooms (`max_active_rooms`) | `32` | `128` | `512` |
-| L4 Max Active TCP Conns (`max_conns`) | `32` | `128` | `512` |
-| L4 Max TCP Conns / IP (`max_conns_per_ip`) | `6` | `16` | `32` |
+| L4 Max Active TCP Conns (`max_conns`) | `64` | `128` | `512` |
+| L4 Max TCP Conns / IP (`max_conns_per_ip`) | `16` | `16` | `32` |
 | L7 Concurrent Data Streams (`transfer_sem`) | `2` (per IP: `1`) | `8` (per IP: `3`) | `32` (per IP: `8`) |
 | Default Spool Backend (`spool`) | `memory` | `disk` | `disk` |
 | Spool Global Cap (`spool_max_total_bytes`) | `16 MiB` | `512 MiB` | `10 GiB` |
 | Spool Per-Mailbox Cap (`spool_max_mailbox_bytes`) | `8 MiB` | `256 MiB` | `4 GiB` |
 | Spool Single-Item Cap (`spool_max_item_bytes`) | `4 MiB` | `100 MiB` | `2 GiB` |
 | Max Items / Mailbox (`spool_max_items`) | `16` | `64` | `256` |
+| Max Registered Mailboxes (`max_mailboxes`) | `256` | `4,096` | `32,768` |
+| Nonce Cache Capacity (`125s` TTL) | `16,384` | `65,536` | `262,144` |
 | Spool Default / Max TTL | `30m` / `2h` | `24h` / `72h` | `72h` / `168h` (7d) |
 | Max Downloads / Manifest (`part_id == 0`) | `16` | `16` | `16` |
 | Max Downloads / Blob Chunk (`part_id >= 1`) | `3` | `5` | `5` |
@@ -623,11 +640,11 @@ Permanently destroys the spooled item after end-to-end verification and local pe
 | Strike Ban Threshold / Duration / Decay | `10` / `15m` / `-1 per min` | `10` / `15m` / `-1 per min` | `10` / `15m` / `-1 per min` |
 | Global Bandwidth Limit (`max_bandwidth_mbps`) | `0` (optional e.g. `40` Mbps) | `0` (unlimited) | `0` (unlimited) |
 
-> **HTTP Timeout Discipline (All Tiers)**:
-> - `ReadHeaderTimeout`: `10s`; `IdleTimeout`: `60s`.
+> **HTTP Timeout & Header Discipline (All Tiers)**:
+> - `MaxHeaderBytes`: `8,192 B` (`8 KiB`); `ReadHeaderTimeout`: `5s`; `IdleTimeout`: `60s`.
 > - **NO global `ReadTimeout`/`WriteTimeout`** (prevents cutting off slow mobile media streams).
 > - Control-plane handler deadline: `15s` via `http.ResponseController`.
-> - Data-plane chunk stall timeout: `30s` rolling deadline reset per buffer iteration.
+> - Data-plane chunk stall timeout: `30s` rolling deadline reset per buffer iteration, capped by a `5m` per-chunk wall-clock ceiling (`MaxChunkTransferDuration`) and room TTL context.
 
 ---
 
@@ -636,12 +653,12 @@ Permanently destroys the spooled item after end-to-end verification and local pe
 ### 7.1 Dual Deployment Forms (Including Docker-Free 256MB VPS)
 
 1. **Docker One-Click (Primary for 512MB+ VPS)**:
-   - Multi-arch `FROM scratch` static Go binary (`linux/amd64`, `linux/arm64`, ~6–10 MiB), `USER 65532:65532`, `cap_drop: ALL`, `no-new-privileges:true`, `read_only: true` rootfs (mount `/data` only for persisted certs/key and `spool=disk`).
-   - Docker `HEALTHCHECK` invokes `synctool-relay healthcheck` (no `curl`/`wget` needed in `scratch`).
-   - CI publishes to **GHCR (`ghcr.io/yellowdking/synctool`)** + **Docker Hub**, plus standalone static binaries on **GitHub Releases**.
+   - Multi-arch `FROM scratch` static Go binary (`linux/amd64`, `linux/arm64`, ~6–10 MiB), `USER 65532:65532`, `cap_drop: ALL`, `no-new-privileges:true`, `read_only: true` rootfs (mount named volume `synctool_data:/data` for persisted certs/key and `spool=disk`, `mem_limit: 256m`, `SYNCTOOL_PROFILE=standard`).
+   - Docker `HEALTHCHECK` invokes `synctool-relay healthcheck` (no `curl`/`wget` needed in `scratch`; supports both `selfsigned` SPKI pinning and `cert` SNI derivation).
+   - CI publishes canonical multi-arch images to **GHCR (`ghcr.io/yellowdking/synctool`)**, plus SHA-256-verified standalone static binaries (`linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, `windows/arm64`) on **GitHub Releases**.
 2. **Standalone Static Binary + `systemd` Unit (For 256MB Low-RAM VPS)**:
-   - Avoids `dockerd`/`containerd`'s 80–120 MiB RAM tax.
-   - Reference `systemd` unit sets `MemoryMax=64M`, `DynamicUser=yes`, `ProtectSystem=strict`, `NoNewPrivileges=yes`, keeping idle RSS **`< 15 MiB`**.
+   - Avoids `dockerd`/`containerd`'s 80–120 MiB RAM tax, verifying downloaded binaries against `SHA256SUMS.txt`.
+   - Reference `systemd` unit aligns `MemoryMax` by tier (`256M` `nano`, `384M` `standard`, `1024M` `media`), `User=synctool`, `ProtectSystem=strict`, `NoNewPrivileges=yes`, keeping idle RSS **`< 15 MiB`**.
 
 ### 7.2 TLS Modes & 730-Day Self-Signed Certificate Policy
 
@@ -653,13 +670,13 @@ Permanently destroys the spooled item after end-to-end verification and local pe
 | `cert` | Loads `--tls-cert` & `--tls-key` (TLS `MinVersion = TLS 1.3`), reloads on `SIGHUP`. |
 | `off` | Plaintext HTTP (HTTP/1.1 + optional H2C) behind Nginx / Caddy / Cloudflare Tunnel. **Hard Safety Guard**: startup **MUST FAIL** if `--tls=off` AND `--listen` is non-loopback AND `--trust-proxies` is empty. |
 
-- **Rotation Lifecycle**: `/v1/ping` and `/v1/caps` return `cert_expires_at` and `cert_rotate_recommended` (`true` when `< 30 days` remain). Operators run `synctool-relay cert-rotate` to mint a fresh 730-day cert and obtain the updated onboarding URI/QR.
+- **Rotation Lifecycle**: `/v1/ping` and `/v1/caps` return `cert_expires_at` and `cert_rotate_recommended` (`true` when `< 30 days` remain). Operators run `synctool-relay cert-rotate --reuse-key` (renews 730-day leaf cert keeping identical SPKI pin & existing SANs), or `synctool-relay cert-rotate --stage-next` (`tls-next.crt`/`tls-next.key` + dual-pin `pin=<cur>,<next>` URI) followed by `synctool-relay cert-rotate --promote-staged` + `SIGHUP` for zero-downtime key rollover.
 
 ### 7.3 Reverse Proxy Compatibility & `TRUSTED_PROXIES`
 
 - **`--trust-proxies` / `SYNCTOOL_TRUSTED_PROXIES`**: Comma-separated CIDR list (default **empty**).
   - When empty: real client IP is strictly `r.RemoteAddr` (ignores `X-Forwarded-For` / `X-Real-IP` / `CF-Connecting-IP` to defeat header spoofing).
-  - When set: if `r.RemoteAddr` matches a trusted CIDR, walk `X-Forwarded-For` right-to-left and pick the **first IP NOT in `TRUSTED_PROXIES`** (falling back to `CF-Connecting-IP` / `X-Real-IP` when configured).
+  - When set: if `r.RemoteAddr` matches a trusted CIDR, walk `X-Forwarded-For` right-to-left and pick the **first IP NOT in `TRUSTED_PROXIES`** (XFF-only default: never falls back to client-spoofable `CF-Connecting-IP` or `X-Real-IP` when `X-Forwarded-For` is absent).
 - **Recommended Nginx Reverse Proxy Snippet**:
   ```nginx
   client_max_body_size 4m;
@@ -677,9 +694,9 @@ Permanently destroys the spooled item after end-to-end verification and local pe
 - `synctool-relay init [--public-host <ip-or-domain>] [--port 54843] [--data-dir /data]`:
   - Generates 256-bit random `RELAY_ACCESS_KEY` (`43-char b64u`, persisted in `access.key` mode `0600`; **zero hardcoded default key exists in source code**) and 730-day self-signed cert (unless `--tls=off`/`cert`).
   - Prints unified URI `synctool://relay?v=1&u=<percent_encoded_canonical_origin>[&pin=<64-hex-spki>]#k=<access_key>` and ASCII QR **strictly to interactive TTY / explicit `init` stdout** (exact URI parameter grammar frozen in `spec/ENVELOPE_AND_SDK.md`).
-- `synctool-relay serve` *(default)*: Starts relay server. **NEVER** prints `access_key`, tokens, signatures, or full IDs to runtime logs.
-- `synctool-relay cert-rotate`: Rotates 730-day self-signed cert and prints updated SPKI pin URI.
-- `synctool-relay healthcheck`: Probes local listener and exits `0`/`1`.
+- `synctool-relay serve` *(default)*: Starts relay server (supports optional `--cors-origins` / `SYNCTOOL_CORS_ORIGINS`). **NEVER** prints `access_key`, tokens, signatures, or full IDs to runtime logs.
+- `synctool-relay cert-rotate [--reuse-key | --stage-next | --promote-staged] [--print-uri]`: Rotates or stages 730-day self-signed cert (preserving existing IP/DNS SANs when `--public-host` is omitted) and prints updated single-pin or dual-pin SPKI URI.
+- `synctool-relay healthcheck`: Probes local listener (SPKI-pinned for `selfsigned`; SNI-verified via `ServerName` for `cert`) and exits `0`/`1`.
 
 ### 7.5 On-Disk Spool Layout (`spool=disk`) & Lazy GC
 
