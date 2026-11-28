@@ -1,7 +1,8 @@
 // Zero-dependency WebCrypto primitives, RFC 8410 Curve25519 DER wrapping, and Master Seed HKDF derivation
-// (spec/CRYPTO_AND_AUTH.md §2–§3). Works natively in Node 20+, Deno, Bun, Chrome 133+, Edge 133+, Firefox 130+, Safari 17+.
+// (spec/CRYPTO_AND_AUTH.md §2–§3). Works natively in Node 20+, Deno, Bun, Chrome/Edge 137+, Firefox 130+, Safari 17+
+// (legacy WebViews supported via setCryptoProvider).
 
-import { ErrorCode, SyncError } from './envelope.js';
+import { ErrorCode, SyncError } from './errors.js';
 
 export const PROTO_VERSION = 1;
 export const CHUNK_PLAINTEXT_MAX = 65536; // 64 KiB
@@ -21,6 +22,23 @@ export const X25519_PKCS8_PREFIX = hexToBytes('302e020100300506032b656e04220420'
 export const ED25519_SPKI_PREFIX = hexToBytes('302a300506032b6570032100');
 export const X25519_SPKI_PREFIX = hexToBytes('302a300506032b656e032100');
 
+// Ed25519 group constants for strict canonical S < L & small-order torsion PK rejection (RFC 8032 §5.1.3)
+const ED25519_P = 0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffedn;
+const ED25519_L = 0x1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3edn;
+const ED25519_ORDER8_Y1 = 0x05fc536d880238b13933c6d305acdfd5f098eff289f4c345b027b2c28f95e826n;
+const ED25519_ORDER8_Y2 = ED25519_P - ED25519_ORDER8_Y1;
+
+// 1-time cached KAT vectors for WebCrypto PKCS#8 -> JWK.x derivation (RFC 8032 §7.1 Test 1 & RFC 7748 §6.1)
+const KAT_ED25519_SEED = hexToBytes('9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60');
+const KAT_ED25519_PK = hexToBytes('d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a');
+const KAT_X25519_SK = hexToBytes('77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a');
+const KAT_X25519_PK = hexToBytes('8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a');
+
+/** @type {Promise<void> | null} */
+let ed25519KatPromise = null;
+/** @type {Promise<void> | null} */
+let x25519KatPromise = null;
+
 /** @type {any} */
 let customCryptoProvider = null;
 
@@ -31,6 +49,8 @@ let customCryptoProvider = null;
  */
 export function setCryptoProvider(provider) {
   customCryptoProvider = provider ?? null;
+  ed25519KatPromise = null;
+  x25519KatPromise = null;
 }
 
 function getSubtle() {
@@ -39,6 +59,15 @@ function getSubtle() {
     throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'WebCrypto SubtleCrypto is not available in this runtime');
   }
   return s;
+}
+
+function wrapWebCryptoError(opName, err) {
+  if (err instanceof SyncError) return err;
+  return new SyncError(
+    ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED,
+    `WebCrypto ${opName} failed (${err?.name || 'Error'}: ${err?.message || err}); register setCryptoProvider() on legacy WebViews`,
+    { cause: err },
+  );
 }
 
 // ============================================================================
@@ -57,8 +86,14 @@ export function utf8Decode(b) {
 
 /** @param {number} n */
 export function randomBytes(n) {
+  if (!Number.isSafeInteger(n) || n < 0) {
+    throw new RangeError(`invalid randomBytes length: ${n}`);
+  }
   const out = new Uint8Array(n);
-  globalThis.crypto.getRandomValues(out);
+  const maxStep = 65536; // W3C WebCrypto getRandomValues 64 KiB quota per call
+  for (let off = 0; off < n; off += maxStep) {
+    globalThis.crypto.getRandomValues(out.subarray(off, Math.min(off + maxStep, n)));
+  }
   return out;
 }
 
@@ -139,13 +174,23 @@ export function u32be(n) {
   return b;
 }
 
-/** @param {Uint8Array} buf @param {number} offset */
+/** @param {Uint8Array} buf @param {number} [offset=0] */
 export function readU32be(buf, offset = 0) {
+  if (!(buf instanceof Uint8Array) || !Number.isInteger(offset) || offset < 0 || offset + 4 > buf.byteLength) {
+    throw new RangeError(`readU32be out of bounds (offset=${offset}, byteLength=${buf?.byteLength})`);
+  }
   return new DataView(buf.buffer, buf.byteOffset + offset, 4).getUint32(0, false);
 }
 
 /** @param {number | bigint} n */
 export function u64be(n) {
+  if (typeof n === 'number') {
+    if (!Number.isSafeInteger(n) || n < 0) {
+      throw new RangeError(`uint64 safe integer out of range: ${n}`);
+    }
+  } else if (typeof n !== 'bigint') {
+    throw new RangeError(`uint64 must be a safe integer or bigint: ${n}`);
+  }
   const big = typeof n === 'bigint' ? n : BigInt(n);
   if (big < 0n || big > 0xffffffffffffffffn) {
     throw new RangeError(`uint64 out of range: ${n}`);
@@ -155,9 +200,15 @@ export function u64be(n) {
   return b;
 }
 
-/** @param {Uint8Array} buf @param {number} offset */
+/** @param {Uint8Array} buf @param {number} [offset=0] */
 export function readU64be(buf, offset = 0) {
+  if (!(buf instanceof Uint8Array) || !Number.isInteger(offset) || offset < 0 || offset + 8 > buf.byteLength) {
+    throw new RangeError(`readU64be out of bounds (offset=${offset}, byteLength=${buf?.byteLength})`);
+  }
   const big = new DataView(buf.buffer, buf.byteOffset + offset, 8).getBigUint64(0, false);
+  if (big > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new RangeError(`uint64 exceeds Number.MAX_SAFE_INTEGER: ${big}`);
+  }
   return Number(big);
 }
 
@@ -192,14 +243,47 @@ export function isAllZero(bytes) {
   return acc === 0;
 }
 
+function bytes32LeToBigInt(buf32, offset = 0) {
+  let v = 0n;
+  for (let i = 31; i >= 0; i--) {
+    v = (v << 8n) | BigInt(buf32[offset + i]);
+  }
+  return v;
+}
+
+/**
+ * Check if a 32-byte Ed25519 public key is non-canonical (y >= p, -0) or one of the 8 small-order torsion points.
+ * @param {Uint8Array} pk32
+ * @returns {boolean}
+ */
+export function isSmallOrderEd25519PublicKey(pk32) {
+  if (!(pk32 instanceof Uint8Array) || pk32.length !== 32) return true;
+  const raw = bytes32LeToBigInt(pk32, 0);
+  const y = raw & ((1n << 255n) - 1n);
+  if (y >= ED25519_P) return true;
+  if (y === 0n || y === 1n || y === ED25519_P - 1n || y === ED25519_ORDER8_Y1 || y === ED25519_ORDER8_Y2) {
+    return true;
+  }
+  return false;
+}
+
+function isCanonicalEd25519Scalar(sig64) {
+  const s = bytes32LeToBigInt(sig64, 32);
+  return s < ED25519_L;
+}
+
 // ============================================================================
 // Core Cryptographic Primitives (WebCrypto Native)
 // ============================================================================
 
 /** @param {Uint8Array} data */
 export async function sha256(data) {
-  const digest = await getSubtle().digest('SHA-256', data);
-  return new Uint8Array(digest);
+  try {
+    const digest = await getSubtle().digest('SHA-256', data);
+    return new Uint8Array(digest);
+  } catch (err) {
+    throw wrapWebCryptoError('SHA-256', err);
+  }
 }
 
 /**
@@ -207,10 +291,14 @@ export async function sha256(data) {
  * @param {Uint8Array} data
  */
 export async function hmacSha256(keyBytes, data) {
-  const subtle = getSubtle();
-  const key = await subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const sig = await subtle.sign('HMAC', key, data);
-  return new Uint8Array(sig);
+  try {
+    const subtle = getSubtle();
+    const key = await subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const sig = await subtle.sign('HMAC', key, data);
+    return new Uint8Array(sig);
+  } catch (err) {
+    throw wrapWebCryptoError('HMAC-SHA256', err);
+  }
 }
 
 /**
@@ -253,14 +341,18 @@ export async function hkdfExpand(prk, info, length) {
  * @param {number} length
  */
 export async function hkdfDerive(salt, ikm, info, length) {
-  const subtle = getSubtle();
-  const key = await subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
-  const bits = await subtle.deriveBits(
-    { name: 'HKDF', hash: 'SHA-256', salt, info },
-    key,
-    length * 8,
-  );
-  return new Uint8Array(bits);
+  try {
+    const subtle = getSubtle();
+    const key = await subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
+    const bits = await subtle.deriveBits(
+      { name: 'HKDF', hash: 'SHA-256', salt, info },
+      key,
+      length * 8,
+    );
+    return new Uint8Array(bits);
+  } catch (err) {
+    throw wrapWebCryptoError('HKDF', err);
+  }
 }
 
 /**
@@ -273,14 +365,18 @@ export async function hkdfDerive(salt, ikm, info, length) {
 export async function aesGcmSeal(key32, nonce12, plaintext, aad) {
   if (key32.length !== 32) throw new RangeError('AES-256-GCM key must be 32 bytes');
   if (nonce12.length !== 12) throw new RangeError('AES-256-GCM nonce must be 12 bytes');
-  const subtle = getSubtle();
-  const key = await subtle.importKey('raw', key32, { name: 'AES-GCM' }, false, ['encrypt']);
-  const ct = await subtle.encrypt(
-    { name: 'AES-GCM', iv: nonce12, additionalData: aad, tagLength: 128 },
-    key,
-    plaintext,
-  );
-  return new Uint8Array(ct);
+  try {
+    const subtle = getSubtle();
+    const key = await subtle.importKey('raw', key32, { name: 'AES-GCM' }, false, ['encrypt']);
+    const ct = await subtle.encrypt(
+      { name: 'AES-GCM', iv: nonce12, additionalData: aad, tagLength: 128 },
+      key,
+      plaintext,
+    );
+    return new Uint8Array(ct);
+  } catch (err) {
+    throw wrapWebCryptoError('AES-GCM seal', err);
+  }
 }
 
 /**
@@ -296,9 +392,9 @@ export async function aesGcmOpen(key32, nonce12, ciphertextWithTag, aad) {
   if (ciphertextWithTag.length < AEAD_TAG_LEN) {
     throw new SyncError(ErrorCode.ERR_CRYPTO_DECRYPT_FAILED, 'ciphertext shorter than 16B GCM tag');
   }
-  const subtle = getSubtle();
-  const key = await subtle.importKey('raw', key32, { name: 'AES-GCM' }, false, ['decrypt']);
   try {
+    const subtle = getSubtle();
+    const key = await subtle.importKey('raw', key32, { name: 'AES-GCM' }, false, ['decrypt']);
     const pt = await subtle.decrypt(
       { name: 'AES-GCM', iv: nonce12, additionalData: aad, tagLength: 128 },
       key,
@@ -338,6 +434,82 @@ export function x25519PubToSpki(pk32) {
   return concatBytes(X25519_SPKI_PREFIX, pk32);
 }
 
+async function deriveEd25519PkViaWebCrypto(subtle, seed32) {
+  const pkcs8 = ed25519SeedToPkcs8(seed32);
+  try {
+    const privKey = await subtle.importKey('pkcs8', pkcs8, { name: 'Ed25519' }, true, ['sign']);
+    const jwk = await subtle.exportKey('jwk', privKey);
+    if (!jwk?.x) {
+      throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'WebCrypto Ed25519 JWK export missing public key x');
+    }
+    const pk = b64uToBytes(jwk.x);
+    if (pk.length !== 32) {
+      throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'WebCrypto Ed25519 JWK x has invalid length');
+    }
+    return pk;
+  } catch (err) {
+    throw wrapWebCryptoError('Ed25519 key derivation', err);
+  } finally {
+    zeroBytes(pkcs8);
+  }
+}
+
+async function deriveX25519PkViaWebCrypto(subtle, sk32) {
+  const pkcs8 = x25519SkToPkcs8(sk32);
+  try {
+    const privKey = await subtle.importKey('pkcs8', pkcs8, { name: 'X25519' }, true, ['deriveBits']);
+    const jwk = await subtle.exportKey('jwk', privKey);
+    if (!jwk?.x) {
+      throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'WebCrypto X25519 JWK export missing public key x');
+    }
+    const pk = b64uToBytes(jwk.x);
+    if (pk.length !== 32) {
+      throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'WebCrypto X25519 JWK x has invalid length');
+    }
+    return pk;
+  } catch (err) {
+    throw wrapWebCryptoError('X25519 key derivation', err);
+  } finally {
+    zeroBytes(pkcs8);
+  }
+}
+
+function ensureEd25519Kat(subtle) {
+  if (!ed25519KatPromise) {
+    ed25519KatPromise = (async () => {
+      const derived = await deriveEd25519PkViaWebCrypto(subtle, KAT_ED25519_SEED);
+      if (!constantTimeEqual(derived, KAT_ED25519_PK)) {
+        throw new SyncError(
+          ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED,
+          'WebCrypto Ed25519 JWK x KAT self-check failed; register setCryptoProvider()',
+        );
+      }
+    })().catch((err) => {
+      ed25519KatPromise = null;
+      throw err;
+    });
+  }
+  return ed25519KatPromise;
+}
+
+function ensureX25519Kat(subtle) {
+  if (!x25519KatPromise) {
+    x25519KatPromise = (async () => {
+      const derived = await deriveX25519PkViaWebCrypto(subtle, KAT_X25519_SK);
+      if (!constantTimeEqual(derived, KAT_X25519_PK)) {
+        throw new SyncError(
+          ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED,
+          'WebCrypto X25519 JWK x KAT self-check failed; register setCryptoProvider()',
+        );
+      }
+    })().catch((err) => {
+      x25519KatPromise = null;
+      throw err;
+    });
+  }
+  return x25519KatPromise;
+}
+
 /**
  * Derive 32B Ed25519 public key from 32B seed using standard WebCrypto (or optional CryptoProvider).
  * @param {Uint8Array} seed32
@@ -346,24 +518,20 @@ export function x25519PubToSpki(pk32) {
 export async function ed25519KeyPairFromSeed(seed32) {
   if (seed32.length !== 32) throw new RangeError('Ed25519 seed must be 32 bytes');
   if (customCryptoProvider?.ed25519PublicKeyFromSeed) {
-    const publicKey = await customCryptoProvider.ed25519PublicKeyFromSeed(seed32);
-    return { seed: new Uint8Array(seed32), publicKey: new Uint8Array(publicKey) };
+    try {
+      const publicKey = new Uint8Array(await customCryptoProvider.ed25519PublicKeyFromSeed(seed32));
+      if (publicKey.length !== 32) {
+        throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'customCryptoProvider Ed25519 public key must be 32 bytes');
+      }
+      return { seed: new Uint8Array(seed32), publicKey };
+    } catch (err) {
+      throw wrapWebCryptoError('custom Ed25519 key derivation', err);
+    }
   }
   const subtle = getSubtle();
-  const pkcs8 = ed25519SeedToPkcs8(seed32);
-  try {
-    const privKey = await subtle.importKey('pkcs8', pkcs8, { name: 'Ed25519' }, true, ['sign']);
-    const jwk = await subtle.exportKey('jwk', privKey);
-    if (!jwk.x) {
-      throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'WebCrypto Ed25519 JWK export missing public key x');
-    }
-    return {
-      seed: new Uint8Array(seed32),
-      publicKey: b64uToBytes(jwk.x),
-    };
-  } finally {
-    zeroBytes(pkcs8);
-  }
+  await ensureEd25519Kat(subtle);
+  const publicKey = await deriveEd25519PkViaWebCrypto(subtle, seed32);
+  return { seed: new Uint8Array(seed32), publicKey };
 }
 
 /**
@@ -374,30 +542,30 @@ export async function ed25519KeyPairFromSeed(seed32) {
 export async function x25519KeyPairFromSk(sk32) {
   if (sk32.length !== 32) throw new RangeError('X25519 private key must be 32 bytes');
   if (customCryptoProvider?.x25519PublicKeyFromSk) {
-    const publicKey = await customCryptoProvider.x25519PublicKeyFromSk(sk32);
-    return { privateKey: new Uint8Array(sk32), publicKey: new Uint8Array(publicKey) };
+    try {
+      const publicKey = new Uint8Array(await customCryptoProvider.x25519PublicKeyFromSk(sk32));
+      if (publicKey.length !== 32) {
+        throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'customCryptoProvider X25519 public key must be 32 bytes');
+      }
+      return { privateKey: new Uint8Array(sk32), publicKey };
+    } catch (err) {
+      throw wrapWebCryptoError('custom X25519 key derivation', err);
+    }
   }
   const subtle = getSubtle();
-  const pkcs8 = x25519SkToPkcs8(sk32);
-  try {
-    const privKey = await subtle.importKey('pkcs8', pkcs8, { name: 'X25519' }, true, ['deriveBits']);
-    const jwk = await subtle.exportKey('jwk', privKey);
-    if (!jwk.x) {
-      throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'WebCrypto X25519 JWK export missing public key x');
-    }
-    return {
-      privateKey: new Uint8Array(sk32),
-      publicKey: b64uToBytes(jwk.x),
-    };
-  } finally {
-    zeroBytes(pkcs8);
-  }
+  await ensureX25519Kat(subtle);
+  const publicKey = await deriveX25519PkViaWebCrypto(subtle, sk32);
+  return { privateKey: new Uint8Array(sk32), publicKey };
 }
 
 /** Generate a fresh CSPRNG X25519 key pair. */
 export async function generateX25519KeyPair() {
   const sk = randomBytes(32);
-  return x25519KeyPairFromSk(sk);
+  try {
+    return await x25519KeyPairFromSk(sk);
+  } finally {
+    zeroBytes(sk);
+  }
 }
 
 /**
@@ -407,7 +575,7 @@ export async function generateX25519KeyPair() {
  * @returns {Promise<Uint8Array>}
  */
 export async function x25519SharedSecret(sk32, peerPk32) {
-  if (sk32.length !== 32 || peerPk32.length !== 32) {
+  if (!(sk32 instanceof Uint8Array) || !(peerPk32 instanceof Uint8Array) || sk32.length !== 32 || peerPk32.length !== 32) {
     throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'X25519 keys must be 32 bytes');
   }
   let shared;
@@ -416,6 +584,7 @@ export async function x25519SharedSecret(sk32, peerPk32) {
       shared = new Uint8Array(await customCryptoProvider.x25519SharedSecret(sk32, peerPk32));
     } else {
       const subtle = getSubtle();
+      await ensureX25519Kat(subtle);
       const pkcs8 = x25519SkToPkcs8(sk32);
       try {
         const privKey = await subtle.importKey('pkcs8', pkcs8, { name: 'X25519' }, false, ['deriveBits']);
@@ -427,9 +596,10 @@ export async function x25519SharedSecret(sk32, peerPk32) {
       }
     }
   } catch (err) {
-    throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'X25519 key agreement failed', { cause: err });
+    throw wrapWebCryptoError('X25519 key agreement', err);
   }
   if (shared.length !== 32 || isAllZero(shared)) {
+    zeroBytes(shared);
     throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'rejected all-zero X25519 shared secret (low-order point)');
   }
   return shared;
@@ -444,7 +614,15 @@ export async function x25519SharedSecret(sk32, peerPk32) {
 export async function ed25519Sign(seed32, message) {
   if (seed32.length !== 32) throw new RangeError('Ed25519 seed must be 32 bytes');
   if (customCryptoProvider?.ed25519Sign) {
-    return new Uint8Array(await customCryptoProvider.ed25519Sign(seed32, message));
+    try {
+      const sig = new Uint8Array(await customCryptoProvider.ed25519Sign(seed32, message));
+      if (sig.length !== 64) {
+        throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'customCryptoProvider Ed25519 signature must be 64 bytes');
+      }
+      return sig;
+    } catch (err) {
+      throw wrapWebCryptoError('custom Ed25519 sign', err);
+    }
   }
   const subtle = getSubtle();
   const pkcs8 = ed25519SeedToPkcs8(seed32);
@@ -452,20 +630,25 @@ export async function ed25519Sign(seed32, message) {
     const privKey = await subtle.importKey('pkcs8', pkcs8, { name: 'Ed25519' }, false, ['sign']);
     const sig = await subtle.sign('Ed25519', privKey, message);
     return new Uint8Array(sig);
+  } catch (err) {
+    throw wrapWebCryptoError('Ed25519 sign', err);
   } finally {
     zeroBytes(pkcs8);
   }
 }
 
 /**
- * PureEdDSA Ed25519 verify.
+ * PureEdDSA Ed25519 verify. Strictly rejects small-order public keys and non-canonical S >= L signatures.
  * @param {Uint8Array} publicKey32
  * @param {Uint8Array} message
  * @param {Uint8Array} signature64
  * @returns {Promise<boolean>}
  */
 export async function ed25519Verify(publicKey32, message, signature64) {
+  if (!(publicKey32 instanceof Uint8Array) || !(signature64 instanceof Uint8Array)) return false;
   if (publicKey32.length !== 32 || signature64.length !== 64) return false;
+  if (isSmallOrderEd25519PublicKey(publicKey32)) return false;
+  if (!isCanonicalEd25519Scalar(signature64)) return false;
   try {
     if (customCryptoProvider?.ed25519Verify) {
       return Boolean(await customCryptoProvider.ed25519Verify(publicKey32, message, signature64));
@@ -548,19 +731,26 @@ export async function deriveDeviceIdentity(seed32) {
  * @param {string} relayId
  */
 export async function deriveMailboxIdentity(seed32, relayId) {
+  if (typeof relayId !== 'string' || !/^[0-9a-f]{32}$/.test(relayId)) {
+    throw new SyncError(ErrorCode.ERR_BAD_REQUEST, 'relayId must be 32 lowercase hex chars');
+  }
   const masterPrk = await deriveMasterPRK(seed32);
-  const mailboxAuthSeed = await hkdfExpand(
-    masterPrk,
-    concatBytes(utf8Encode('synctool-v1/mailbox-auth/'), utf8Encode(relayId)),
-    32,
-  );
-  const { publicKey: mailboxAuthPk } = await ed25519KeyPairFromSeed(mailboxAuthSeed);
-  const mailboxId = await deriveMailboxId(mailboxAuthPk);
-  return {
-    mailboxAuthSeed,
-    mailboxAuthPk,
-    mailboxId,
-  };
+  try {
+    const mailboxAuthSeed = await hkdfExpand(
+      masterPrk,
+      concatBytes(utf8Encode('synctool-v1/mailbox-auth/'), utf8Encode(relayId)),
+      32,
+    );
+    const { publicKey: mailboxAuthPk } = await ed25519KeyPairFromSeed(mailboxAuthSeed);
+    const mailboxId = await deriveMailboxId(mailboxAuthPk);
+    return {
+      mailboxAuthSeed,
+      mailboxAuthPk,
+      mailboxId,
+    };
+  } finally {
+    zeroBytes(masterPrk);
+  }
 }
 
 /**
@@ -591,19 +781,21 @@ export async function signDeviceCard(signSeed32, signPk32, kemPk32, issuedAt) {
 }
 
 /**
- * Verify a DeviceCard's deterministic device_id derivation and Ed25519 card_sig.
+ * Verify a DeviceCard's deterministic device_id derivation, non-torsion sign_pk, and Ed25519 card_sig.
  * @param {{ device_id: string, sign_pk: string, kem_pk: string, issued_at: number, card_sig: string }} card
  */
 export async function verifyDeviceCard(card) {
   if (!card || typeof card !== 'object') return false;
+  if (typeof card.device_id !== 'string' || !/^[0-9a-f]{32}$/.test(card.device_id)) return false;
   try {
     const signPk = b64uToBytes(card.sign_pk);
     const kemPk = b64uToBytes(card.kem_pk);
     const sig = b64uToBytes(card.card_sig);
     if (signPk.length !== 32 || kemPk.length !== 32 || sig.length !== 64) return false;
+    if (isSmallOrderEd25519PublicKey(signPk)) return false;
     if (!Number.isSafeInteger(card.issued_at) || card.issued_at < 0) return false;
     const expectedDeviceId = await deriveDeviceId(signPk);
-    if (card.device_id !== expectedDeviceId) return false;
+    if (!constantTimeEqual(utf8Encode(card.device_id), utf8Encode(expectedDeviceId))) return false;
     const input = buildDeviceCardSigInput(signPk, kemPk, card.issued_at);
     return await ed25519Verify(signPk, input, sig);
   } catch {
