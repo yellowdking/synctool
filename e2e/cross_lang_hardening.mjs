@@ -300,6 +300,29 @@ export async function runHardeningAndSelfHealingScenarios({ relayBin, cliBin, wo
     assert.equal(JSON.stringify(badInit).includes(v2Secret), false, 'CLI leaked #k= secret in JSON/stderr output!');
     log('   CLI watch isolation, safe filenames, 307 redirect block, version mismatch & secret redaction passed!');
 
+    // 9F: Flow 1B SAS Responder mandatory onSASConfirm negative gate (rejecting burns room before saving DeviceCard!)
+    const tsRejectResp = new SyncClient({
+      relay: parseRelayURI(healURI),
+      label: 'TS-Reject-Responder',
+    });
+    const sasNegOfferProc = spawnCLIInteractive(cliBin, goHealCfg, ['pair', 'offer', '--mode', 'sas', '--label', 'Go-Heal-Alice']);
+    const sasNegOffer = await sasNegOfferProc.waitForEvent((e) => e.type === 'event' && e.event === 'offer_ready', 10_000);
+    await assert.rejects(
+      () => tsRejectResp.acceptDeviceBind(sasNegOffer.display_code, {
+        timeoutMs: 10_000,
+        onSASDisplay: ({ sas }) => {
+          sasNegOfferProc.writeLine(sas);
+          sasNegOfferProc.endInput();
+        },
+        onSASConfirm: async () => false,
+      }),
+      (err) => err instanceof SyncError && err.code === ErrorCode.ERR_SAS_MISMATCH,
+    );
+    assert.equal((await tsRejectResp.keyStore.listDevices()).length, 0, 'rejected SAS responder must never save peer DeviceCard');
+    await sasNegOfferProc.done.catch(() => {});
+    await tsRejectResp.close();
+    log('   9F: mandatory Responder onSASConfirm negative gate passed!');
+
     // =========================================================================
     // SCENARIO 10: Runnable `examples/` Verification (Go, TS & Subprocess NDJSON)
     // =========================================================================
