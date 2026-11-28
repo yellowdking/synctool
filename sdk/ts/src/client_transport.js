@@ -695,7 +695,6 @@ export async function* iterateSSE(readableStream, signal, options = {}) {
         idleTimer = setTimeout(() => {
           reject(new SyncError(ErrorCode.ERR_RELAY_UNREACHABLE, `SSE stream idle timeout (${idleTimeoutMs}ms)`, { retryable: true }));
         }, idleTimeoutMs);
-        idleTimer.unref?.();
       }),
     ]).finally(() => {
       if (idleTimer) clearTimeout(idleTimer);
