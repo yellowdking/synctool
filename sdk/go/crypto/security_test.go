@@ -426,3 +426,39 @@ func TestStreamOverflowAndNonceWrapGuard(t *testing.T) {
 		t.Fatalf("expected decrypt wrap past MaxUint32 to fail with ErrStreamTooLarge, got %v", err)
 	}
 }
+
+func TestSmallOrderAndNonCanonicalEd25519PublicKeysRejected(t *testing.T) {
+	badPKHexes := []string{
+		"0000000000000000000000000000000000000000000000000000000000000000", // y=0 (order 4)
+		"0000000000000000000000000000000000000000000000000000000000000080", // y=0, sign=1
+		"0100000000000000000000000000000000000000000000000000000000000000", // y=1 (identity)
+		"0100000000000000000000000000000000000000000000000000000000000080", // y=1, sign=1
+		"26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05", // order 8
+		"26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85", // order 8, sign=1
+		"c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a", // order 8
+		"c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa", // order 8, sign=1
+		"ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", // y=p-1 (order 2)
+		"ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", // y=p-1, sign=1
+		"edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", // y=p (non-canonical)
+		"eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", // y=p+1 (non-canonical)
+		"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", // non-canonical > p
+	}
+	var zeroSig [64]byte
+	// Forged trivial (R=I, S=0) signature that naive non-torsion-checked verifiers might accept for pk=I:
+	zeroSig[0] = 0x01
+	kem := bytes.Repeat([]byte{0x42}, 32)
+	for _, h := range badPKHexes {
+		pk := mustHex(t, h)
+		if !IsSmallOrderOrNonCanonicalEd25519PK(pk) {
+			t.Fatalf("expected IsSmallOrderOrNonCanonicalEd25519PK(%s) == true", h)
+		}
+		_, devID := DeriveDeviceID(pk)
+		if err := VerifyDeviceCard(devID, pk, kem, 1700000000, zeroSig[:]); !errors.Is(err, ErrInvalidSignature) {
+			t.Fatalf("VerifyDeviceCard(%s) got %v, want ErrInvalidSignature", h, err)
+		}
+		mbID := DeriveMailboxID(pk)
+		if VerifyMailboxRequest(ed25519.PublicKey(pk), "GET", "/v1/ping", mbID, "1700000000", strings.Repeat("a", 32), BodyBindingControl(nil), base64.RawURLEncoding.EncodeToString(zeroSig[:])) {
+			t.Fatalf("VerifyMailboxRequest(%s) unexpectedly succeeded", h)
+		}
+	}
+}
