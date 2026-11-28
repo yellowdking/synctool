@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+)
+
+type connCtxKey struct{}
+
+const (
+	corsExposeHeaders = "Retry-After, Content-Length, Content-Type"
+	corsAllowMethods  = "GET, POST, PUT, DELETE, OPTIONS"
+	corsAllowHeaders  = "Authorization, Content-Type, X-Sync-TS, X-Sync-Nonce, X-Sync-Sig, X-Sync-Client, X-Sync-Room-Token, X-Sync-Mailbox-Sig, X-Sync-Deposit-Token, X-Sync-Upload-Token, Last-Event-ID"
+	corsMaxAge        = "86400"
 )
 
 type apiError struct {
@@ -242,7 +252,7 @@ func NewServer(cfg ResolvedConfig, logger *log.Logger) (*Server, error) {
 		guard:   NewIPGuard(cfg.Preset, cfg.TrustedProxies),
 		gate:    NewTransferGate(cfg.Preset.MaxTransferStreams, cfg.Preset.MaxTransferStreamsPerIP),
 		bw:      NewBandwidthLimiter(cfg.MaxBandwidthMbps),
-		nonces:  NewNonceCache(NonceCacheMaxEntries, NonceCacheTTL),
+		nonces:  NewNonceCache(cfg.Preset.MaxNonceEntries, NonceCacheTTL),
 		logger:  logger,
 		gcWake:  make(chan struct{}, 1),
 		gcStop:  make(chan struct{}),
@@ -256,7 +266,7 @@ func NewServer(cfg ResolvedConfig, logger *log.Logger) (*Server, error) {
 	}
 
 	s.rooms = NewRoomManager(cfg.Preset.MaxActiveRooms, wake)
-	s.pipes = NewPipeHub(cfg.Preset.CopyBufBytes, cfg.RendezvousTimeout, cfg.StallTimeout, s.gate, s.bw)
+	s.pipes = NewPipeHubWithMaxDuration(cfg.Preset.CopyBufBytes, cfg.RendezvousTimeout, cfg.StallTimeout, cfg.MaxChunkDuration, s.gate, s.bw)
 	spool, err := NewSpoolStore(cfg, s.bw, wake)
 	if err != nil {
 		return nil, err
@@ -321,9 +331,70 @@ func (s *Server) NewHTTPServer() *http.Server {
 		Addr:              s.cfg.ListenAddr,
 		Handler:           s,
 		TLSConfig:         s.certs.TLSConfig(),
+		MaxHeaderBytes:    MaxHeaderBytes,
 		ReadHeaderTimeout: ReadHeaderTimeout,
 		IdleTimeout:       HTTPIdleTimeout,
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			return context.WithValue(ctx, connCtxKey{}, c)
+		},
 		// Explicitly NO global ReadTimeout/WriteTimeout so large slow-link media streams are never killed.
+	}
+}
+
+func isCleanV1Path(rawPath string) bool {
+	if !strings.HasPrefix(rawPath, "/v1/") {
+		return false
+	}
+	if strings.Contains(rawPath, "..") || strings.Contains(rawPath, `\`) || strings.Contains(rawPath, "//") {
+		return false
+	}
+	trimmed := strings.TrimPrefix(rawPath, "/v1/")
+	if trimmed == "" || strings.HasSuffix(trimmed, "/") {
+		return false
+	}
+	for _, seg := range strings.Split(trimmed, "/") {
+		if seg == "" || seg == "." {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) applyCORSHeaders(w http.ResponseWriter, r *http.Request) bool {
+	if len(s.cfg.CORSOrigins) == 0 {
+		return false
+	}
+	vals := r.Header.Values("Origin")
+	if len(vals) != 1 {
+		return false
+	}
+	allowOrigin, ok := MatchCORSOrigin(s.cfg.CORSOrigins, vals[0])
+	if !ok {
+		return false
+	}
+	h := w.Header()
+	h.Set("Access-Control-Allow-Origin", allowOrigin)
+	h.Set("Vary", "Origin")
+	h.Set("Access-Control-Expose-Headers", corsExposeHeaders)
+	return true
+}
+
+// abortBannedConn cleanly flushes the stealth 404 frame and tears down direct HTTP/2 (or HTTP/1.1) connections
+// without disrupting shared trusted reverse-proxy connections.
+func (s *Server) abortBannedConn(r *http.Request, rc *http.ResponseController) {
+	if rc != nil {
+		_ = rc.Flush()
+	}
+	if remoteIP, ok := ParseRemoteAddrIP(r.RemoteAddr); ok && s.guard.isTrusted(remoteIP) {
+		return
+	}
+	if c, ok := r.Context().Value(connCtxKey{}).(net.Conn); ok && c != nil {
+		_ = c.SetReadDeadline(time.Now())
+		if r.ProtoMajor >= 2 {
+			time.AfterFunc(15*time.Millisecond, func() {
+				_ = c.Close()
+			})
+		}
 	}
 }
 
@@ -378,12 +449,36 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if banned {
 		abortUnreadUploadBody(w, r, rc)
 		writeStealth404(w, r)
+		s.abortBannedConn(r, rc)
 		return
 	}
+
+	// Optional opt-in CORS header & preflight handling (zero headers emitted when --cors-origins is unset).
+	corsMatched := s.applyCORSHeaders(w, r)
+	if corsMatched &&
+		r.Method == http.MethodOptions &&
+		r.URL.RawPath == "" &&
+		isCleanV1Path(r.URL.Path) &&
+		strings.TrimSpace(r.Header.Get("Access-Control-Request-Method")) != "" {
+		if !allowed {
+			wh.Set("Retry-After", "5")
+			writeAPIError(w, newAPIError(429, "ERR_RATE_LIMITED", "request rate limit exceeded", true))
+			return
+		}
+		wh.Set("Access-Control-Allow-Methods", corsAllowMethods)
+		wh.Set("Access-Control-Allow-Headers", corsAllowHeaders)
+		wh.Set("Access-Control-Max-Age", corsMaxAge)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	if !matched {
-		s.guard.RecordStrike(clientIP, now)
+		bannedNow := s.guard.RecordStrike(clientIP, now)
 		abortUnreadUploadBody(w, r, rc)
 		writeStealth404(w, r)
+		if bannedNow {
+			s.abortBannedConn(r, rc)
+		}
 		return
 	}
 
@@ -392,9 +487,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		HeaderSyncTS, HeaderSyncNonce, HeaderSyncSig, HeaderSyncClient,
 		HeaderSyncDepositToken, HeaderSyncUploadToken, HeaderSyncRoomToken, HeaderSyncMailboxSig,
 	) {
-		s.guard.RecordStrike(clientIP, now)
+		bannedNow := s.guard.RecordStrike(clientIP, now)
 		abortUnreadUploadBody(w, r, rc)
 		writeStealth404(w, r)
+		if bannedNow {
+			s.abortBannedConn(r, rc)
+		}
 		return
 	}
 
@@ -417,9 +515,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		!isValidAuthHeaderToken(uploadTok) ||
 		!isValidAuthHeaderToken(roomTok) ||
 		!isValidAuthHeaderToken(mailboxSig) {
-		s.guard.RecordStrike(clientIP, now)
+		bannedNow := s.guard.RecordStrike(clientIP, now)
 		abortUnreadUploadBody(w, r, rc)
 		writeStealth404(w, r)
+		if bannedNow {
+			s.abortBannedConn(r, rc)
+		}
 		return
 	}
 
@@ -431,9 +532,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Data-plane chunk PUT: require single explicit non-negative Content-Length (strictly reject chunked TE).
 		clVals := r.Header.Values("Content-Length")
 		if len(r.TransferEncoding) > 0 || len(clVals) != 1 || clVals[0] == "" || r.ContentLength < 0 {
-			s.guard.RecordStrike(clientIP, now)
+			bannedNow := s.guard.RecordStrike(clientIP, now)
 			abortUnreadUploadBody(w, r, rc)
 			writeStealth404(w, r)
+			if bannedNow {
+				s.abortBannedConn(r, rc)
+			}
 			return
 		}
 		bodyBinding = StreamBodyBinding(r.ContentLength)
@@ -444,9 +548,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			limited := io.LimitReader(r.Body, MaxControlBodyBytes+1)
 			b, err := io.ReadAll(limited)
 			if err != nil || len(b) > MaxControlBodyBytes {
-				s.guard.RecordStrike(clientIP, now)
+				bannedNow := s.guard.RecordStrike(clientIP, now)
 				abortUnreadUploadBody(w, r, rc)
 				writeStealth404(w, r)
+				if bannedNow {
+					s.abortBannedConn(r, rc)
+				}
 				return
 			}
 			rawBody = b
@@ -460,9 +567,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Step 4: Constant-time X-Sync-Sig HMAC verification FIRST (before clock skew & nonce!).
 	if !VerifyRelaySig(s.hmacKey, sigHeader, r.Method, pathAndQuery, tsHeader, nonceHeader, bodyBinding, extraBinding) {
-		s.guard.RecordStrike(clientIP, now)
+		bannedNow := s.guard.RecordStrike(clientIP, now)
 		abortUnreadUploadBody(w, r, rc)
 		writeStealth404(w, r)
+		if bannedNow {
+			s.abortBannedConn(r, rc)
+		}
 		return
 	}
 
@@ -494,12 +604,24 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Step 6: Bounded replay nonce check (only written after valid HMAC + valid clock window!).
-	if !s.nonces.CheckAndAdd(nonceHeader, now) {
-		s.guard.RecordStrike(clientIP, now)
+	switch s.nonces.CheckAndAddStatus(nonceHeader, now) {
+	case NonceAccepted:
+	case NonceReplay:
+		bannedNow := s.guard.RecordStrike(clientIP, now)
 		if rt.isDataUpload {
 			abortUnreadUploadBody(w, r, rc)
 		}
 		writeAPIError(w, newAPIError(401, "ERR_REPLAY_DETECTED", "nonce already consumed", true))
+		if bannedNow {
+			s.abortBannedConn(r, rc)
+		}
+		return
+	case NonceCacheFull:
+		if rt.isDataUpload {
+			abortUnreadUploadBody(w, r, rc)
+		}
+		w.Header().Set("Retry-After", "5")
+		writeAPIError(w, newAPIError(429, "ERR_RATE_LIMITED", "replay nonce cache saturated", true))
 		return
 	}
 
