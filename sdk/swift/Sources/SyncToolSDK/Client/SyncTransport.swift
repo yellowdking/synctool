@@ -3,8 +3,13 @@ import Foundation
 import Security
 
 internal struct RequestAuthOptions: Sendable {
-    var contentType: String = "", roomToken: String = "", depositToken: String = ""
-    var uploadToken: String = "", mailboxId: String = "", mailboxAuthSeed32: Data?, acceptSse: Bool = false
+    var contentType: String = ""
+    var roomToken: String = ""
+    var depositToken: String = ""
+    var uploadToken: String = ""
+    var mailboxId: String = ""
+    var mailboxAuthSeed32: Data? = nil
+    var acceptSse: Bool = false
 }
 
 internal struct RawHttpResponse: Sendable { let statusCode: Int, headers: [String: String], body: Data }
