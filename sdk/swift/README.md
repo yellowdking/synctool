@@ -105,5 +105,5 @@ SYNCTOOL_CLI_BIN=/tmp/synctool-cli-e2e \
 swift test --package-path sdk/swift
 
 # Verify clean iOS Simulator compilation (ensures zero macOS-only API leaks in SyncToolSDK)
-(cd sdk/swift && xcodebuild build -scheme SyncToolSDK -destination "generic/platform=iOS Simulator" CODE_SIGN_ALLOWED=NO -quiet)
+(cd sdk/swift && xcodebuild build -scheme SyncToolSDK -destination "generic/platform=iOS Simulator" CODE_SIGNING_ALLOWED=NO -quiet)
 ```
