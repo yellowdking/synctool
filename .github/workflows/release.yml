@@ -6,8 +6,6 @@ on:
       - "v*"
     branches:
       - main
-    paths:
-      - "VERSION"
   workflow_dispatch:
     inputs:
       version:
