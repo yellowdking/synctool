@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -408,9 +409,11 @@ func TestE2E_SecurityHardening_Redirect_Headers_Overflow_XFF_SlowWatch_And_Versi
 	// 4. WatchInbox Slow-Upload (>1.2s between InitUpload and Commit) MUST deliver event without missing!
 	aliceOfBob, _ := pairTwoClients(t, ctx, alice, bob, synccrypto.ModeQROOB)
 	watchCtx, cancelWatch := context.WithTimeout(ctx, 10*time.Second)
-	defer cancelWatch()
 	gotEventCh := make(chan string, 1)
+	var watchWG sync.WaitGroup
+	watchWG.Add(1)
 	go func() {
+		defer watchWG.Done()
 		_ = bob.WatchInbox(watchCtx, func(ev client.InboxWatchEvent) error {
 			select {
 			case gotEventCh <- ev.ItemID:
@@ -419,6 +422,10 @@ func TestE2E_SecurityHardening_Redirect_Headers_Overflow_XFF_SlowWatch_And_Versi
 			cancelWatch()
 			return nil
 		})
+	}()
+	defer func() {
+		cancelWatch()
+		watchWG.Wait()
 	}()
 	time.Sleep(150 * time.Millisecond)
 
@@ -448,6 +455,8 @@ func TestE2E_SecurityHardening_Redirect_Headers_Overflow_XFF_SlowWatch_And_Versi
 	case <-time.After(5 * time.Second):
 		t.Fatalf("WatchInbox missed slow-upload committed item %s!", slowSendRes.ItemID)
 	}
+	cancelWatch()
+	watchWG.Wait()
 
 	// 5. Forward Compatibility (unknown v1.1 fields) + ERR_UNSUPPORTED_VERSION + Secret Auto-Redaction.
 	v11JSON, _ := json.Marshal(map[string]any{
