@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -24,6 +25,7 @@ const (
 	CryptoBlockBytes          = CryptoPlaintextBlockBytes + AEADTagBytes // 65552 B
 
 	MaxControlBodyBytes        = 16384 // 16 KiB
+	MaxHeaderBytes             = 8192  // 8 KiB HTTP header ceiling
 	MaxAuthHeaderBytes         = 128
 	MaxRoomMsgBytes            = 4096 // 4 KiB raw decoded
 	MaxHandshakeFrames         = 8
@@ -34,25 +36,26 @@ const (
 	SealedHeaderLen            = 208
 
 	ClockSkewMaxSec      = 60
-	NonceCacheMaxEntries = 8192
-	NonceCacheTTL        = 120 * time.Second
+	NonceCacheMaxEntries = 65536
+	NonceCacheTTL        = 125 * time.Second // Covers full ±60s window + boundary
 
-	RendezvousTimeout     = 30 * time.Second
-	StallTimeout          = 30 * time.Second
-	TransferSemWait       = 5 * time.Second
-	ControlDeadline       = 15 * time.Second
-	ReadHeaderTimeout     = 10 * time.Second
-	HTTPIdleTimeout       = 60 * time.Second
-	SSEKeepaliveInterval  = 20 * time.Second
-	SSEMaxDuration        = 90 * time.Second
-	LongPollDefaultSec    = 20
-	LongPollMaxSec        = 25
-	RoomTTLMinSec         = 60
-	RoomTTLMaxSec         = 600
-	RoomTTLDefaultSec     = 300
-	RoomTombstoneDuration = 15 * time.Second
-	UncommittedTTLSec     = 1800
-	MaxManifestDownloads  = 16
+	RendezvousTimeout        = 30 * time.Second
+	StallTimeout             = 30 * time.Second
+	MaxChunkTransferDuration = 5 * time.Minute
+	TransferSemWait          = 5 * time.Second
+	ControlDeadline          = 15 * time.Second
+	ReadHeaderTimeout        = 5 * time.Second
+	HTTPIdleTimeout          = 60 * time.Second
+	SSEKeepaliveInterval     = 20 * time.Second
+	SSEMaxDuration           = 90 * time.Second
+	LongPollDefaultSec       = 20
+	LongPollMaxSec           = 25
+	RoomTTLMinSec            = 60
+	RoomTTLMaxSec            = 600
+	RoomTTLDefaultSec        = 300
+	RoomTombstoneDuration    = 15 * time.Second
+	UncommittedTTLSec        = 1800
+	MaxManifestDownloads     = 16
 
 	StrikeBanThreshold = 10
 	StrikeBanDuration  = 15 * time.Minute
@@ -61,7 +64,9 @@ const (
 	CertValidityDays   = 730
 	CertRotateWarnDays = 30
 
-	MinAutoDiskFreeBytes = 256 << 20 // 256 MiB
+	MinAutoDiskFreeBytes     = 256 << 20  // 256 MiB
+	AutoProfileNanoMaxBytes  = 224 << 20  // < 224 MiB -> nano; >= 224 MiB (e.g. 256 MiB) -> standard
+	AutoProfileMediaMinBytes = 1536 << 20 // >= 1536 MiB -> media
 )
 
 type ProfileName string
@@ -109,6 +114,7 @@ type ProfilePreset struct {
 	SpoolMaxMailboxBytes      int64
 	SpoolMaxItemBytes         int64
 	SpoolMaxItemsPerMailbox   int
+	MaxMailboxes              int
 	SpoolDefaultTTLSec        int64
 	SpoolMaxTTLSec            int64
 	MaxDownloadsPerChunk      int
@@ -117,6 +123,7 @@ type ProfilePreset struct {
 	DataRatePerMin            float64
 	DataBurst                 int
 	MaxTrackedIPs             int
+	MaxNonceEntries           int
 }
 
 func PresetFor(name ProfileName) (ProfilePreset, error) {
@@ -132,8 +139,8 @@ func PresetFor(name ProfileName) (ProfilePreset, error) {
 			RecommendedParallelChunks: 1,
 			MaxParallelChunks:         2,
 			MaxActiveRooms:            32,
-			MaxConns:                  32,
-			MaxConnsPerIP:             6,
+			MaxConns:                  64,
+			MaxConnsPerIP:             16,
 			MaxTransferStreams:        2,
 			MaxTransferStreamsPerIP:   1,
 			DefaultSpool:              SpoolMemory,
@@ -141,6 +148,7 @@ func PresetFor(name ProfileName) (ProfilePreset, error) {
 			SpoolMaxMailboxBytes:      8 << 20,
 			SpoolMaxItemBytes:         4 << 20,
 			SpoolMaxItemsPerMailbox:   16,
+			MaxMailboxes:              256,
 			SpoolDefaultTTLSec:        1800,
 			SpoolMaxTTLSec:            7200,
 			MaxDownloadsPerChunk:      3,
@@ -149,6 +157,7 @@ func PresetFor(name ProfileName) (ProfilePreset, error) {
 			DataRatePerMin:            1800,
 			DataBurst:                 240,
 			MaxTrackedIPs:             2048,
+			MaxNonceEntries:           16384,
 		}, nil
 	case ProfileStandard:
 		return ProfilePreset{
@@ -170,6 +179,7 @@ func PresetFor(name ProfileName) (ProfilePreset, error) {
 			SpoolMaxMailboxBytes:      256 << 20,
 			SpoolMaxItemBytes:         100 << 20,
 			SpoolMaxItemsPerMailbox:   64,
+			MaxMailboxes:              4096,
 			SpoolDefaultTTLSec:        86400,
 			SpoolMaxTTLSec:            259200,
 			MaxDownloadsPerChunk:      5,
@@ -178,6 +188,7 @@ func PresetFor(name ProfileName) (ProfilePreset, error) {
 			DataRatePerMin:            3600,
 			DataBurst:                 480,
 			MaxTrackedIPs:             4096,
+			MaxNonceEntries:           65536,
 		}, nil
 	case ProfileMedia:
 		return ProfilePreset{
@@ -199,6 +210,7 @@ func PresetFor(name ProfileName) (ProfilePreset, error) {
 			SpoolMaxMailboxBytes:      4 << 30,
 			SpoolMaxItemBytes:         2 << 30,
 			SpoolMaxItemsPerMailbox:   256,
+			MaxMailboxes:              32768,
 			SpoolDefaultTTLSec:        259200,
 			SpoolMaxTTLSec:            604800,
 			MaxDownloadsPerChunk:      5,
@@ -207,6 +219,7 @@ func PresetFor(name ProfileName) (ProfilePreset, error) {
 			DataRatePerMin:            6000,
 			DataBurst:                 800,
 			MaxTrackedIPs:             16384,
+			MaxNonceEntries:           262144,
 		}, nil
 	default:
 		return ProfilePreset{}, fmt.Errorf("unknown profile %q (valid: auto, nano, standard, media)", name)
@@ -217,13 +230,58 @@ func ResolveAutoProfileName(memBytes uint64) ProfileName {
 	if memBytes == 0 {
 		return ProfileStandard
 	}
-	if memBytes < 768<<20 {
+	if memBytes < AutoProfileNanoMaxBytes {
 		return ProfileNano
 	}
-	if memBytes < 2048<<20 {
+	if memBytes < AutoProfileMediaMinBytes {
 		return ProfileStandard
 	}
 	return ProfileMedia
+}
+
+// EffectiveMemoryBytes returns min(hostMem, cgroupLimit) across whichever limits are positive.
+func EffectiveMemoryBytes(hostMem, cgroupLimit uint64) uint64 {
+	if hostMem > 0 && cgroupLimit > 0 {
+		if cgroupLimit < hostMem {
+			return cgroupLimit
+		}
+		return hostMem
+	}
+	if cgroupLimit > 0 {
+		return cgroupLimit
+	}
+	return hostMem
+}
+
+// ComputeSafeGoMemLimit computes a safe GOMEMLIMIT (~58.6% of effective memory, so 256 MiB yields 150 MiB),
+// bounded by a safe per-profile ceiling so bare-metal hosts without cgroup limits do not over-reserve RAM.
+func ComputeSafeGoMemLimit(effectiveMem uint64, preset ProfilePreset) int64 {
+	if effectiveMem == 0 {
+		return preset.GoMemLimitBytes
+	}
+	// 75/128 = 58.59375% (within ~56-62%; 256 MiB -> 150 MiB).
+	safe := int64((effectiveMem / 128) * 75)
+	if safe <= 0 {
+		safe = int64((effectiveMem * 3) / 5)
+	}
+	if safe < 24<<20 {
+		safe = 24 << 20
+	}
+	var maxCap int64
+	switch preset.Name {
+	case ProfileNano:
+		maxCap = 96 << 20
+	case ProfileStandard:
+		maxCap = 256 << 20
+	case ProfileMedia:
+		maxCap = 768 << 20
+	default:
+		maxCap = preset.GoMemLimitBytes * 2
+	}
+	if maxCap > 0 && safe > maxCap {
+		safe = maxCap
+	}
+	return safe
 }
 
 type Config struct {
@@ -237,6 +295,7 @@ type Config struct {
 	DataDir          string
 	AccessKey        string
 	TrustedProxies   []netip.Prefix
+	CORSOrigins      []string
 	MaxBandwidthMbps float64
 	ServerVersion    string
 
@@ -245,19 +304,22 @@ type Config struct {
 	SpoolMaxMailboxBytes    int64
 	SpoolMaxItemBytes       int64
 	SpoolMaxItemsPerMailbox int
+	SpoolMaxMailboxes       int
 	SpoolDefaultTTLSec      int64
 	SpoolMaxTTLSec          int64
 	MaxDownloadsPerChunk    int
 	RendezvousTimeout       time.Duration
 	StallTimeout            time.Duration
+	MaxChunkDuration        time.Duration
 	SSEKeepaliveInterval    time.Duration
 	SSEMaxDuration          time.Duration
 
 	// Test hooks
-	DetectMemFunc  func() uint64
-	DiskFreeFunc   func(string) (uint64, bool)
-	NowFunc        func() time.Time
-	DisableMemTune bool
+	DetectMemFunc       func() uint64
+	DetectMemLimitsFunc func() (hostMem, cgroupLimit uint64)
+	DiskFreeFunc        func(string) (uint64, bool)
+	NowFunc             func() time.Time
+	DisableMemTune      bool
 }
 
 type ResolvedConfig struct {
@@ -315,6 +377,13 @@ func LoadConfigFromEnv(base Config) (Config, error) {
 		}
 		cfg.TrustedProxies = prefixes
 	}
+	if v := strings.TrimSpace(os.Getenv("SYNCTOOL_CORS_ORIGINS")); v != "" {
+		origins, err := ParseCORSOrigins(v)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.CORSOrigins = origins
+	}
 	if v := strings.TrimSpace(os.Getenv("SYNCTOOL_MAX_BANDWIDTH_MBPS")); v != "" {
 		mbps, err := strconv.ParseFloat(v, 64)
 		if err != nil || mbps < 0 {
@@ -323,6 +392,77 @@ func LoadConfigFromEnv(base Config) (Config, error) {
 		cfg.MaxBandwidthMbps = mbps
 	}
 	return cfg, nil
+}
+
+// ParseCORSOrigins parses comma-separated exact origins (e.g. "https://app.example.com,http://localhost:5173") or "*".
+func ParseCORSOrigins(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]bool, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if p == "*" {
+			if !seen["*"] {
+				seen["*"] = true
+				out = append(out, "*")
+			}
+			continue
+		}
+		norm, ok := normalizeExactOrigin(p)
+		if !ok {
+			return nil, fmt.Errorf("invalid CORS origin %q (expected exact scheme://host[:port] or *)", p)
+		}
+		if !seen[norm] {
+			seen[norm] = true
+			out = append(out, norm)
+		}
+	}
+	return out, nil
+}
+
+func normalizeExactOrigin(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "null" || !strings.Contains(raw, "://") {
+		return "", false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", false
+	}
+	if u.Path != "" && u.Path != "/" {
+		return "", false
+	}
+	if strings.Contains(u.Host, "*") {
+		return "", false
+	}
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host), true
+}
+
+// MatchCORSOrigin checks if reqOrigin matches the configured allowlist.
+// Returns the Access-Control-Allow-Origin value to emit ("*" or reqOrigin) and true on match.
+func MatchCORSOrigin(allowlist []string, reqOrigin string) (string, bool) {
+	if len(allowlist) == 0 {
+		return "", false
+	}
+	normReq, ok := normalizeExactOrigin(reqOrigin)
+	if !ok {
+		return "", false
+	}
+	for _, allowed := range allowlist {
+		if allowed == "*" {
+			return "*", true
+		}
+		if allowed == normReq {
+			return strings.TrimSpace(reqOrigin), true
+		}
+	}
+	return "", false
 }
 
 func ParseTrustedProxies(raw string) ([]netip.Prefix, error) {
@@ -382,6 +522,53 @@ func IsLoopbackListenAddr(addr string) bool {
 		return false
 	}
 	return ip.Unmap().WithZone("").IsLoopback()
+}
+
+// ParseCgroupV2MaxBytes parses a cgroup v2 memory.max file payload ("max" or empty -> 0).
+func ParseCgroupV2MaxBytes(content string) uint64 {
+	s := strings.TrimSpace(content)
+	if s == "" || s == "max" {
+		return 0
+	}
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil || v == 0 || v >= (1<<60) {
+		return 0
+	}
+	return v
+}
+
+// WalkCgroupV2TightestMax walks from the leaf cgroup v2 slice up to cgroupRoot,
+// returning the minimum positive memory.max across all ancestor slices (handles leaf "max").
+func WalkCgroupV2TightestMax(cgroupRoot, v2Rel string, readFile func(string) ([]byte, error)) uint64 {
+	if cgroupRoot == "" || readFile == nil {
+		return 0
+	}
+	rootClean := filepath.Clean(cgroupRoot)
+	cur := rootClean
+	if rel := strings.TrimSpace(v2Rel); rel != "" && rel != "/" && !strings.Contains(rel, "..") {
+		cand := filepath.Clean(filepath.Join(rootClean, filepath.FromSlash(strings.TrimPrefix(rel, "/"))))
+		if cand == rootClean || strings.HasPrefix(cand, rootClean+string(filepath.Separator)) {
+			cur = cand
+		}
+	}
+
+	var tightest uint64
+	for {
+		if data, err := readFile(filepath.Join(cur, "memory.max")); err == nil {
+			if v := ParseCgroupV2MaxBytes(string(data)); v > 0 && (tightest == 0 || v < tightest) {
+				tightest = v
+			}
+		}
+		if cur == rootClean {
+			break
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur || !strings.HasPrefix(parent, rootClean) {
+			break
+		}
+		cur = parent
+	}
+	return tightest
 }
 
 // ParseProcSelfCgroupPaths extracts relative cgroup v2 and v1 memory slice paths from /proc/self/cgroup.
@@ -502,18 +689,37 @@ func (c Config) Resolve() (ResolvedConfig, error) {
 		return rc, fmt.Errorf("invalid tls mode %q (valid: selfsigned, cert, off)", rc.TLSMode)
 	}
 
-	// Resolve profile preset.
+	// Validate & normalize optional CORS origins.
+	if len(rc.CORSOrigins) > 0 {
+		normOrigins, cerr := ParseCORSOrigins(strings.Join(rc.CORSOrigins, ","))
+		if cerr != nil {
+			return rc, cerr
+		}
+		rc.CORSOrigins = normOrigins
+	}
+
+	// Detect effective memory and resolve profile preset + safe GOMEMLIMIT.
+	var effectiveMem uint64
+	if rc.DetectMemLimitsFunc != nil {
+		h, cg := rc.DetectMemLimitsFunc()
+		effectiveMem = EffectiveMemoryBytes(h, cg)
+	} else if rc.DetectMemFunc != nil {
+		effectiveMem = rc.DetectMemFunc()
+	} else {
+		h, cg := detectMemoryLimits()
+		effectiveMem = EffectiveMemoryBytes(h, cg)
+	}
+
 	profName := rc.Profile
 	if profName == ProfileAuto {
-		detect := rc.DetectMemFunc
-		if detect == nil {
-			detect = detectEffectiveMemoryBytes
-		}
-		profName = ResolveAutoProfileName(detect())
+		profName = ResolveAutoProfileName(effectiveMem)
 	}
 	preset, err := PresetFor(profName)
 	if err != nil {
 		return rc, err
+	}
+	if effectiveMem > 0 {
+		preset.GoMemLimitBytes = ComputeSafeGoMemLimit(effectiveMem, preset)
 	}
 
 	// Apply explicit overrides if provided.
@@ -528,6 +734,9 @@ func (c Config) Resolve() (ResolvedConfig, error) {
 	}
 	if rc.SpoolMaxItemsPerMailbox > 0 {
 		preset.SpoolMaxItemsPerMailbox = rc.SpoolMaxItemsPerMailbox
+	}
+	if rc.SpoolMaxMailboxes > 0 {
+		preset.MaxMailboxes = rc.SpoolMaxMailboxes
 	}
 	if rc.SpoolDefaultTTLSec > 0 {
 		preset.SpoolDefaultTTLSec = rc.SpoolDefaultTTLSec
@@ -587,6 +796,9 @@ func (c Config) Resolve() (ResolvedConfig, error) {
 	}
 	if rc.StallTimeout <= 0 {
 		rc.StallTimeout = StallTimeout
+	}
+	if rc.MaxChunkDuration <= 0 {
+		rc.MaxChunkDuration = MaxChunkTransferDuration
 	}
 	if rc.SSEKeepaliveInterval <= 0 {
 		rc.SSEKeepaliveInterval = SSEKeepaliveInterval
