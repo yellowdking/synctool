@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 
+	synccrypto "github.com/yellowdking/synctool/sdk/go/crypto"
 	"github.com/yellowdking/synctool/sdk/go/envelope"
 )
 
@@ -95,21 +96,70 @@ type mailboxDepositTokenSpec struct {
 	TokenHashHex string `json:"token_hash_hex"`
 }
 
-// SyncMailbox idempotently registers this device's blinded mailbox on the relay and restores all active
-// per-peer inbound deposit token hashes recorded in KeyStore (enabling seamless zero-rebind self-healing
-// when a nano memory-spool relay restarts). Compatible with both v1.0 and v1.1+ relays.
+type allDevicesKeyStore interface {
+	ListAllDevices() ([]envelope.DeviceCard, error)
+}
+
+type pendingTokenDeletesKeyStore interface {
+	AddPendingTokenDelete(tokenID string) error
+	ListPendingTokenDeletes() ([]string, error)
+	RemovePendingTokenDelete(tokenID string) error
+}
+
+// SyncMailbox idempotently registers this device's blinded mailbox on the relay, restores all active
+// per-peer inbound deposit token hashes recorded in KeyStore, backfills missing DeviceCard.RelayID fields,
+// and drains any pending 2-phase deposit token revocations/deletions.
+// Gracefully treats 403 ERR_SPOOL_DISABLED as non-fatal so --spool=off relays work cleanly.
 func (c *Client) SyncMailbox(ctx context.Context) error {
-	cards, err := c.keyStore.ListDevices()
+	done, err := c.beginOp()
 	if err != nil {
 		return err
 	}
+	defer done()
+	return c.syncMailboxInternal(ctx)
+}
+
+func (c *Client) syncMailboxInternal(ctx context.Context) error {
+	var cards []envelope.DeviceCard
+	var err error
+	if allKS, ok := c.keyStore.(allDevicesKeyStore); ok {
+		cards, err = allKS.ListAllDevices()
+	} else {
+		cards, err = c.keyStore.ListDevices()
+	}
+	if err != nil {
+		return err
+	}
+
 	specs := make([]mailboxDepositTokenSpec, 0, len(cards))
 	seenTok := make(map[string]struct{}, len(cards))
+	var revokedPendingCards []envelope.DeviceCard
+
 	for _, card := range cards {
-		if card.Revoked || card.InboundTokenID == "" || len(card.InboundTokenHash) != 64 {
+		// ST-Opt-8: Backfill missing RelayID on legacy/synthetic DeviceCards.
+		if card.RelayID == "" {
+			if card.RelayOrigin != "" {
+				if canon, cerr := synccrypto.CanonicalRelayOrigin(card.RelayOrigin); cerr == nil {
+					card.RelayOrigin = canon
+					card.RelayID = synccrypto.DeriveRelayID(canon)
+					_ = c.keyStore.PutDevice(card)
+				}
+			} else {
+				card.RelayOrigin = c.profile.Endpoint
+				card.RelayID = c.profile.RelayID
+				_ = c.keyStore.PutDevice(card)
+			}
+		}
+		if card.RelayID != c.profile.RelayID {
 			continue
 		}
-		if card.RelayID != "" && card.RelayID != c.profile.RelayID {
+		if card.Revoked {
+			if card.PendingTokenDelete && card.InboundTokenID != "" {
+				revokedPendingCards = append(revokedPendingCards, card)
+			}
+			continue
+		}
+		if card.PendingTokenDelete || card.InboundTokenID == "" || len(card.InboundTokenHash) != 64 {
 			continue
 		}
 		if _, dup := seenTok[card.InboundTokenID]; dup {
@@ -161,5 +211,40 @@ func (c *Client) SyncMailbox(ctx context.Context) error {
 			}
 		}
 	}
+
+	// ST-P1-8: Retry pending 2-phase deposit token deletes now that we are online.
+	pendingDeletes := make(map[string]struct{})
+	if pks, ok := c.keyStore.(pendingTokenDeletesKeyStore); ok {
+		if list, lerr := pks.ListPendingTokenDeletes(); lerr == nil {
+			for _, tokID := range list {
+				if tokID != "" {
+					pendingDeletes[tokID] = struct{}{}
+				}
+			}
+		}
+	}
+	for _, rc := range revokedPendingCards {
+		pendingDeletes[rc.InboundTokenID] = struct{}{}
+	}
+	for tokID := range pendingDeletes {
+		if _, active := seenTok[tokID]; active {
+			if pks, ok := c.keyStore.(pendingTokenDeletesKeyStore); ok {
+				_ = pks.RemovePendingTokenDelete(tokID)
+			}
+			continue
+		}
+		delErr := c.deleteRelayDepositToken(ctx, tokID)
+		if delErr == nil {
+			if pks, ok := c.keyStore.(pendingTokenDeletesKeyStore); ok {
+				_ = pks.RemovePendingTokenDelete(tokID)
+			}
+			for _, rc := range revokedPendingCards {
+				if rc.InboundTokenID == tokID {
+					_ = c.keyStore.DeleteDevice(rc.DeviceID)
+				}
+			}
+		}
+	}
+
 	return nil
 }
