@@ -21,7 +21,7 @@
 | 场景 | 验证与加密路径 | 密码学安全强度 | 用户上手体验 | 跨平台实现与维护 |
 | :--- | :--- | :--- | :--- | :--- |
 | **流 1A：面对面换机 / 首次绑定**（90% 手机↔电脑主路径） | **QR OOB 128-bit 暗码 + 临时 X25519 + 双向 Key Confirmation** | 128-bit 带外暗码 + 128-bit ECDH，抗离线破解、抗主动 MITM、完全双向 PFS | **扫一下二维码即通**，零手输、零易错 | 100% 标准库原生内置，零三方加密依赖 |
-| **流 1B：无摄像头 / 跨城 / CLI 一次性配对**（兜底路径） | **明码路由 + 3 步 Commit-Reveal X25519 + 发送端强制输入接收端 6 位 SAS** | 128-bit ECDH 抗离线破解；Commit-Reveal 彻底封死 SAS 离线碰撞；在线猜中率 $\le 10^{-6}$ 且失败即熔断房间；完全双向 PFS | 仅传 8 位明码，核对/输入对方 6 位数字即可 | 100% 标准库原生内置，零三方加密依赖 |
+| **流 1B：无摄像头 / 跨城 / CLI 一次性配对**（兜底路径） | **明码路由 + 3 步 Commit-Reveal X25519 + 发起端输入 6 位 SAS + 响应端强制 `OnSASConfirm` 双向放行** | 128-bit ECDH 抗离线破解；Commit-Reveal 彻底封死 SAS 离线碰撞；双端门控彻底封死恶心中继双腿 MITM 抢注；在线猜中率 $\le 10^{-6}$ 且失败即熔断房间；完全双向 PFS | 仅传 8 位明码，双端核对 6 位数字即可 | 100% 标准库原生内置，零三方加密依赖 |
 | **流 2：已绑定设备高频定向推送**（记事本 / 剪贴板 / 简易信息工具，兼容在线与离线） | **DeviceCard 0-RTT Ephemeral-Static X25519 + Ed25519 Sealed Sender** | 仅目标设备可解、送信方 Ed25519 防伪造、中继不可知发送者、发送端 PFS（预留 `prekey_id` 供 V2 升级 OTPK） | **点选目标设备一键直发**，无需再输任何码 | 统一通吃 Mode B 暂存箱与 Mode A 超限直传 |
 
 **为何此方案优于 MVP 阶段强上多端 PAKE（SPAKE2）**：
@@ -52,8 +52,12 @@ v1 **禁止运行时动态协商加密套件**（彻底消除降级攻击面）�
 | X25519 私钥 | PKCS#8 | `302e020100300506032b656e04220420` | `kem_sk` (32B) | 48 B |
 | Ed25519 公钥 | SPKI | `302a300506032b6570032100` | `sign_pk` (32B) | 44 B |
 | X25519 公钥 | SPKI | `302a300506032b656e032100` | `kem_pk` (32B) | 44 B |
+| ECDSA P-256 公钥（TLS 叶证书 Pin） | SPKI | `3059301306072a8648ce3d020106082a8648ce3d030107034200` | X9.63 未压缩点 `0x04 \|\| X(32B) \|\| Y(32B)` (65B) | 91 B |
 
-> 注：RFC 7748 规定 X25519 私钥标量钳位（clamping：`k[0] &= 248; k[31] &= 127; k[31] |= 64`）由各平台 `X25519` 底层自动完成；`HKDF-Expand` 产出的 32B `kem_sk` 直接作为原始私钥输入即可保持全平台字节一致。
+> 注 1：RFC 7748 规定 X25519 私钥标量钳位（clamping：`k[0] &= 248; k[31] &= 127; k[31] |= 64`）由各平台 `X25519` 底层自动完成；`HKDF-Expand` 产出的 32B `kem_sk` 直接作为原始私钥输入即可保持全平台字节一致。  
+> 注 2（**Apple `Security.framework` 与 `CryptoKit` 原生互操作红线，供 `sdk/swift` 实现遵循**）：
+> 1. **ECDSA P-256 SPKI DER 26 字节前缀陷阱**：`synctool` 锁定的证书公钥指纹为完整 ASN.1 `DER(SubjectPublicKeyInfo)` 的 `SHA-256`（对 P-256 叶证书固定 `91 B`）。在 iOS / macOS 上调用 `SecCertificateCopyKey` + `SecKeyCopyExternalRepresentation` 返回的仅是 **65 字节 ANSI X9.63 原始椭圆曲线点（`0x04 || X || Y`）**，不含 ASN.1 头！Swift 实现计算 SPKI Pin 时**必须**在 65 字节原始公钥前拼接上表固定 **26 字节 P-256 SPKI DER 前缀**（`3059301306072a8648ce3d020106082a8648ce3d030107034200`，总计 `91 B`）后再做 `SHA256`（或直接从 `SecCertificateCopyData` 解析 `SubjectPublicKeyInfo` TLV）；同时叶证书必须携带匹配的 IP/DNS SAN 且有效期 `≤ 730 天`（低于 Apple 825 天上限）。
+> 2. **`CryptoKit` `AES.GCM.SealedBox` 线缆格式陷阱**：Apple `CryptoKit` 的 `sealedBox.combined` 属性会将 **12B Nonce 拼在密文最前方**（`nonce(12B) || ciphertext || tag(16B)`），而 `synctool-v1` 全协议使用确定性派生 Nonce，线缆仅传输 **`ciphertext || tag(16B)`**（例如 0 字节空 STREAM 块密文精确为 `16 B` Tag）。`sdk/swift` 加密时必须输出 `sealedBox.ciphertext + sealedBox.tag`，解密时必须使用 `try AES.GCM.SealedBox(nonce: nonce, ciphertext: wire.dropLast(16), tag: wire.suffix(16))`，**严禁**对线缆数据直接调用 `AES.GCM.SealedBox(combined:)`。
 
 ### 2.3 基础编码约定
 - `||`：原始字节顺序拼接，无隐式分隔符。
@@ -209,11 +213,15 @@ master_prk = HKDF-Extract(
      {"proto_v":1,"mode":2,"e_a":"<b64u(32B)>","n_a":"<b64u(32B)>","mac_a":"<b64u(32B)>"}
      ```
    - **硬约束**：此时 Alice **严禁**上传任何业务密文，进入等待人工核验状态。
-4. **M4 校验与防盲点人工核验（Bob & Alice）**：
+4. **M4 校验与双端强制人工核验门控（Bob & Alice — 零线缆变更防双腿 MITM）**：
    - Bob 拉取 M3，**第一步先验承诺**：重算 `SHA256("synctool-v1/commit" || purpose_code || room_id || E_a || n_a)` 并常量时间比对 `commit_a`；不符立即中止并销毁房间。
    - Bob 派生 `th, prk, session_key, sas_str, confirm_key_a, confirm_key_b`，**常量时间校验 `mac_a`**；不符立即销毁房间。
-   - 校验通过后：Bob 上报 **M4** `{"proto_v":1,"mode":2,"mac_b":"<b64u(HMAC-SHA256(confirm_key_b, th))>"}` 并在屏幕展示 6 位 `sas_str`（`sas_str` **绝不经中继发送**）。
-   - Alice 收到 M4 校验 `mac_b` 通过后，UI **强制要求用户输入 Bob 屏幕上的 6 位 `sas_str`**（本地常量时间比对，允许最多 2 次防手误输入重试；超限或用户点拒绝立即销毁房间）。比对一致后方才放行后续数据传输或设备绑定。
+   - 校验通过后：Bob 上报 **M4** `{"proto_v":1,"mode":2,"mac_b":"<b64u(HMAC-SHA256(confirm_key_b, th))>"}` 并在屏幕展示 6 位 `sas_str`（`sas_str` **绝不经中继发送**；线缆帧 `M1..M4` 与黄金测试向量 `04_handshake_commit_sas.json` 保持 100% 不变）。
+   - **发起方（Alice）门控**：Alice 收到 M4 校验 `mac_b` 通过后，UI **强制要求用户输入 Bob 屏幕上的 6 位 `sas_str`**（本地常量时间比对，允许最多 2 次防手误输入重试；超限或用户点拒绝立即调用 `/close{"reason":"verify_failed"}` 销毁房间）。比对一致后 Alice 才允许发出加密 `pair_bind`（`ct_a`）或 `pipe_start` 控制帧。
+   - **响应方（Bob）强制 `OnSASConfirm` 门控（防恶心中继单边投毒铁律）**：
+     - **威胁根因**：在恶心中继 $M$（或聊天室 `room_id` 被替换）模型下，$M$ 可同时与 Alice 建立 `SAS_1`、与 Bob 建立 `SAS_2`（在 Bob 腿上 $M$ 自行提交 `commit_m` 揭示 `E_m, n_m`，因此 Bob 的 `VerifyCommitA` 会通过），并在收到 Bob 的 `M4` 后 `<5ms` 内立即向 Bob 伪造自签 `DeviceCard_M` 或恶意 `pipe_start` 包裹——此时即使 Alice 发现 `SAS_1 != SAS_2` 熔断 Alice 腿，$M$ 也可忽略熔断直接劫持无人工确认门控的 Bob！
+     - **强制规范**：所有 SDK（Go / TS / Kotlin / Swift）与 CLI 在 `mode=2` 担任响应方（`AcceptDeviceBind` / `ReceiveOneShot`）时，**必须提供阻塞式人工确认回调 `OnSASConfirm(sas_str)`**；若回调缺失（`nil`）或用户拒绝核验，Bob **必须立即失败关闭（Fail-Closed）**并调用 `/close{"reason":"verify_failed"}` 熔断销毁房间，返回 `ERR_SAS_MISMATCH`。
+     - **双条件放行顺序**：Bob 只有在 **(a) 收到并成功解密对端发来的加密 `pair_bind`（`ct_a`）或 `pipe_start` 帧**（在诚实中继下证明发起方已通过 SAS 输入核验）**且 (b) 本端 `OnSASConfirm(sas_str)` 人工确认通过**这两个条件**全部满足**之后，才允许将对端 `DeviceCard` 写入 `KeyStore`、签发/回复本端 `PairBindPayload`（`ct_b`）、拉取执行业务 `ParcelHandler` 或回传 `pipe_ack`！
 
 ### 4.3 握手成功后的分叉产出
 
@@ -489,7 +497,8 @@ canonical_req =
    - 客户端仅在验过 TLS（含 SPKI Pin）后信任 `server_ts`，缓存进程内时钟偏移并换用**新 `X-Sync-Nonce`** 自动重试 1 次。
 4. **第三步校验并写入 `X-Sync-Nonce` 去重表**：
    - 仅当步骤 2 与 3 均通过后才写入（防未授权流量打爆内存）；
-   - 有界滑动缓存：上限 **`8,192` 条**，单条 TTL **`120 秒`**（超上限按最旧淘汰）。命中重复 nonce 返回 HTTP `401` `{"error":"ERR_REPLAY_DETECTED"}`。
+   - 有界紧凑缓存：使用解码后的 **`[16]byte` 二进制键**，单条 TTL **`125 秒`**（`2 × 60s + 5s`，完整覆盖 `±60s` 整数秒窗口及跨秒边界），容量按档位扩展（`nano = 16,384`、`standard = 65,536`、`media = 262,144`）。
+   - 命中未过期重复 nonce → `strike++`，返回 HTTP `401` `{"error":"ERR_REPLAY_DETECTED"}`；若缓存已满且队首最旧条目仍处于未过期（`live`）状态，服务端**绝不静默淘汰未过期 nonce**，而是返回 HTTP `429` `{"error":"ERR_RATE_LIMITED","retryable":true}`（附 `Retry-After: 5`）。
 5. **第四步执行端点专属鉴权**：信箱所有权签名（§7.4）、投递令牌匹配（§7.4）或房间/上传会话令牌校验。
 
 ### 7.4 信箱所有权签名（`X-Sync-Mailbox-Sig`）与单设备 `deposit_token` 吊销
@@ -512,10 +521,15 @@ canonical_req =
 
 ### 7.5 传输层 TLS、裸 IP 强制 SPKI Pinning 与证书寿命
 - **禁止无校验跳过证书**：彻底废除类似 GravitySSH `RelayTLSModeSelfSignedIP` 的跳过校验行为。
-- **裸 IP 自建模式（`tls=selfsigned`）**：
+- **裸 IP 自建模式（`tls=selfsigned`）与多指纹零停机轮换（Multi-Pin SPKI）**：
   - 自动生成并持久化 ECDSA P-256 自签证书，必须包含 `ExtKeyUsageServerAuth` EKU 及明确的 IP/DNS SAN；
   - 证书有效期锁定 **730 天（2 年）**，严格低于 Apple 平台 `≤ 825` 天叶证书兼容红线；
-  - 服务端计算证书公钥指纹 `pin = hex(SHA256(DER(SubjectPublicKeyInfo)))`（64 位小写 hex），写入配置 URI `synctool://relay?...#k=<access_key>`；客户端必须严格校验叶证书 SPKI SHA-256 精确匹配，并在 `/v1/ping` 返回的 `cert_expires_at` 剩余 **< 30 天** 时向用户触发轮换提醒。
+  - 服务端计算叶证书公钥指纹 `pin = hex(SHA256(DER(SubjectPublicKeyInfo)))`（64 位小写 hex），写入配置 URI `synctool://relay?...&pin=<pin1>[,<pin2>...]#k=<access_key>`；
+  - **多指纹格式规范**：URI 参数 `pin` 支持 **逗号分隔的 `1..8` 个** 64 位十六进制 SPKI SHA-256 指纹（解析时兼容剥离可选 `sha256:` 前缀、转小写并去重）。TLS 1.3 握手时，只要对端叶证书 SPKI SHA-256 与配置列表中的**任一**指纹常量时间精确匹配即放行；全部不匹配则立即中止并返回 `ERR_TLS_PIN_MISMATCH`。
+  - **平滑续期与零停机换钥**：
+    1. **日常到期续签（推荐）**：`synctool-relay cert-rotate --reuse-key` 复用现有 `key.pem`（及原证书非回环 IP/DNS SAN）重签全新 730 天叶证书，**SPKI `pin` 完全不变**，所有已配对客户端零改动无缝衔接；
+    2. **私钥轮换（双阶段零停机）**：先执行 `synctool-relay cert-rotate --stage-next` 生成候选证书 `tls-next.crt` / `tls-next.key` 并输出双指纹 URI `pin=<cur>,<next>` 供客户端平滑导入；随后执行 `synctool-relay cert-rotate --promote-staged` 原子切换至 `cert.pem` / `key.pem` 并通过 `SIGHUP` 热重载。
+  - 客户端在 `/v1/ping` 或 `/v1/caps` 返回 `cert_expires_at` 剩余 **< 30 天**（`cert_rotate_recommended == true`）时向用户触发轮换提醒。
 - **反代模式（`tls=off`）**：服务端仅允许在监听地址为 loopback（`127.0.0.1` / `::1`）或显式配置 `TRUSTED_PROXIES` 时启用 `tls=off`；客户端对外部反代域名强制走系统根 CA 的 TLS 1.3。
 - **URI 安全红线**：`synctool://relay?...` 与 `synctool://pair?...` 中的敏感密钥（`k`、`s`）置于 `#fragment`（防止出现在 HTTP 请求或反代日志中）；所有客户端严禁将含密钥 URI 写入日志/崩溃上报，移动端严禁注册系统全局 Deep Link 拦截该 scheme。
 
