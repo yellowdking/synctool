@@ -174,7 +174,7 @@ func SignMailboxRequest(mailboxAuthSK ed25519.PrivateKey, method, pathAndRawQuer
 
 // VerifyMailboxRequest verifies X-Sync-Mailbox-Sig against mailboxAuthPK.
 func VerifyMailboxRequest(mailboxAuthPK ed25519.PublicKey, method, pathAndRawQuery, mailboxID, ts, nonce, bodyBinding, sigB64U string) bool {
-	if len(mailboxAuthPK) != ed25519.PublicKeySize {
+	if len(mailboxAuthPK) != ed25519.PublicKeySize || IsSmallOrderOrNonCanonicalEd25519PK(mailboxAuthPK) {
 		return false
 	}
 	sig, err := base64.RawURLEncoding.DecodeString(sigB64U)

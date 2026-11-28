@@ -20,6 +20,10 @@ const (
 	ModeQROOB     = 1
 	ModeCommitSAS = 2
 
+	HandshakeModeDirect = ModeDirect
+	HandshakeModeQROOB  = ModeQROOB
+	HandshakeModeSAS    = ModeCommitSAS
+
 	PurposeDirect  = "direct"
 	PurposeOneshot = "oneshot"
 	PurposePair    = "pair"
