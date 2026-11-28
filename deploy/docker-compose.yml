@@ -20,18 +20,20 @@ services:
     cap_drop:
       - ALL
     pids_limit: 128
-    mem_limit: 192m
+    mem_limit: 256m
     ports:
       - "54843:54843"
     environment:
       # 填入你的 VPS 公网 IP（用于生成证书 IP SAN 与客户端导入 URI）
       SYNCTOOL_PUBLIC_HOST: "${SYNCTOOL_PUBLIC_HOST:-}"
-      # 自动按容器/VPS 内存选档：auto | nano | standard | media
-      SYNCTOOL_PROFILE: "${SYNCTOOL_PROFILE:-auto}"
+      # 容器默认 standard（256m 内存预算对应安全 GOMEMLIMIT ~150 MiB）；可选 auto | nano | standard | media
+      SYNCTOOL_PROFILE: "${SYNCTOOL_PROFILE:-standard}"
       # 离线暂存总开关：auto（按档位自动）| off（手动彻底关闭离线暂存，仅保留实时零落盘管道）| memory | disk
       SYNCTOOL_SPOOL: "${SYNCTOOL_SPOOL:-auto}"
       SYNCTOOL_TLS: "selfsigned"
       SYNCTOOL_DATA_DIR: "/data"
+      # 可选：允许跨源浏览器/PWA 访问的精确 Origin 列表（逗号分隔或 *；默认留空零 CORS 头保持隐身）
+      SYNCTOOL_CORS_ORIGINS: "${SYNCTOOL_CORS_ORIGINS:-}"
       # 可选：按需限制全局带宽（Mbps）保护按流量计费的 NAT 小鸡，0 表示不限
       SYNCTOOL_MAX_BANDWIDTH_MBPS: "${SYNCTOOL_MAX_BANDWIDTH_MBPS:-0}"
     volumes:

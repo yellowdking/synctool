@@ -23,18 +23,20 @@ services:
     cap_drop:
       - ALL
     pids_limit: 128
-    mem_limit: 192m
+    mem_limit: 256m
     expose:
       - "54843"
     environment:
       SYNCTOOL_LISTEN: ":54843"
       SYNCTOOL_PUBLIC_HOST: "https://${SYNCTOOL_DOMAIN:?set SYNCTOOL_DOMAIN}:443"
-      SYNCTOOL_PROFILE: "${SYNCTOOL_PROFILE:-auto}"
+      SYNCTOOL_PROFILE: "${SYNCTOOL_PROFILE:-standard}"
       # 可手动设为 off 彻底关闭离线暂存：SYNCTOOL_SPOOL=off
       SYNCTOOL_SPOOL: "${SYNCTOOL_SPOOL:-auto}"
       # 由前置 Caddy 终止 HTTPS，中继内网仅信任反代网段
       SYNCTOOL_TLS: "off"
       SYNCTOOL_TRUSTED_PROXIES: "127.0.0.1/32,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16,::1/128,fc00::/7"
+      # 可选：跨源浏览器 / PWA / Tauri WebView 白名单（例如 https://app.example.com 或 *；默认留空保持隐身）
+      SYNCTOOL_CORS_ORIGINS: "${SYNCTOOL_CORS_ORIGINS:-}"
       SYNCTOOL_DATA_DIR: "/data"
     volumes:
       - synctool_data:/data

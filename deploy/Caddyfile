@@ -2,6 +2,31 @@
 	request_body {
 		max_size 4MB
 	}
+
+	# Cross-Origin Browser / PWA / WebView Support (CORS):
+	#
+	# Recommended (built-in zero-strike handling on synctool-relay):
+	#   Set SYNCTOOL_CORS_ORIGINS="https://app.example.com" (or "*") on the synctool-relay
+	#   service in docker-compose.caddy.yml. synctool-relay natively handles OPTIONS /v1/*
+	#   preflights (204 No Content, 0 IP strikes) and sets Access-Control-Allow-Origin,
+	#   Vary: Origin, and Access-Control-Expose-Headers: Retry-After, Content-Length, Content-Type.
+	#
+	# Alternative (Caddy-level edge preflight — keep SYNCTOOL_CORS_ORIGINS empty to avoid duplicate headers):
+	#   @cors_preflight {
+	#       method OPTIONS
+	#       path /v1/*
+	#       header Origin https://app.example.com
+	#       header Access-Control-Request-Method *
+	#   }
+	#   handle @cors_preflight {
+	#       header Access-Control-Allow-Origin "https://app.example.com"
+	#       header Vary "Origin"
+	#       header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS"
+	#       header Access-Control-Allow-Headers "Authorization, Content-Type, X-Sync-TS, X-Sync-Nonce, X-Sync-Sig, X-Sync-Client, X-Sync-Room-Token, X-Sync-Mailbox-Sig, X-Sync-Deposit-Token, X-Sync-Upload-Token, Last-Event-ID"
+	#       header Access-Control-Max-Age "86400"
+	#       respond "" 204
+	#   }
+
 	reverse_proxy synctool-relay:54843 {
 		# Disable response buffering so Mode A chunk streams and SSE deliver immediately.
 		flush_interval -1
