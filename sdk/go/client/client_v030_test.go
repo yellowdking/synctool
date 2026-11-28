@@ -549,7 +549,7 @@ func TestV030_P1_8_9_10_13_RePair_TwoPhaseRevoke_WatchIdle_AbortedSpool_SkipVeri
 		t.Fatalf("expected ERR_HANDSHAKE_TIMEOUT on DeadlineExceeded, got %v", hsTimeoutErr)
 	}
 
-	// Stalled SSE stream MUST hit 120ms idle timeout, backoff cleanly, fall back to poll, and deliver event!
+	// Stalled SSE + oversized >4MiB control response test server.
 	prevIdle := sseIdleTimeout
 	sseIdleTimeout = 120 * time.Millisecond
 	defer func() { sseIdleTimeout = prevIdle }()
