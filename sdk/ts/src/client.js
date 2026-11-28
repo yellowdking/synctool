@@ -2,7 +2,6 @@
 // Implements spec/PROTOCOL.md, spec/CRYPTO_AND_AUTH.md, and spec/ENVELOPE_AND_SDK.md.
 
 import {
-  bytesToB64u,
   bytesToHex,
   deriveDeviceIdentity,
   deriveMailboxIdentity,
@@ -11,6 +10,7 @@ import {
   signMailboxRequest,
   signRelayRequest,
   utf8Encode,
+  zeroBytes,
 } from './crypto.js';
 import {
   ErrorCode,
@@ -18,13 +18,18 @@ import {
   canonicalizeRelayOrigin,
   isBareIP,
   parseRelayURI,
+  resolveConfigSpkiPins,
 } from './envelope.js';
 import { MemoryKeyStore } from './keystore.js';
 import {
+  DEFAULT_MAX_IN_MEMORY_BLOB_BYTES,
   StreamingSha256,
   blobFromBytes,
+  blobFromNodeFile,
   blobFromSliceReader,
   blobFromWebBlob,
+  createNodeFileBlobSink,
+  createNodePinnedAgent,
   isNodeRuntime,
   nodePinnedFetch,
 } from './client_transport.js';
@@ -45,9 +50,61 @@ import {
   syncMailboxImpl,
 } from './client_heal.js';
 
-export { StreamingSha256, blobFromWebBlob, blobFromSliceReader, blobFromBytes, resolveDeviceCard };
+export {
+  DEFAULT_MAX_IN_MEMORY_BLOB_BYTES,
+  StreamingSha256,
+  blobFromWebBlob,
+  blobFromSliceReader,
+  blobFromBytes,
+  blobFromNodeFile,
+  createNodeFileBlobSink,
+  resolveDeviceCard,
+};
 
-const CLIENT_UA = 'synctool-ts/1.0';
+const CLIENT_UA = 'synctool-ts/0.3.0';
+export const MAX_CLOCK_SKEW_OFFSET_SEC = 365 * 86400; // ±365 days safe bound (ST-P1-6)
+
+function clampClockOffset(offsetSec) {
+  if (!Number.isFinite(offsetSec)) return 0;
+  return Math.max(-MAX_CLOCK_SKEW_OFFSET_SEC, Math.min(MAX_CLOCK_SKEW_OFFSET_SEC, Math.trunc(offsetSec)));
+}
+
+function normalizeClientRelayConfig(relayInput) {
+  if (typeof relayInput === 'string') {
+    return parseRelayURI(relayInput);
+  }
+  if (!relayInput || typeof relayInput !== 'object') {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'invalid relay configuration');
+  }
+  const rawOrigin = relayInput.origin ?? relayInput.endpoint ?? '';
+  const canon = canonicalizeRelayOrigin(rawOrigin);
+  const spkiPins = resolveConfigSpkiPins(
+    {
+      spkiPins: relayInput.spkiPins ?? relayInput.spki_pins,
+      spkiPin: relayInput.spkiPin ?? relayInput.spki_pin ?? relayInput.spki_sha256,
+    },
+    'spkiPin',
+  );
+  const accessKey = relayInput.accessKey ?? relayInput.access_key ?? '';
+  if (!accessKey || accessKey.length < 32) {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'relay accessKey must be >= 32 chars');
+  }
+  if (spkiPins.length === 0 && canon.scheme === 'https' && isBareIP(canon.hostname)) {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'bare IP https relay requires SPKI pin');
+  }
+  const tlsMode = spkiPins.length > 0 ? 'spki_pin' : (relayInput.tlsMode ?? relayInput.tls_mode ?? 'system_ca');
+  if (tlsMode === 'spki_pin' && spkiPins.length === 0) {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'tlsMode="spki_pin" requires at least one 64-hex SPKI pin');
+  }
+  return {
+    version: 1,
+    origin: canon.origin,
+    tlsMode,
+    spkiPin: spkiPins[0] ?? null,
+    spkiPins,
+    accessKey,
+  };
+}
 
 // ============================================================================
 // SyncClient Implementation
@@ -56,7 +113,7 @@ const CLIENT_UA = 'synctool-ts/1.0';
 export class SyncClient {
   /**
    * @param {{
-   *   relay: string | { origin: string, tlsMode?: 'system_ca'|'spki_pin', spkiPin?: string|null, accessKey: string },
+   *   relay: string | { origin: string, tlsMode?: 'system_ca'|'spki_pin', spkiPin?: string|null, spkiPins?: string[]|null, accessKey: string },
    *   keyStore?: any,
    *   appId?: string,
    *   label?: string,
@@ -64,114 +121,258 @@ export class SyncClient {
    *   fetchImpl?: typeof fetch,
    *   onCertExpiring?: (event: any) => void,
    *   clockOffsetSec?: number,
+   *   maxInMemoryBlobBytes?: number,
    * }} config
    */
   constructor(config) {
     if (!config || !config.relay) {
       throw new SyncError(ErrorCode.ERR_URI_INVALID, 'SyncClient requires relay configuration or synctool://relay URI');
     }
-    const parsedRelay = typeof config.relay === 'string' ? parseRelayURI(config.relay) : {
-      origin: canonicalizeRelayOrigin(config.relay.origin).origin,
-      tlsMode: config.relay.spkiPin ? 'spki_pin' : (config.relay.tlsMode ?? 'system_ca'),
-      spkiPin: config.relay.spkiPin ?? null,
-      accessKey: config.relay.accessKey,
-    };
-    if (!parsedRelay.accessKey || parsedRelay.accessKey.length < 32) {
-      throw new SyncError(ErrorCode.ERR_URI_INVALID, 'relay accessKey must be >= 32 chars');
-    }
-    const canon = canonicalizeRelayOrigin(parsedRelay.origin);
-    if (canon.scheme === 'https' && isBareIP(canon.hostname) && !parsedRelay.spkiPin) {
-      throw new SyncError(ErrorCode.ERR_URI_INVALID, 'bare IP https relay requires SPKI pin');
-    }
-
-    this.relay = parsedRelay;
+    this.relay = normalizeClientRelayConfig(config.relay);
     this.keyStore = config.keyStore ?? new MemoryKeyStore();
     this.appId = config.appId ?? 'synctool.ts';
     this.label = config.label ?? 'synctool-ts';
     this.platform = config.platform ?? (isNodeRuntime() ? 'linux' : 'web');
     this._fetchImpl = config.fetchImpl ?? null;
     this._onCertExpiring = config.onCertExpiring ?? null;
-    this._clockOffsetSec = config.clockOffsetSec ?? 0;
+    this._clockOffsetSec = clampClockOffset(config.clockOffsetSec ?? 0);
+    this._maxInMemoryBlobBytes = config.maxInMemoryBlobBytes ?? DEFAULT_MAX_IN_MEMORY_BLOB_BYTES;
+
     this._cachedCaps = null;
     this._identityPromise = null;
+    this._resolvedIdentity = null;
     this._relayIdPromise = null;
     this._mailboxIdentityPromise = null;
+    this._resolvedMailboxIdentity = null;
+    this._pinnedAgentPromise = null;
+    this._pinnedAgent = null;
+    /** @type {Set<AbortController>} */
+    this._activeControllers = new Set();
+    /** @type {Set<string>} */
+    this._inFlightMsgIds = new Set();
+    this._closed = false;
   }
 
   static fromEnv(overrides = {}) {
     return createClientFromEnv(SyncClient, overrides);
   }
 
+  _assertOpen() {
+    if (this._closed) {
+      throw new SyncError(ErrorCode.ERR_CANCELLED, 'SyncClient is closed');
+    }
+  }
+
+  /** Local wall-clock Unix seconds — NEVER tainted by relay `clockOffsetSec` (ST-P1-6). */
+  _localNowSec() {
+    return Math.floor(Date.now() / 1000);
+  }
+
+  /** Relay HTTP authentication timestamp (`X-Sync-TS` / `since_ts` ONLY) (ST-P1-6). */
+  _authNowSec() {
+    return this._localNowSec() + this._clockOffsetSec;
+  }
+
+  async _getReplayWatermarkSec() {
+    if (typeof this.keyStore?.getReplayWatermark === 'function') {
+      return (await this.keyStore.getReplayWatermark()) ?? 0;
+    }
+    return 0;
+  }
+
   async getRelayId() {
+    this._assertOpen();
     if (!this._relayIdPromise) {
-      this._relayIdPromise = deriveRelayId(this.relay.origin);
+      this._relayIdPromise = deriveRelayId(this.relay.origin).catch((err) => {
+        this._relayIdPromise = null;
+        throw err;
+      });
     }
     return this._relayIdPromise;
   }
 
   async getIdentity() {
+    this._assertOpen();
     if (!this._identityPromise) {
       this._identityPromise = (async () => {
         const seed = await this.keyStore.loadOrCreateMasterSeed();
-        return deriveDeviceIdentity(seed);
-      })();
+        try {
+          const id = await deriveDeviceIdentity(seed);
+          if (this._closed) {
+            this._zeroIdentity(id);
+            throw new SyncError(ErrorCode.ERR_CANCELLED, 'SyncClient is closed');
+          }
+          this._resolvedIdentity = id;
+          return id;
+        } finally {
+          zeroBytes(seed);
+        }
+      })().catch((err) => {
+        this._identityPromise = null;
+        throw err;
+      });
     }
     return this._identityPromise;
   }
 
   async getMailboxIdentity() {
+    this._assertOpen();
     if (!this._mailboxIdentityPromise) {
       this._mailboxIdentityPromise = (async () => {
         const [seed, relayId] = await Promise.all([
           this.keyStore.loadOrCreateMasterSeed(),
           this.getRelayId(),
         ]);
-        return deriveMailboxIdentity(seed, relayId);
-      })();
+        try {
+          const mb = await deriveMailboxIdentity(seed, relayId);
+          if (this._closed) {
+            zeroBytes(mb.mailboxAuthSeed);
+            throw new SyncError(ErrorCode.ERR_CANCELLED, 'SyncClient is closed');
+          }
+          this._resolvedMailboxIdentity = mb;
+          return mb;
+        } finally {
+          zeroBytes(seed);
+        }
+      })().catch((err) => {
+        this._mailboxIdentityPromise = null;
+        throw err;
+      });
     }
     return this._mailboxIdentityPromise;
+  }
+
+  _zeroIdentity(id) {
+    if (!id) return;
+    zeroBytes(id.masterPrk);
+    zeroBytes(id.signSeed);
+    zeroBytes(id.kemSk);
+    zeroBytes(id.localMetaKey);
+  }
+
+  /**
+   * Abort all active requests, destroy keep-alive TLS SPKI agent sockets, and wipe derived secret keys in RAM (ST-P1-13).
+   */
+  async close() {
+    if (this._closed) return;
+    this._closed = true;
+
+    for (const ctrl of this._activeControllers) {
+      ctrl.abort();
+    }
+    this._activeControllers.clear();
+
+    const pendingId = this._identityPromise;
+    const pendingMb = this._mailboxIdentityPromise;
+    this._identityPromise = null;
+    this._mailboxIdentityPromise = null;
+
+    if (pendingId) {
+      const id = await pendingId.catch(() => null);
+      this._zeroIdentity(id);
+    }
+    this._zeroIdentity(this._resolvedIdentity);
+    this._resolvedIdentity = null;
+
+    if (pendingMb) {
+      const mb = await pendingMb.catch(() => null);
+      if (mb) zeroBytes(mb.mailboxAuthSeed);
+    }
+    if (this._resolvedMailboxIdentity) {
+      zeroBytes(this._resolvedMailboxIdentity.mailboxAuthSeed);
+      this._resolvedMailboxIdentity = null;
+    }
+
+    if (this._pinnedAgentPromise) {
+      const agent = await this._pinnedAgentPromise.catch(() => null);
+      agent?.destroy();
+      this._pinnedAgentPromise = null;
+    }
+    if (this._pinnedAgent) {
+      this._pinnedAgent.destroy();
+      this._pinnedAgent = null;
+    }
+  }
+
+  async _getOrCreatePinnedAgent() {
+    if (this._pinnedAgent) return this._pinnedAgent;
+    if (!this._pinnedAgentPromise) {
+      this._pinnedAgentPromise = createNodePinnedAgent(this.relay.spkiPins)
+        .then((agent) => {
+          if (this._closed) {
+            agent.destroy();
+            throw new SyncError(ErrorCode.ERR_CANCELLED, 'SyncClient is closed');
+          }
+          this._pinnedAgent = agent;
+          return agent;
+        })
+        .catch((err) => {
+          this._pinnedAgentPromise = null;
+          throw err;
+        });
+    }
+    return this._pinnedAgentPromise;
   }
 
   // --------------------------------------------------------------------------
   // Low-Level Transport & Authenticated Request Pipeline (with 409 Clock Skew Retry)
   // --------------------------------------------------------------------------
 
-  async _rawTransport(url, init) {
-    if (this._fetchImpl) {
+  async _rawTransport(url, init = {}) {
+    this._assertOpen();
+    const reqCtrl = new AbortController();
+    const callerSignal = init.signal;
+    const onCallerAbort = () => reqCtrl.abort();
+    if (callerSignal) {
+      if (callerSignal.aborted) {
+        throw new SyncError(ErrorCode.ERR_CANCELLED, 'request aborted');
+      }
+      callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+    }
+    this._activeControllers.add(reqCtrl);
+
+    const effectiveInit = { ...init, signal: reqCtrl.signal };
+    try {
+      if (this._fetchImpl) {
+        try {
+          return await this._fetchImpl(url, effectiveInit);
+        } catch (err) {
+          if (err instanceof SyncError) throw err;
+          if (reqCtrl.signal.aborted) throw new SyncError(ErrorCode.ERR_CANCELLED, 'request aborted', { cause: err });
+          const errDesc = `${err?.message || ''} ${err?.cause?.message || ''}`;
+          const isRedirectBlock = effectiveInit.redirect === 'error' && /redirect/i.test(errDesc);
+          throw new SyncError(
+            ErrorCode.ERR_RELAY_UNREACHABLE,
+            isRedirectBlock ? 'relay HTTP redirect blocked for credential safety' : `fetch failed: ${err.message}`,
+            { retryable: !isRedirectBlock, cause: err },
+          );
+        }
+      }
+      if (this.relay.tlsMode === 'spki_pin' && this.relay.spkiPins.length > 0) {
+        if (!isNodeRuntime()) {
+          throw new SyncError(
+            ErrorCode.ERR_TLS_CERT_INVALID,
+            'browser sandbox cannot perform custom TLS SPKI pinning; use HTTPS domain with system_ca or Node/native runtime',
+          );
+        }
+        const agent = await this._getOrCreatePinnedAgent();
+        return await nodePinnedFetch(url, effectiveInit, this.relay.spkiPins, agent);
+      }
       try {
-        return await this._fetchImpl(url, init);
+        return await globalThis.fetch(url, effectiveInit);
       } catch (err) {
-        if (err instanceof SyncError) throw err;
-        if (init.signal?.aborted) throw new SyncError(ErrorCode.ERR_CANCELLED, 'request aborted', { cause: err });
+        if (reqCtrl.signal.aborted) throw new SyncError(ErrorCode.ERR_CANCELLED, 'request aborted', { cause: err });
         const errDesc = `${err?.message || ''} ${err?.cause?.message || ''}`;
-        const isRedirectBlock = init.redirect === 'error' && /redirect/i.test(errDesc);
+        const isRedirectBlock = effectiveInit.redirect === 'error' && /redirect/i.test(errDesc);
         throw new SyncError(
           ErrorCode.ERR_RELAY_UNREACHABLE,
-          isRedirectBlock ? 'relay HTTP redirect blocked for credential safety' : `fetch failed: ${err.message}`,
+          isRedirectBlock ? 'relay HTTP redirect blocked for credential safety' : `relay unreachable: ${err.message}`,
           { retryable: !isRedirectBlock, cause: err },
         );
       }
-    }
-    if (this.relay.tlsMode === 'spki_pin' && this.relay.spkiPin) {
-      if (!isNodeRuntime()) {
-        throw new SyncError(
-          ErrorCode.ERR_TLS_CERT_INVALID,
-          'browser sandbox cannot perform custom TLS SPKI pinning; use HTTPS domain with system_ca or Node/native runtime',
-        );
-      }
-      return nodePinnedFetch(url, init, this.relay.spkiPin);
-    }
-    try {
-      return await globalThis.fetch(url, init);
-    } catch (err) {
-      if (init.signal?.aborted) throw new SyncError(ErrorCode.ERR_CANCELLED, 'request aborted', { cause: err });
-      const errDesc = `${err?.message || ''} ${err?.cause?.message || ''}`;
-      const isRedirectBlock = init.redirect === 'error' && /redirect/i.test(errDesc);
-      throw new SyncError(
-        ErrorCode.ERR_RELAY_UNREACHABLE,
-        isRedirectBlock ? 'relay HTTP redirect blocked for credential safety' : `relay unreachable: ${err.message}`,
-        { retryable: !isRedirectBlock, cause: err },
-      );
+    } finally {
+      this._activeControllers.delete(reqCtrl);
+      callerSignal?.removeEventListener('abort', onCallerAbort);
     }
   }
 
@@ -183,14 +384,15 @@ export class SyncClient {
   }
 
   async _signedRequestAttempt(opts, attempt) {
+    this._assertOpen();
     const method = opts.method.toUpperCase();
-    const pathAndRawQuery = opts.path; // e.g. "/v1/ping" or "/v1/rooms/ABCD1234/events?since=0&mode=sse"
+    const pathAndRawQuery = opts.path;
     const isDataPlanePut = Boolean(opts.isDataPlanePut);
     const bodyBytes = opts.jsonBody !== undefined
       ? utf8Encode(JSON.stringify(opts.jsonBody))
       : (opts.bodyBytes ?? null);
 
-    const ts = Math.floor(Date.now() / 1000) + this._clockOffsetSec;
+    const ts = this._authNowSec();
     const nonce = bytesToHex(randomBytes(16));
 
     const sigParams = {
@@ -251,6 +453,8 @@ export class SyncClient {
       return res;
     }
     if (res.status >= 300 && res.status < 400) {
+      // ST-P2-15: cancel any unread 3xx redirect response stream immediately
+      res.body?.cancel?.().catch(() => {});
       throw new SyncError(ErrorCode.ERR_RELAY_UNREACHABLE, 'relay HTTP redirect blocked for credential and SPKI pin safety', {
         retryable: false,
         httpStatus: res.status,
@@ -272,9 +476,17 @@ export class SyncClient {
       errJson = null;
     }
 
-    // Automatic 1-time 409 ERR_CLOCK_SKEW adjustment & retry with fresh nonce (spec/CRYPTO_AND_AUTH.md §7.3)
-    if (res.status === 409 && errJson?.error === ErrorCode.ERR_CLOCK_SKEW && typeof errJson.server_ts === 'number' && attempt === 0) {
-      this._clockOffsetSec = errJson.server_ts - Math.floor(Date.now() / 1000);
+    // Automatic 1-time 409 ERR_CLOCK_SKEW adjustment & retry with fresh nonce, clamped to ±365d (ST-P1-6)
+    const rawServerTs = typeof errJson?.server_ts === 'number' ? errJson.server_ts : errJson?.server_unix;
+    if (
+      res.status === 409 &&
+      errJson?.error === ErrorCode.ERR_CLOCK_SKEW &&
+      Number.isFinite(rawServerTs) &&
+      rawServerTs > 0 &&
+      attempt === 0
+    ) {
+      const rawOffset = Math.trunc(rawServerTs) - this._localNowSec();
+      this._clockOffsetSec = clampClockOffset(rawOffset);
       return this._signedRequestAttempt(opts, 1);
     }
 
@@ -300,7 +512,7 @@ export class SyncClient {
 
   async _checkCertExpiryEvent(payload) {
     if (!this._onCertExpiring || !payload || !payload.cert_rotate_recommended || !payload.cert_expires_at) return;
-    const nowSec = payload.server_ts ?? Math.floor(Date.now() / 1000);
+    const nowSec = payload.server_ts ?? this._localNowSec();
     const daysRemaining = Math.max(0, Math.floor((payload.cert_expires_at - nowSec) / 86400));
     const relayId = await this.getRelayId();
     this._onCertExpiring({
@@ -336,7 +548,7 @@ export class SyncClient {
   }
 
   async registerMailbox(opts = {}) {
-    return syncMailboxImpl(this, { ...opts, throwOnDisabled: true });
+    return syncMailboxImpl(this, opts);
   }
 
   async syncMailbox(opts = {}) {
@@ -348,6 +560,10 @@ export class SyncClient {
   // --------------------------------------------------------------------------
 
   startDeviceBind(opts = {}) {
+    return startDeviceBindImpl(this, opts);
+  }
+
+  initiateDeviceBind(opts = {}) {
     return startDeviceBindImpl(this, opts);
   }
 
