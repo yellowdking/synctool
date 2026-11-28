@@ -417,29 +417,48 @@ final class CrossLangRelayE2ETests: XCTestCase {
             env["SYNCTOOL_RELAY"] = relayUri
             cliProc.environment = env
             let outPipe = Pipe()
+            let errPipe = Pipe()
             cliProc.standardOutput = outPipe
-            cliProc.standardError = FileHandle.nullDevice
+            cliProc.standardError = errPipe
             try cliProc.run()
+            try? outPipe.fileHandleForWriting.close()
+            try? errPipe.fileHandleForWriting.close()
             defer { if cliProc.isRunning { cliProc.terminate() } }
 
             let uriSig = AsyncSignal<String>()
-            let fh = outPipe.fileHandleForReading
+            let readHandle = outPipe.fileHandleForReading
             Task.detached {
                 var buf = Data()
+                var scratch = [UInt8](repeating: 0, count: 1024)
                 while true {
-                    let chunk = (try? fh.read(upToCount: 4096)) ?? Data()
-                    if chunk.isEmpty { break }
-                    buf.append(chunk)
+                    let n = withExtendedLifetime(readHandle) {
+                        scratch.withUnsafeMutableBytes { ptr in
+                            Darwin.read(readHandle.fileDescriptor, ptr.baseAddress, ptr.count)
+                        }
+                    }
+                    if n < 0 && errno == EINTR { continue }
+                    if n <= 0 { break }
+                    buf.append(contentsOf: scratch[0..<n])
                     while let nl = buf.firstIndex(of: 0x0A) {
-                        let line = Data(buf[..<nl]); buf.removeSubrange(...nl)
+                        let line = Data(buf[..<nl])
+                        buf.removeSubrange(...nl)
                         if let obj = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
-                           (obj["event"] as? String) == "offer_ready", let pairUri = obj["pair_uri"] as? String {
+                           (obj["event"] as? String) == "offer_ready",
+                           let pairUri = obj["pair_uri"] as? String {
                             await uriSig.complete(pairUri)
                         }
                     }
                 }
+                await uriSig.complete("")
             }
             let cliPairUri = try await uriSig.wait()
+            if cliPairUri.isEmpty {
+                cliProc.waitUntilExit()
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let errText = Redact.message(String(decoding: errData, as: UTF8.self))
+                XCTFail("synctool CLI exited without offer_ready (status=\(cliProc.terminationStatus)): \(errText)")
+                return
+            }
             let fromGoCli = try await receiver.receiveOneShot(pairInput: cliPairUri)
             cliProc.waitUntilExit()
             XCTAssertEqual(0, cliProc.terminationStatus)
