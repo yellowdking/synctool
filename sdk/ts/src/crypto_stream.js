@@ -119,7 +119,7 @@ export async function openStreamBlock(encKey32, noncePrefix7, msgId16, partId, b
   }
   const plaintextLen = ciphertextBlock.length - AEAD_TAG_LEN;
   if (!isFinal && plaintextLen !== CHUNK_PLAINTEXT_MAX) {
-    throw new SyncError(ErrorCode.ERR_STREAM_TRUNCATED, `non-final STREAM ciphertext block must be ${CHUNK_PLAINTEXT_MAX} bytes`);
+    throw new SyncError(ErrorCode.ERR_STREAM_TRUNCATED, `non-final STREAM ciphertext block must be ${CHUNK_CIPHERTEXT_MAX} bytes`);
   }
   const nonce = buildChunkNonce(noncePrefix7, blockIdx, isFinal);
   const aad = buildChunkAAD(msgId16, partId, blockIdx, isFinal, plaintextLen);
