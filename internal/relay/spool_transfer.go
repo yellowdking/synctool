@@ -14,6 +14,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -175,6 +176,7 @@ func (s *SpoolStore) InitUpload(req SpoolInitRequest, depositToken string, now t
 		expiresAt:          now.Add(time.Duration(ttlSec) * time.Second),
 		parts:              partsMap,
 		partOrder:          partsCopy,
+		inFlight:           make(map[chunkKey]int64),
 		receivedSizes:      make(map[chunkKey]int64),
 		downloads:          make(map[chunkKey]int),
 	}
@@ -182,6 +184,7 @@ func (s *SpoolStore) InitUpload(req SpoolInitRequest, depositToken string, now t
 		it.memChunks = make(map[chunkKey][]byte)
 	} else {
 		if err := s.persistItemLocked(it); err != nil {
+			_ = os.RemoveAll(s.itemDir(it.mailboxID, it.id))
 			return SpoolInitResponse{}, err
 		}
 	}
@@ -202,6 +205,39 @@ func (s *SpoolStore) InitUpload(req SpoolInitRequest, depositToken string, now t
 		UploadExpiresAt:        it.uploadExpiresAt.Unix(),
 		ExpiresAt:              it.expiresAt.Unix(),
 	}, nil
+}
+
+func checkSpoolChunkQuotaLocked(it *spoolItem, partSpec SpoolPartSpec, ck chunkKey, contentLen int64) error {
+	if _, busy := it.inFlight[ck]; busy {
+		return newAPIError(409, "ERR_CONFLICT", "concurrent duplicate upload already in progress for this chunk", true)
+	}
+	var otherPartBytes int64
+	var otherItemBytes int64
+	for k, sz := range it.receivedSizes {
+		if k == ck {
+			continue
+		}
+		otherItemBytes += sz
+		if k.partID == ck.partID {
+			otherPartBytes += sz
+		}
+	}
+	for k, sz := range it.inFlight {
+		if k == ck {
+			continue
+		}
+		otherItemBytes += sz
+		if k.partID == ck.partID {
+			otherPartBytes += sz
+		}
+	}
+	if otherPartBytes+contentLen > partSpec.TotalBytes {
+		return newAPIError(400, "ERR_BAD_REQUEST", "uploaded chunk bytes exceed declared part total_bytes", false)
+	}
+	if otherItemBytes+contentLen > it.declaredTotalBytes {
+		return newAPIError(400, "ERR_BAD_REQUEST", "uploaded chunk bytes exceed declared_total_bytes", false)
+	}
+	return nil
 }
 
 func (s *SpoolStore) PrecheckPutChunk(itemID, uploadToken string, partID int, txIdx uint32, contentLen int64, now time.Time) error {
@@ -242,16 +278,7 @@ func (s *SpoolStore) PrecheckPutChunk(itemID, uploadToken string, partID int, tx
 		return newAPIError(400, "ERR_BAD_REQUEST", "part_id or tx_idx out of declared bounds", false)
 	}
 	ck := chunkKey{partID: partID, txIdx: txIdx}
-	var otherBytes int64
-	for k, sz := range it.receivedSizes {
-		if k.partID == partID && k != ck {
-			otherBytes += sz
-		}
-	}
-	if otherBytes+contentLen > partSpec.TotalBytes {
-		return newAPIError(400, "ERR_BAD_REQUEST", "uploaded chunk bytes exceed declared part total_bytes", false)
-	}
-	return nil
+	return checkSpoolChunkQuotaLocked(it, partSpec, ck, contentLen)
 }
 
 func (s *SpoolStore) PutChunk(
@@ -283,7 +310,7 @@ func (s *SpoolStore) PutChunk(
 		}
 	}
 
-	// Validate item & permissions under lock without holding lock during network I/O.
+	// Validate item, reserve inFlight bytes & lock per-chunk slot under s.mu before network I/O.
 	s.mu.Lock()
 	s.sweepLocked(now)
 	it, ok := s.items[itemID]
@@ -305,21 +332,29 @@ func (s *SpoolStore) PutChunk(
 		return 0, newAPIError(400, "ERR_BAD_REQUEST", "part_id or tx_idx out of declared bounds", false)
 	}
 	ck := chunkKey{partID: partID, txIdx: txIdx}
-	var otherBytes int64
-	for k, sz := range it.receivedSizes {
-		if k.partID == partID && k != ck {
-			otherBytes += sz
-		}
-	}
-	if otherBytes+contentLen > partSpec.TotalBytes {
+	if qErr := checkSpoolChunkQuotaLocked(it, partSpec, ck, contentLen); qErr != nil {
 		s.mu.Unlock()
-		return 0, newAPIError(400, "ERR_BAD_REQUEST", "uploaded chunk bytes exceed declared part total_bytes", false)
+		return 0, qErr
 	}
+	if it.inFlight == nil {
+		it.inFlight = make(map[chunkKey]int64)
+	}
+	it.inFlight[ck] = contentLen
 	mbID := it.mailboxID
 	if s.backend == SpoolDisk {
 		it.activeIO++
 	}
 	s.mu.Unlock()
+
+	var releaseOnce sync.Once
+	releaseInFlight := func() {
+		releaseOnce.Do(func() {
+			s.mu.Lock()
+			delete(it.inFlight, ck)
+			s.mu.Unlock()
+		})
+	}
+	defer releaseInFlight()
 	if s.backend == SpoolDisk {
 		defer s.releaseItemIO(it)
 	}
@@ -422,8 +457,10 @@ func (s *SpoolStore) PutChunk(
 			return total, newAPIError(400, "ERR_BAD_REQUEST", "unexpected EOF before Content-Length bytes received", false)
 		}
 
-		// Re-check state before finalizing rename.
+		// Re-check state and release inFlight atomically under s.mu before finalizing rename.
+		releaseOnce.Do(func() {})
 		s.mu.Lock()
+		delete(it.inFlight, ck)
 		cur, stillExists := s.items[itemID]
 		if !stillExists || cur.destroyed || cur.committed {
 			s.mu.Unlock()
@@ -432,6 +469,11 @@ func (s *SpoolStore) PutChunk(
 				return total, newAPIError(404, "ERR_NOT_FOUND", "spool item vanished during upload", false)
 			}
 			return total, newAPIError(409, "ERR_INVALID_STATE", "spool item already committed", false)
+		}
+		if qErr := checkSpoolChunkQuotaLocked(cur, partSpec, ck, contentLen); qErr != nil {
+			s.mu.Unlock()
+			_ = os.Remove(tmpPath)
+			return total, qErr
 		}
 		if err := os.Rename(tmpPath, diskTarget); err != nil {
 			s.mu.Unlock()
@@ -443,9 +485,11 @@ func (s *SpoolStore) PutChunk(
 		return contentLen, nil
 	}
 
-	// Commit memory chunk under lock.
+	// Commit memory chunk and release inFlight atomically under lock.
+	releaseOnce.Do(func() {})
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	delete(it.inFlight, ck)
 	cur, stillExists := s.items[itemID]
 	if !stillExists || cur.destroyed || cur.committed {
 		clear(memData)
@@ -453,6 +497,10 @@ func (s *SpoolStore) PutChunk(
 			return contentLen, newAPIError(404, "ERR_NOT_FOUND", "spool item vanished during upload", false)
 		}
 		return contentLen, newAPIError(409, "ERR_INVALID_STATE", "spool item already committed", false)
+	}
+	if qErr := checkSpoolChunkQuotaLocked(cur, partSpec, ck, contentLen); qErr != nil {
+		clear(memData)
+		return contentLen, qErr
 	}
 	if old, existed := cur.memChunks[ck]; existed {
 		clear(old)
@@ -679,7 +727,6 @@ func (s *SpoolStore) ServeChunk(w http.ResponseWriter, r *http.Request, rc *http
 	// Disk mode: track activeIO so concurrent AckBurn on Windows cleans up right after f.Close()!
 	it.activeIO++
 	chunkPath := s.chunkFilePath(it.mailboxID, it.id, partID, txIdx)
-	modTime := it.createdAt
 	s.mu.Unlock()
 
 	f, err := os.Open(chunkPath)
@@ -701,7 +748,15 @@ func (s *SpoolStore) ServeChunk(w http.ResponseWriter, r *http.Request, rc *http
 		}
 		serveErr = s.streamReaderWithDeadline(w, r, rc, f, info.Size())
 	} else {
-		// Serve directly via http.ServeContent (uses Linux sendfile zero-copy) with bounded write deadline.
+		// Strip conditional & Range headers before http.ServeContent so Linux sendfile(2) zero-copy
+		// is preserved while guaranteeing uniform 200 OK full-chunk responses (no 206/304 confusion).
+		r.Header.Del("Range")
+		r.Header.Del("If-Range")
+		r.Header.Del("If-Modified-Since")
+		r.Header.Del("If-Unmodified-Since")
+		r.Header.Del("If-None-Match")
+		r.Header.Del("If-Match")
+
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -712,7 +767,7 @@ func (s *SpoolStore) ServeChunk(w http.ResponseWriter, r *http.Request, rc *http
 			}
 			_ = rc.SetWriteDeadline(time.Now().Add(dl))
 		}
-		http.ServeContent(w, r, "", modTime, f)
+		http.ServeContent(w, r, "", time.Time{}, f)
 		if rc != nil {
 			_ = rc.SetWriteDeadline(time.Time{})
 		}
