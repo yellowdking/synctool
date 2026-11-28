@@ -1,38 +1,54 @@
 {
   "name": "@yellowdking/synctool",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Zero-dependency WebCrypto TypeScript/JavaScript SDK for synctool v1 end-to-end encrypted relay sync",
   "type": "module",
   "main": "./src/index.js",
   "types": "./src/index.d.ts",
+  "browser": {
+    "./src/node_platform.js": "./src/node_platform.browser.js"
+  },
+  "imports": {
+    "#node-platform": {
+      "browser": "./src/node_platform.browser.js",
+      "default": "./src/node_platform.js"
+    }
+  },
   "exports": {
     ".": {
       "types": "./src/index.d.ts",
+      "browser": "./src/index.js",
       "default": "./src/index.js"
     },
     "./crypto": {
       "types": "./src/crypto.d.ts",
+      "browser": "./src/crypto.js",
       "default": "./src/crypto.js"
     },
     "./crockford": {
       "types": "./src/crockford.d.ts",
+      "browser": "./src/crockford.js",
       "default": "./src/crockford.js"
     },
     "./envelope": {
       "types": "./src/envelope.d.ts",
+      "browser": "./src/envelope.js",
       "default": "./src/envelope.js"
     },
     "./keystore": {
       "types": "./src/keystore.d.ts",
+      "browser": "./src/keystore.js",
       "default": "./src/keystore.js"
     },
     "./client": {
       "types": "./src/client.d.ts",
+      "browser": "./src/client.js",
       "default": "./src/client.js"
     }
   },
   "files": [
-    "src"
+    "src",
+    "index.d.ts"
   ],
   "engines": {
     "node": ">=20.0.0"
