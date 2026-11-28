@@ -182,14 +182,15 @@ func (rm *RoomManager) Create(roomID string, ttlSec int64, initialMsgB64 string,
 		return RoomCreateResult{}, newAPIError(429, "ERR_RATE_LIMITED", "active room capacity reached", true)
 	}
 
-	pipeCtx, pipeCancel := context.WithCancel(context.Background())
+	ttlDur := time.Duration(ttlSec) * time.Second
+	pipeCtx, pipeCancel := context.WithTimeout(context.Background(), ttlDur)
 	room := &Room{
 		ID:          roomID,
 		PipeID:      pipeID,
 		SenderToken: senderToken,
 		State:       RoomWaiting,
 		CreatedAt:   now,
-		ExpiresAt:   now.Add(time.Duration(ttlSec) * time.Second),
+		ExpiresAt:   now.Add(ttlDur),
 		NotifyCh:    make(chan struct{}),
 		PipeCtx:     pipeCtx,
 		PipeCancel:  pipeCancel,
@@ -347,6 +348,7 @@ func (rm *RoomManager) PostMessage(roomID, token, kind, msgB64 string, now time.
 		})
 		if len(room.ControlMsgs) > MaxControlRingSize {
 			clear(room.ControlMsgs[0].raw)
+			room.ControlMsgs[0] = storedRoomMsg{}
 			room.ControlMsgs = room.ControlMsgs[1:]
 		}
 	}
@@ -377,6 +379,11 @@ func (rm *RoomManager) Close(roomID, token, reason string, now time.Time) (RoomS
 		return "", newAPIError(401, "ERR_UNAUTHORIZED_TOKEN", "invalid room token", false)
 	}
 
+	// Preserve first terminal close state, reason, and TombstoneUntil idempotently (prevents reason spoofing & tombstone pinning).
+	if room.State == RoomBurned || room.State == RoomClosed {
+		return room.State, nil
+	}
+
 	// Wipe all buffered opaque messages immediately.
 	rm.wipeMessagesLocked(room)
 	if room.PipeCancel != nil {
@@ -385,7 +392,7 @@ func (rm *RoomManager) Close(roomID, token, reason string, now time.Time) (RoomS
 
 	if reason == "verify_failed" || reason == "rejected" {
 		room.State = RoomBurned
-	} else if room.State != RoomBurned {
+	} else {
 		room.State = RoomClosed
 	}
 	room.Reason = reason
