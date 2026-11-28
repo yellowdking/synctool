@@ -6,6 +6,8 @@ export declare const MANIFEST_PAD_BUCKET: 4096;
 export declare const CLEAR_HEADER_LEN: 56;
 export declare const SEALED_BOX_LEN: 152;
 export declare const SEALED_HEADER_LEN: 208;
+export declare const DEFAULT_0RTT_MAX_AGE_SEC: number;
+export declare const DEFAULT_0RTT_MAX_FUTURE_SKEW_SEC: number;
 
 export declare const ED25519_PKCS8_PREFIX: Uint8Array;
 export declare const X25519_PKCS8_PREFIX: Uint8Array;
@@ -36,6 +38,8 @@ export declare function u64be(n: number | bigint): Uint8Array;
 export declare function readU64be(buf: Uint8Array, offset?: number): number;
 export declare function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean;
 export declare function zeroBytes(buf: Uint8Array | null | undefined): void;
+export declare function isAllZero(bytes: Uint8Array): boolean;
+export declare function isSmallOrderEd25519PublicKey(pk32: Uint8Array): boolean;
 
 export declare function sha256(data: Uint8Array): Promise<Uint8Array>;
 export declare function hmacSha256(keyBytes: Uint8Array, data: Uint8Array): Promise<Uint8Array>;
@@ -206,6 +210,10 @@ export declare function openPaired0RTTHeader(params: {
   sealedHeader: Uint8Array | string;
   recipientKemSk: Uint8Array;
   recipientDeviceIdRaw: Uint8Array;
+  nowSec?: number | null;
+  maxAgeSec?: number;
+  maxFutureSkewSec?: number;
+  replayWatermarkSec?: number;
   hasSeenMsgId?: (msgIdHex: string) => Promise<boolean> | boolean;
   lookupSenderCard: (senderDeviceIdHex: string) => Promise<any> | any;
 }): Promise<{

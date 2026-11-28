@@ -51,6 +51,10 @@ export function normalizeRoomId(input) {
   }
   let normalized = '';
   for (let i = 0; i < input.length; i++) {
+    const rawCode = input.charCodeAt(i);
+    if (rawCode >= 128) {
+      throw new Error(`invalid non-ASCII character in room_id: ${JSON.stringify(input[i])}`);
+    }
     const ch = input[i];
     if (ch === '-' || ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') {
       continue;
@@ -60,7 +64,7 @@ export function normalizeRoomId(input) {
     else if (upper === 'I' || upper === 'L') upper = '1';
 
     const code = upper.charCodeAt(0);
-    if (code >= 128 || DECODE_MAP[code] < 0) {
+    if (upper.length !== 1 || code >= 128 || DECODE_MAP[code] < 0) {
       throw new Error(`invalid Crockford Base32 character in room_id: ${JSON.stringify(ch)}`);
     }
     normalized += upper;
