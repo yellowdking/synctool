@@ -498,6 +498,7 @@ func TestCLIInboxWatchAutoPullAppFilterProtectsOtherApps(t *testing.T) {
 		_ = ks.SetLocalLabel(label)
 		seed, _ := ks.LoadOrCreateMasterSeed()
 		dk, _ := synccrypto.DeriveDeviceKeys(seed[:])
+		clear(seed[:])
 		mk, _ := dk.DeriveMailboxKeys(prof.RelayID)
 		return ks, dk, mk
 	}
@@ -604,5 +605,252 @@ func TestCLIInboxWatchAutoPullAppFilterProtectsOtherApps(t *testing.T) {
 	gotBlob, err := os.ReadFile(filepath.Join(outDir, "note.txt"))
 	if err != nil || string(gotBlob) != "VERIFIED_TARGET_APP_BLOB" {
 		t.Fatalf("expected verified attachment in outDir, got %q err=%v", gotBlob, err)
+	}
+}
+
+func TestCLIV030_ModeStrictness_StdinSASGuard_RelayArgvWarn_And_ResponderSASGate(t *testing.T) {
+	cfgDir := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	// 1. ST-P2-13: --oneshot --mode sas --inline-json - MUST fail with exit code 2 (ERR_BAD_REQUEST) BEFORE reading stdin!
+	code := run([]string{"--config", cfgDir, "--json", "send", "--oneshot", "--mode", "sas", "--inline-json", "-"}, strings.NewReader(`{"a":1}`), &stdout, &stderr)
+	if code != 2 || !strings.Contains(stdout.String(), "ERR_BAD_REQUEST") {
+		t.Fatalf("expected exit=2 ERR_BAD_REQUEST for --inline-json - + --mode sas, got code=%d stdout=%s", code, stdout.String())
+	}
+
+	// 2. ST-P2-13: Invalid --mode values MUST fail strictly with exit code 2!
+	for _, argv := range [][]string{
+		{"--config", cfgDir, "--json", "send", "--oneshot", "--mode", "auto", "--text", "hi"},
+		{"--config", cfgDir, "--json", "send", "--oneshot", "--mode", "typo", "--text", "hi"},
+		{"--config", cfgDir, "--json", "send", "--to", "some-dev", "--mode", "qr", "--text", "hi"},
+		{"--config", cfgDir, "--json", "send", "--to", "some-dev", "--mode", "typo", "--text", "hi"},
+	} {
+		stdout.Reset()
+		stderr.Reset()
+		if c := run(argv, strings.NewReader(""), &stdout, &stderr); c != 2 || !strings.Contains(stdout.String(), "ERR_BAD_REQUEST") {
+			t.Fatalf("expected exit=2 ERR_BAD_REQUEST for %v, got code=%d stdout=%s", argv, c, stdout.String())
+		}
+	}
+
+	// 3. ST-P2-10: Passing secret URI via global --relay flag emits stderr warning (unless --quiet) and never leaks secret!
+	stdout.Reset()
+	stderr.Reset()
+	badRelayArg := "synctool://relay?v=1&u=https%3A%2F%2F1.2.3.4%3A8443#k=SECRET_GLOBAL_RELAY_ARG_777"
+	code = run([]string{"--config", cfgDir, "--relay", badRelayArg, "--json", "ping"}, strings.NewReader(""), &stdout, &stderr)
+	if code == 0 {
+		t.Fatal("expected unpinned bare IP --relay to fail")
+	}
+	if strings.Contains(stdout.String(), "SECRET_GLOBAL_RELAY_ARG_777") || strings.Contains(stderr.String(), "SECRET_GLOBAL_RELAY_ARG_777") {
+		t.Fatalf("secret leaked in stdout=%q or stderr=%q", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "warning:") {
+		t.Fatalf("expected stderr warning when passing secret URI to --relay, got %q", stderr.String())
+	}
+
+	// 4. ST-P0-1: CLI `pair accept` in Flow 1B (mode=2 SAS) emits sas_ready + awaiting_sas (role=responder),
+	// rejects "no" without saving DeviceCard, and succeeds on "y"!
+	var mu sync.Mutex
+	type cliRoom struct {
+		msgs  []map[string]any
+		state string
+	}
+	rooms := make(map[string]*cliRoom)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/ping":
+			_ = json.NewEncoder(w).Encode(map[string]any{"proto_v": 1, "server_ts": time.Now().Unix(), "profile": "nano", "spool_backend": "off"})
+		case r.URL.Path == "/v1/caps":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"proto_v":   1,
+				"spool":     map[string]any{"enabled": false, "backend": "off"},
+				"streaming": map[string]any{"enabled": true, "blocks_per_chunk": 4, "max_transport_chunk_bytes": 262208},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/rooms":
+			var req struct {
+				RoomID        string `json:"room_id"`
+				InitialMsgB64 string `json:"initial_msg_b64"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			mu.Lock()
+			rooms[req.RoomID] = &cliRoom{
+				state: "waiting",
+				msgs:  []map[string]any{{"seq": 1, "from": "sender", "kind": "handshake", "msg_b64": req.InitialMsgB64}},
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"room_id": req.RoomID, "pipe_id": "p_" + req.RoomID, "sender_token": "stok", "expires_at": time.Now().Unix() + 300, "seq": 1})
+		case strings.HasPrefix(r.URL.Path, "/v1/rooms/"):
+			segs := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/rooms/"), "/")
+			rid, act := segs[0], segs[1]
+			mu.Lock()
+			rm := rooms[rid]
+			mu.Unlock()
+			if rm == nil {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": "ERR_NOT_FOUND"})
+				return
+			}
+			switch act {
+			case "join":
+				mu.Lock()
+				rm.state = "joined"
+				msgs := append([]map[string]any(nil), rm.msgs...)
+				mu.Unlock()
+				_ = json.NewEncoder(w).Encode(map[string]any{"room_id": rid, "pipe_id": "p_" + rid, "receiver_token": "rtok", "expires_at": time.Now().Unix() + 300, "seq": len(msgs), "messages": msgs})
+			case "messages":
+				from := "receiver"
+				if r.Header.Get(synccrypto.HeaderRoomToken) == "stok" {
+					from = "sender"
+				}
+				var req struct {
+					Kind   string `json:"kind"`
+					MsgB64 string `json:"msg_b64"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&req)
+				mu.Lock()
+				if rm.state == "burned" {
+					mu.Unlock()
+					w.WriteHeader(http.StatusGone)
+					_ = json.NewEncoder(w).Encode(map[string]any{"error": "ERR_ROOM_BURNED"})
+					return
+				}
+				seq := len(rm.msgs) + 1
+				rm.msgs = append(rm.msgs, map[string]any{"seq": seq, "from": from, "kind": req.Kind, "msg_b64": req.MsgB64})
+				mu.Unlock()
+				_ = json.NewEncoder(w).Encode(map[string]any{"seq": seq})
+			case "events":
+				if r.URL.Query().Get("mode") == "sse" {
+					w.WriteHeader(http.StatusNotImplemented)
+					return
+				}
+				var since int
+				_, _ = fmt.Sscanf(r.URL.Query().Get("since"), "%d", &since)
+				deadline := time.Now().Add(2 * time.Second)
+				for time.Now().Before(deadline) {
+					mu.Lock()
+					var out []map[string]any
+					for _, m := range rm.msgs {
+						if m["seq"].(int) > since {
+							out = append(out, m)
+						}
+					}
+					st := rm.state
+					seq := len(rm.msgs)
+					mu.Unlock()
+					if len(out) > 0 || st == "burned" || st == "closed" {
+						_ = json.NewEncoder(w).Encode(map[string]any{"state": st, "seq": seq, "messages": out})
+						return
+					}
+					time.Sleep(15 * time.Millisecond)
+				}
+				mu.Lock()
+				_ = json.NewEncoder(w).Encode(map[string]any{"state": rm.state, "seq": len(rm.msgs), "messages": []any{}})
+				mu.Unlock()
+			case "close":
+				var req struct {
+					Reason string `json:"reason"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&req)
+				mu.Lock()
+				if req.Reason == "verify_failed" || req.Reason == "rejected" {
+					rm.state = "burned"
+				} else {
+					rm.state = "closed"
+				}
+				mu.Unlock()
+				_ = json.NewEncoder(w).Encode(map[string]any{"state": "closed"})
+			}
+		}
+	}))
+	defer srv.Close()
+
+	relayURI := fmt.Sprintf("synctool://relay?v=1&u=%s#k=%s", url.QueryEscape(srv.URL), strings.Repeat("K", 43))
+	aliceCfg := t.TempDir()
+	bobCfg := t.TempDir()
+	for _, d := range []string{aliceCfg, bobCfg} {
+		var o, e bytes.Buffer
+		if c := run([]string{"--config", d, "--json", "init", "--stdin"}, strings.NewReader(relayURI+"\n"), &o, &e); c != 0 {
+			t.Fatalf("init %s failed: %s %s", d, o.String(), e.String())
+		}
+	}
+
+	aliceKS, _ := envelope.NewFileKeyStore(aliceCfg)
+	prof, _ := aliceKS.GetDefaultRelayProfile()
+	aliceCli, _ := client.New(client.Config{AppID: "synctool.cli", DeviceLabel: "Alice", Relay: prof, KeyStore: aliceKS})
+	defer aliceCli.Close()
+
+	// Case A: Responder types "no" -> exit code 4 (ERR_SAS_MISMATCH) and 0 devices saved!
+	codeChA := make(chan string, 1)
+	sasChA := make(chan string, 1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = aliceCli.StartDeviceBind(context.Background(), client.PairOptions{
+			Mode:         synccrypto.ModeCommitSAS,
+			OnOfferReady: func(info client.OfferReadyInfo) { codeChA <- info.DisplayCode },
+			OnSASInput:   func() (string, error) { return <-sasChA, nil },
+		})
+	}()
+	roomCodeA := <-codeChA
+	close(sasChA) // empty -> initiator rejects or sees burned room
+	stdout.Reset()
+	stderr.Reset()
+	exitReject := run([]string{"--config", bobCfg, "--json", "pair", "accept", "--stdin"}, strings.NewReader(roomCodeA+"\nno\n"), &stdout, &stderr)
+	wg.Wait()
+	if exitReject != 4 || !strings.Contains(stdout.String(), "ERR_SAS_MISMATCH") || !strings.Contains(stdout.String(), `"event":"awaiting_sas"`) {
+		t.Fatalf("expected exit=4 ERR_SAS_MISMATCH with awaiting_sas event on 'no', got exit=%d stdout=%s stderr=%s", exitReject, stdout.String(), stderr.String())
+	}
+	bobKSCheck, _ := envelope.NewFileKeyStore(bobCfg)
+	if devs, _ := bobKSCheck.ListDevices(); len(devs) != 0 {
+		t.Fatalf("Bob saved DeviceCard despite rejecting SAS in CLI: %+v", devs)
+	}
+
+	// Case B: Responder types "yes" (via shared --stdin reader after room code!) -> exit code 0!
+	codeChB := make(chan string, 1)
+	sasFromStdout := make(chan string, 1)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = aliceCli.StartDeviceBind(context.Background(), client.PairOptions{
+			Mode:         synccrypto.ModeCommitSAS,
+			OnOfferReady: func(info client.OfferReadyInfo) { codeChB <- info.DisplayCode },
+			OnSASInput:   func() (string, error) { return <-sasFromStdout, nil },
+		})
+	}()
+	roomCodeB := <-codeChB
+	pr, pw := io.Pipe()
+	var acceptOut, acceptErr bytes.Buffer
+	acceptDone := make(chan int, 1)
+	go func() {
+		mw := io.MultiWriter(&acceptOut, pw)
+		c := run([]string{"--config", bobCfg, "--json", "pair", "accept", "--stdin"}, strings.NewReader(roomCodeB+"\nyes\n"), mw, &acceptErr)
+		_ = pw.Close()
+		acceptDone <- c
+	}()
+	go func() {
+		defer pr.Close()
+		dec := json.NewDecoder(pr)
+		for {
+			var ev map[string]any
+			if err := dec.Decode(&ev); err != nil {
+				return
+			}
+			if ev["event"] == "sas_ready" {
+				if s, ok := ev["sas"].(string); ok {
+					sasFromStdout <- s
+				}
+			}
+		}
+	}()
+	exitAccept := <-acceptDone
+	wg.Wait()
+	if exitAccept != 0 {
+		t.Fatalf("expected exit=0 when responder confirms 'yes', got exit=%d stdout=%s stderr=%s", exitAccept, acceptOut.String(), acceptErr.String())
+	}
+	bobKSFinal, _ := envelope.NewFileKeyStore(bobCfg)
+	if devs, _ := bobKSFinal.ListDevices(); len(devs) != 1 {
+		t.Fatalf("expected 1 paired device in Bob's keystore after 'yes', got %+v", devs)
 	}
 }
