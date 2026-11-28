@@ -206,7 +206,7 @@ synctool://relay?v=1&u=<percent_encoded_canonical_origin>[&pin=<64_hex_spki>]#k=
 | :--- | :--- | :---: | :--- |
 | Query | `v` | 推荐（缺省按 `1`） | 协议版本号，固定 `1`。 |
 | Query | `u` | **是** | Percent-encoded **`canonical_relay_origin`**（小写 `scheme://host:port`，**显式包含端口**如 `https://relay.example.com:443` 或 `https://1.2.3.4:54843`，无末尾 `/`，不得含 path/query/fragment；仅本地回环 `127.0.0.1` / `localhost` / `[::1]` 允许 `http://`）。客户端按 `CRYPTO_AND_AUTH.md` §3.3 确定性计算 `relay_id = hex(SHA256("synctool-v1/relay-id:" \|\| canonical_relay_origin)[0:16])`。 |
-| Query | `pin` | 条件必填 | **64 位小写十六进制**（`hex(SHA256(DER(SubjectPublicKeyInfo)))`，对齐 `CRYPTO_AND_AUTH.md` §7.5 & `PROTOCOL.md` §7.2）。存在时客户端强制启用 `tls=spki_pin` 严格锁定叶证书指纹；缺省时启用 `tls=system_ca`。**安全铁律**：当 `u` 的 Host 为 IPv4/IPv6 裸 IP 时，`pin` **必填**，缺省即报错 `ERR_URI_INVALID`（彻底废除不校验跳过证书）。 |
+| Query | `pin` | 条件必填 | **逗号分隔的 `1..8` 个 64 位小写十六进制**（`hex(SHA256(DER(SubjectPublicKeyInfo)))`，兼容剥离 `sha256:` 前缀与大小写规范化，对齐 `CRYPTO_AND_AUTH.md` §7.5 & `PROTOCOL.md` §7.2）。存在时客户端强制启用 `tls=spki_pin` 常量时间匹配叶证书指纹（命中列表内任一指纹即通过，支持零停机双指纹轮换 `pin=<cur>,<next>`）；缺省时启用 `tls=system_ca`。**安全铁律**：当 `u` 的 Host 为 IPv4/IPv6 裸 IP 时，`pin` **必填**，缺省即报错 `ERR_URI_INVALID`（彻底废除不校验跳过证书）。 |
 | Fragment | `k` | **是** | 43 字符无填充 `b64u`（或 ≥32 字符人工自定义 `RELAY_ACCESS_KEY` 字符串），按 `CRYPTO_AND_AUTH.md` §7.1 派生 `relay_hmac_key`。 |
 
 ### 3.2 一次性配对 / 换机 / 绑定 / 直传 URI：`synctool://pair`
@@ -423,13 +423,13 @@ interface Client {
   Ping(ctx) -> (PingResult, err)
   Capabilities(ctx) -> (RelayCaps, err)
 
-  // 流 1：一次性按需直传 / 换机（Mode A 零落盘管道，传完即擦零 session_key）
+  // 流 1：一次性按需直传 / 换机（Mode A 零落盘管道，传完即擦零 session_key；mode=2 响应端强制要求 onSASConfirm 人工放行）
   StartOneShotSend(ctx, parcel, opts: { mode: 1|2, onOfferReady, onSASInput, onProgress }) -> (SendResult, err)
-  ReceiveOneShot(ctx, pairInput, handler, opts: { onSASDisplay, onProgress }) -> (Manifest, err)
+  ReceiveOneShot(ctx, pairInput, handler, opts: { onSASDisplay?, onSASConfirm, onProgress }) -> (Manifest, err)
 
-  // 流 1：首次设备双向绑定（房间内加密交换 PairBindPayload 并互注册独立 deposit_token）
+  // 流 1：首次设备双向绑定（房间内加密交换 PairBindPayload 并互注册独立 deposit_token；mode=2 响应端强制要求 onSASConfirm 人工放行）
   StartDeviceBind(ctx, opts: { mode: 1|2, label, onOfferReady, onSASInput }) -> (DeviceCard, err)
-  AcceptDeviceBind(ctx, pairInput, opts: { label, onSASDisplay }) -> (DeviceCard, err)
+  AcceptDeviceBind(ctx, pairInput, opts: { label, onSASDisplay?, onSASConfirm }) -> (DeviceCard, err)
 
   // 流 2：已绑定设备定向推送（统一 0-RTT SealedHeader）
   // deliveryMode="auto": 查 /v1/caps，spool 开启且未超限走 Mode B；否则返回 ERR_SPOOL_DISABLED / ERR_OFFLINE_QUOTA_EXCEEDED
