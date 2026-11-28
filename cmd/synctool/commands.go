@@ -51,7 +51,7 @@ func cmdSend(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 	schema := fs.String("schema", "generic.parcel.v1", "business schema identifier")
 	textVal := fs.String("text", "", "inline UTF-8 text payload")
 	inlineJSON := fs.String("inline-json", "", "JSON file path or '-' for stdin")
-	modeStr := fs.String("mode", "auto", "paired: auto|spool|pipe; oneshot: qr|sas")
+	modeStr := fs.String("mode", "", "paired: auto|spool|pipe; oneshot: qr|sas")
 	includeRelay := fs.Bool("include-relay", false, "embed relay info in pair URI")
 	var files multiStringFlag
 	fs.Var(&files, "file", "file path (optional :role suffix), repeatable")
@@ -61,6 +61,35 @@ func cmdSend(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 
 	if (*toDev == "") == !*oneshot {
 		return envelope.NewError(envelope.ErrCodeBadRequest, false, 0, "specify exactly one of --to <device> or --oneshot", nil)
+	}
+
+	// ST-P2-13: Strict --mode validation + stdin collision check BEFORE consuming stdin or opening network!
+	hsMode := synccrypto.ModeQROOB
+	deliveryMode := client.DeliveryAuto
+	if *oneshot {
+		m := strings.ToLower(strings.TrimSpace(*modeStr))
+		if m == "" || m == "qr" {
+			hsMode = synccrypto.ModeQROOB
+		} else if m == "sas" {
+			hsMode = synccrypto.ModeCommitSAS
+		} else {
+			return envelope.NewError(envelope.ErrCodeBadRequest, false, 0, fmt.Sprintf("invalid oneshot --mode %q (expected qr or sas)", *modeStr), nil)
+		}
+		if hsMode == synccrypto.ModeCommitSAS && *inlineJSON == "-" {
+			return envelope.NewError(envelope.ErrCodeBadRequest, false, 0, "cannot combine --inline-json - with --oneshot --mode sas because both read from stdin; pass a JSON file path instead", nil)
+		}
+	} else {
+		m := strings.ToLower(strings.TrimSpace(*modeStr))
+		switch m {
+		case "", "auto":
+			deliveryMode = client.DeliveryAuto
+		case "spool":
+			deliveryMode = client.DeliverySpool
+		case "pipe":
+			deliveryMode = client.DeliveryPipe
+		default:
+			return envelope.NewError(envelope.ErrCodeBadRequest, false, 0, fmt.Sprintf("invalid paired --mode %q (expected auto, spool, or pipe)", *modeStr), nil)
+		}
 	}
 
 	var inline map[string]any
@@ -116,10 +145,6 @@ func cmdSend(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 	}
 
 	if *oneshot {
-		hsMode := synccrypto.ModeQROOB
-		if *modeStr == "sas" {
-			hsMode = synccrypto.ModeCommitSAS
-		}
 		reader := bufio.NewReader(stdin)
 		res, err := cli.StartOneShotSend(ctx, parcel, client.PairOptions{
 			Mode:         hsMode,
@@ -129,19 +154,16 @@ func cmdSend(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 					emitEvent(opts, stdout, map[string]any{
 						"type": "event", "event": "offer_ready", "room_id": info.RoomID, "display_code": info.DisplayCode, "pair_uri": info.PairURI,
 					})
-				} else if hsMode == synccrypto.ModeQROOB {
-					_, _ = fmt.Fprintf(stderr, "One-shot URI: %s\n", info.PairURI)
-				} else {
-					_, _ = fmt.Fprintf(stderr, "One-shot Room Code: %s\n", info.DisplayCode)
+				} else if !opts.quiet {
+					if hsMode == synccrypto.ModeQROOB {
+						_, _ = fmt.Fprintf(stderr, "One-shot URI: %s\n", info.PairURI)
+					} else {
+						_, _ = fmt.Fprintf(stderr, "One-shot Room Code: %s\n", info.DisplayCode)
+					}
 				}
 			},
 			OnSASInput: func() (string, error) {
-				_, _ = fmt.Fprint(stderr, "Enter 6-digit SAS from receiver: ")
-				line, err := reader.ReadString('\n')
-				if err != nil && len(line) == 0 {
-					return "", err
-				}
-				return strings.TrimSpace(line), nil
+				return promptInitiatorSAS(opts, reader, stdout, stderr)
 			},
 			OnProgress: progressCB,
 		})
@@ -157,14 +179,14 @@ func cmdSend(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 		return err
 	}
 	res, err := cli.SendToDevice(ctx, card.DeviceID, parcel, client.SendOptions{
-		DeliveryMode: *modeStr,
+		DeliveryMode: deliveryMode,
 		IncludeRelay: *includeRelay,
 		OnOfferReady: func(info client.OfferReadyInfo) {
 			if opts.jsonMode {
 				emitEvent(opts, stdout, map[string]any{
 					"type": "event", "event": "offer_ready", "room_id": info.RoomID, "display_code": info.DisplayCode, "pair_uri": info.PairURI,
 				})
-			} else {
+			} else if !opts.quiet {
 				_, _ = fmt.Fprintf(stderr, "Direct Pipe Code: %s (%s)\n", info.DisplayCode, info.PairURI)
 			}
 		},
@@ -181,6 +203,7 @@ func cmdRecv(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 	fs := flag.NewFlagSet("recv", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	itemID := fs.String("item", "", "spool item_id to pull")
+	appFilter := fs.String("app", "", "optional app_id filter when pulling spool --item")
 	outDir := fs.String("out", ".", "output directory for verified attachments")
 	useStdin := fs.Bool("stdin", false, "read pair URI or room code from stdin")
 	if err := fs.Parse(args); err != nil {
@@ -212,7 +235,10 @@ func cmdRecv(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 			return err
 		}
 		defer cli.Close()
-		m, err := cli.FetchParcel(ctx, *itemID, handler, client.ReceiveOptions{OnProgress: progressCB})
+		m, err := cli.FetchParcel(ctx, *itemID, handler, client.ReceiveOptions{
+			AppID:      *appFilter,
+			OnProgress: progressCB,
+		})
 		if err != nil {
 			return err
 		}
@@ -221,10 +247,11 @@ func cmdRecv(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 		return nil
 	}
 
+	reader := bufio.NewReader(stdin)
 	var pairIn string
 	switch {
 	case *useStdin:
-		pairIn, err = readSecretLine(stdin)
+		pairIn, err = readSecretLineFromBufio(reader)
 		if err != nil {
 			return err
 		}
@@ -253,9 +280,12 @@ func cmdRecv(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 		OnSASDisplay: func(sas string) {
 			if opts.jsonMode {
 				emitEvent(opts, stdout, map[string]any{"type": "event", "event": "sas_ready", "sas": sas})
-			} else {
+			} else if !opts.quiet {
 				_, _ = fmt.Fprintf(stderr, "Verify SAS on sender device: %s %s\n", sas[:3], sas[3:])
 			}
+		},
+		OnSASConfirm: func(sas string) error {
+			return confirmResponderSAS(opts, reader, stdout, stderr, sas)
 		},
 		OnProgress: progressCB,
 	})
@@ -265,6 +295,15 @@ func cmdRecv(ctx context.Context, opts globalOpts, args []string, stdin io.Reade
 	emitResult(opts, stdout, map[string]any{"manifest": m, "files": savedFiles},
 		fmt.Sprintf("received msg_id=%s app=%s schema=%s blobs=%d", m.MsgID, m.AppID, m.Schema, len(savedFiles)))
 	return nil
+}
+
+func isAppIDFilterMismatch(err error) bool {
+	se, ok := envelope.AsSyncError(err)
+	if !ok || se.Code != envelope.ErrCodeManifestInvalid || se.Details == nil {
+		return false
+	}
+	_, hasParcelApp := se.Details["parcel_app_id"]
+	return hasParcelApp
 }
 
 func cmdInbox(ctx context.Context, opts globalOpts, args []string, stdout, stderr io.Writer) error {
@@ -342,6 +381,7 @@ func cmdInbox(ctx context.Context, opts globalOpts, args []string, stdout, stder
 				files = f
 				return nil
 			}, client.ReceiveOptions{
+				AppID: *appFilter,
 				OnProgress: func(ev envelope.TransferEvent) {
 					if opts.jsonMode {
 						emitEvent(opts, stdout, ev)
@@ -371,24 +411,6 @@ func cmdInbox(ctx context.Context, opts globalOpts, args []string, stdout, stder
 				_, _ = fmt.Fprintf(stdout, "new_item %s (%d bytes)\n", ev.ItemID, ev.TotalBytes)
 			}
 			if *autoPull {
-				// CRITICAL: When filtering by --app, verify Manifest.AppID via Phase 1 ListInbox BEFORE
-				// calling FetchParcel, because FetchParcel sends signed ACK burn as soon as handler returns nil!
-				if *appFilter != "" {
-					previews, err := cli.ListInbox(ctx, *appFilter)
-					if err != nil {
-						return err
-					}
-					matched := false
-					for _, pv := range previews {
-						if pv.ItemID == ev.ItemID {
-							matched = true
-							break
-						}
-					}
-					if !matched {
-						return nil
-					}
-				}
 				var files []string
 				m, err := cli.FetchParcel(ctx, ev.ItemID, func(p envelope.ReceivedParcel) error {
 					saved, err := saveReceivedParcelToOutDir(*outDir, p)
@@ -397,8 +419,13 @@ func cmdInbox(ctx context.Context, opts globalOpts, args []string, stdout, stder
 					}
 					files = saved
 					return nil
-				}, client.ReceiveOptions{})
+				}, client.ReceiveOptions{
+					AppID: *appFilter,
+				})
 				if err != nil {
+					if *appFilter != "" && isAppIDFilterMismatch(err) {
+						return nil
+					}
 					return err
 				}
 				emitEvent(opts, stdout, map[string]any{"type": "event", "event": "auto_pulled", "item_id": ev.ItemID, "msg_id": m.MsgID, "files": files})
@@ -506,12 +533,24 @@ func cmdDevice(ctx context.Context, opts globalOpts, args []string, stdout, stde
 		}
 		card, err := client.ResolveDeviceByIDOrLabel(ks, subArgs[0])
 		if err != nil {
-			return err
+			// Also allow retrying revoke on an already locally-revoked tombstone awaiting relay delete.
+			if existing, gerr := ks.GetDevice(subArgs[0]); gerr == nil && existing != nil && existing.Revoked {
+				card = existing
+			} else {
+				return err
+			}
 		}
 		cli, err := openClient(opts, ks, nil, stdout, stderr)
 		if err != nil {
-			// Fallback to local-only revocation if no relay configured.
-			if err := ks.DeleteDevice(card.DeviceID); err != nil {
+			// Fallback to local 2-phase tombstone if no relay configured.
+			card.Revoked = true
+			card.PendingTokenDelete = card.InboundTokenID != ""
+			if card.PendingTokenDelete {
+				if err := ks.PutDevice(*card); err != nil {
+					return err
+				}
+				_ = ks.AddPendingTokenDelete(card.InboundTokenID)
+			} else if err := ks.DeleteDevice(card.DeviceID); err != nil {
 				return err
 			}
 			emitResult(opts, stdout, map[string]any{"device_id": card.DeviceID, "revoked": true},
