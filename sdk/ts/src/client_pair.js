@@ -146,7 +146,6 @@ export async function waitRoomMessage(
 
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), Math.max(250, remainingMs));
-    timer.unref?.();
     const onOuterAbort = () => ctrl.abort();
     signal?.addEventListener('abort', onOuterAbort, { once: true });
 
