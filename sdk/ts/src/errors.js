@@ -44,10 +44,11 @@ export const ErrorCode = Object.freeze({
 });
 
 const REDACT_SYNC_URI_RE = /(synctool:\/\/[^\s"'<>#]*)#[^\s"'<>]*/gi;
-const REDACT_FRAGMENT_RE = /#(?:k|s)=[^\s"'&<>]+/g;
+const REDACT_FRAGMENT_RE = /#(?:[^\s"'<>]*?(?:^|&))?(?:k|s)=[^\s"'<>]*/gi;
+const REDACT_QUERY_SECRET_RE = /([?&](?:k|s)=)[^\s"'&<>#]+/gi;
 
 /**
- * Scrub any embedded synctool://#fragment or #k=/#s= secret from diagnostic strings.
+ * Scrub any embedded synctool://#fragment or #k=/#s=/query k=/s= secret from diagnostic strings.
  * @param {string} msg
  * @returns {string}
  */
@@ -55,7 +56,21 @@ export function redactMessage(msg) {
   if (typeof msg !== 'string' || msg.length === 0) return '';
   return msg
     .replace(REDACT_SYNC_URI_RE, '$1#<redacted>')
-    .replace(REDACT_FRAGMENT_RE, '#<redacted>');
+    .replace(REDACT_FRAGMENT_RE, '#<redacted>')
+    .replace(REDACT_QUERY_SECRET_RE, '$1<redacted>');
+}
+
+function redactDetailsValue(val) {
+  if (typeof val === 'string') return redactMessage(val);
+  if (Array.isArray(val)) return val.map(redactDetailsValue);
+  if (val && typeof val === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(val)) {
+      out[k] = redactDetailsValue(v);
+    }
+    return out;
+  }
+  return val;
 }
 
 /** Structured cross-language error matching spec/ENVELOPE_AND_SDK.md §4.1 (auto-redacting URI secrets). */
@@ -67,12 +82,19 @@ export class SyncError extends Error {
    */
   constructor(code, message, options = {}) {
     const safeMessage = redactMessage(String(message ?? code));
-    super(safeMessage, options.cause !== undefined ? { cause: options.cause } : undefined);
+    let safeCause = options.cause;
+    if (safeCause instanceof Error && typeof safeCause.message === 'string') {
+      const scrubbed = redactMessage(safeCause.message);
+      if (scrubbed !== safeCause.message) {
+        safeCause = new Error(scrubbed);
+      }
+    }
+    super(safeMessage, safeCause !== undefined ? { cause: safeCause } : undefined);
     this.name = 'SyncError';
     this.code = code;
     this.retryable = Boolean(options.retryable);
     this.httpStatus = options.httpStatus ?? 0;
-    this.details = options.details ?? {};
+    this.details = options.details ? redactDetailsValue(options.details) : {};
   }
 
   toJSON() {
@@ -81,7 +103,7 @@ export class SyncError extends Error {
       retryable: this.retryable,
       http_status: this.httpStatus,
       message: redactMessage(this.message),
-      details: this.details,
+      details: redactDetailsValue(this.details),
     };
   }
 }
