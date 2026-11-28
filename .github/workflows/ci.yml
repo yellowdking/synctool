@@ -92,6 +92,43 @@ jobs:
       - name: Run Kotlin SDK unit tests & golden vectors
         run: gradle -p sdk/kotlin test --info
 
+  swift-test:
+    name: Swift SDK Golden Vectors, Live Relay E2E & iOS Simulator Build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Verify zero external Swift dependencies
+        run: |
+          for mf in Package.swift sdk/swift/Package.swift; do
+            if [ ! -f "$mf" ]; then
+              echo "ERROR: missing $mf"
+              exit 1
+            fi
+            if sed 's|//.*||' "$mf" | grep -E '\.package\s*\('; then
+              echo "ERROR: $mf must have zero external dependencies"
+              exit 1
+            fi
+          done
+
+      - name: Build Go binaries & run Swift SDK tests (01..07 vectors + live Relay/CLI E2E)
+        run: |
+          swift build
+          go build -o /tmp/synctool-relay-e2e ./cmd/synctool-relay
+          go build -o /tmp/synctool-cli-e2e ./cmd/synctool
+          SYNCTOOL_RELAY_BIN=/tmp/synctool-relay-e2e \
+          SYNCTOOL_CLI_BIN=/tmp/synctool-cli-e2e \
+          swift test --package-path sdk/swift
+
+      - name: Build SyncToolSDK for iOS Simulator
+        run: |
+          (cd sdk/swift && xcodebuild build -scheme SyncToolSDK -destination "generic/platform=iOS Simulator" CODE_SIGNING_ALLOWED=NO -quiet)
+
   cross-lang-e2e:
     name: Cross-Language E2E (Go <-> Relay <-> TS <-> Kotlin)
     needs: [go-test, ts-test, kotlin-test]

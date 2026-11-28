@@ -82,9 +82,48 @@ jobs:
           go build -o /tmp/synctool-relay-e2e ./cmd/synctool-relay
           SYNCTOOL_RELAY_BIN=/tmp/synctool-relay-e2e gradle -p sdk/kotlin test --tests "*CrossLangRelayE2ETest*" --rerun-tasks --info
 
+  verify-swift:
+    name: Verify Swift SDK (macOS + iOS Simulator + Live Relay E2E)
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Verify zero external Swift dependencies
+        run: |
+          for mf in Package.swift sdk/swift/Package.swift; do
+            if [ ! -f "$mf" ]; then
+              echo "ERROR: missing $mf"
+              exit 1
+            fi
+            if sed 's|//.*||' "$mf" | grep -E '\.package\s*\('; then
+              echo "ERROR: $mf must have zero external dependencies"
+              exit 1
+            fi
+          done
+
+      - name: Build Go binaries & run Swift SDK tests + live Relay/CLI E2E
+        run: |
+          swift build
+          go build -o /tmp/synctool-relay-e2e ./cmd/synctool-relay
+          go build -o /tmp/synctool-cli-e2e ./cmd/synctool
+          SYNCTOOL_RELAY_BIN=/tmp/synctool-relay-e2e \
+          SYNCTOOL_CLI_BIN=/tmp/synctool-cli-e2e \
+          swift test --package-path sdk/swift
+
+      - name: Build SyncToolSDK for iOS Simulator
+        run: |
+          (cd sdk/swift && xcodebuild build -scheme SyncToolSDK -destination "generic/platform=iOS Simulator" CODE_SIGNING_ALLOWED=NO -quiet)
+
   prepare:
     name: Prepare Release Tag & Metadata
-    needs: [verify]
+    needs: [verify, verify-swift]
     runs-on: ubuntu-latest
     permissions:
       contents: write
