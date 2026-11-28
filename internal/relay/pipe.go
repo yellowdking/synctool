@@ -32,11 +32,10 @@ type pipeSender struct {
 }
 
 type pipeReceiver struct {
-	w    http.ResponseWriter
-	rc   *http.ResponseController
-	ctx  context.Context
-	ip   netip.Addr
-	done chan error
+	w   http.ResponseWriter
+	rc  *http.ResponseController
+	ctx context.Context
+	ip  netip.Addr
 }
 
 type pipeSlot struct {
@@ -52,11 +51,16 @@ type PipeHub struct {
 	bufSize           int
 	rendezvousTimeout time.Duration
 	stallTimeout      time.Duration
+	maxChunkDuration  time.Duration
 	gate              *TransferGate
 	bw                *BandwidthLimiter
 }
 
 func NewPipeHub(bufSize int, rendezvousTimeout, stallTimeout time.Duration, gate *TransferGate, bw *BandwidthLimiter) *PipeHub {
+	return NewPipeHubWithMaxDuration(bufSize, rendezvousTimeout, stallTimeout, MaxChunkTransferDuration, gate, bw)
+}
+
+func NewPipeHubWithMaxDuration(bufSize int, rendezvousTimeout, stallTimeout, maxChunkDuration time.Duration, gate *TransferGate, bw *BandwidthLimiter) *PipeHub {
 	if bufSize <= 0 {
 		bufSize = 64 << 10
 	}
@@ -66,11 +70,15 @@ func NewPipeHub(bufSize int, rendezvousTimeout, stallTimeout time.Duration, gate
 	if stallTimeout <= 0 {
 		stallTimeout = StallTimeout
 	}
+	if maxChunkDuration <= 0 {
+		maxChunkDuration = MaxChunkTransferDuration
+	}
 	ph := &PipeHub{
 		slots:             make(map[pipeSlotKey]*pipeSlot, 32),
 		bufSize:           bufSize,
 		rendezvousTimeout: rendezvousTimeout,
 		stallTimeout:      stallTimeout,
+		maxChunkDuration:  maxChunkDuration,
 		gate:              gate,
 		bw:                bw,
 	}
@@ -168,11 +176,10 @@ func (ph *PipeHub) GetChunk(
 ) error {
 	key := pipeSlotKey{pipeID: pipeID, partID: partID, txIdx: txIdx}
 	recv := &pipeReceiver{
-		w:    w,
-		rc:   rc,
-		ctx:  ctx,
-		ip:   clientIP,
-		done: make(chan error, 1),
+		w:   w,
+		rc:  rc,
+		ctx: ctx,
+		ip:  clientIP,
 	}
 
 	ph.mu.Lock()
@@ -234,6 +241,19 @@ func (ph *PipeHub) removeIfUnmatched(key pipeSlotKey, expected *pipeSlot) bool {
 	return false
 }
 
+func flushPipeReceiver(rc *http.ResponseController, w http.ResponseWriter) error {
+	if rc != nil {
+		if err := rc.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			return err
+		}
+		return nil
+	}
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	return nil
+}
+
 func (ph *PipeHub) streamBridge(roomCtx context.Context, sender *pipeSender, recv *pipeReceiver) error {
 	// Acquire L7 concurrency semaphore before copying bytes; abort early if either peer or room cancels.
 	if ph.gate != nil {
@@ -276,6 +296,12 @@ func (ph *PipeHub) streamBridge(roomCtx context.Context, sender *pipeSender, rec
 		ph.bufPool.Put(bufPtr)
 	}()
 
+	// Enforce 5-minute per-chunk total ceiling AND bind to roomCtx deadline if tighter.
+	chunkDeadline := time.Now().Add(ph.maxChunkDuration)
+	if roomDead, hasRoomDead := roomCtx.Deadline(); hasRoomDead && roomDead.Before(chunkDeadline) {
+		chunkDeadline = roomDead
+	}
+
 	// Write response headers on receiver side before copying first byte.
 	h := recv.w.Header()
 	h.Set("Content-Type", "application/octet-stream")
@@ -283,8 +309,12 @@ func (ph *PipeHub) streamBridge(roomCtx context.Context, sender *pipeSender, rec
 	h.Set("Cache-Control", "no-store")
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("X-Accel-Buffering", "no")
+	initWriteDL := time.Now().Add(ph.stallTimeout)
+	if chunkDeadline.Before(initWriteDL) {
+		initWriteDL = chunkDeadline
+	}
 	if recv.rc != nil {
-		_ = recv.rc.SetWriteDeadline(time.Now().Add(ph.stallTimeout))
+		_ = recv.rc.SetWriteDeadline(initWriteDL)
 	}
 	recv.w.WriteHeader(http.StatusOK)
 
@@ -293,7 +323,23 @@ func (ph *PipeHub) streamBridge(roomCtx context.Context, sender *pipeSender, rec
 		reader = &rateLimitedReader{ctx: recv.ctx, r: reader, bl: ph.bw}
 	}
 
-	flusher, canFlush := recv.w.(http.Flusher)
+	// Immediately unblock stalled Read/Write sockets if roomCtx cancels mid-chunk (e.g. SAS verify_failed).
+	bridgeDone := make(chan struct{})
+	watchExited := make(chan struct{})
+	go func() {
+		defer close(watchExited)
+		select {
+		case <-roomCtx.Done():
+			abortNow := time.Now()
+			if sender.rc != nil {
+				_ = sender.rc.SetReadDeadline(abortNow)
+			}
+			if recv.rc != nil {
+				_ = recv.rc.SetWriteDeadline(abortNow)
+			}
+		case <-bridgeDone:
+		}
+	}()
 
 	var total int64
 	var copyErr error
@@ -310,9 +356,17 @@ func (ph *PipeHub) streamBridge(roomCtx context.Context, sender *pipeSender, rec
 			copyErr = sender.ctx.Err()
 			break
 		}
+		nowIter := time.Now()
+		if !nowIter.Before(chunkDeadline) {
+			copyErr = errors.New("pipe chunk transfer exceeded max duration")
+			break
+		}
 
-		// Refresh rolling stall deadlines on both ends.
-		deadline := time.Now().Add(ph.stallTimeout)
+		// Refresh rolling stall deadlines on both ends, bounded by chunkDeadline.
+		deadline := nowIter.Add(ph.stallTimeout)
+		if chunkDeadline.Before(deadline) {
+			deadline = chunkDeadline
+		}
 		if sender.rc != nil {
 			_ = sender.rc.SetReadDeadline(deadline)
 		}
@@ -324,15 +378,17 @@ func (ph *PipeHub) streamBridge(roomCtx context.Context, sender *pipeSender, rec
 		if nr > 0 {
 			nw, werr := recv.w.Write(buf[:nr])
 			total += int64(nw)
-			if canFlush {
-				flusher.Flush()
-			}
+			ferr := flushPipeReceiver(recv.rc, recv.w)
 			if werr != nil {
 				copyErr = werr
 				break
 			}
 			if nw != nr {
 				copyErr = io.ErrShortWrite
+				break
+			}
+			if ferr != nil {
+				copyErr = ferr
 				break
 			}
 		}
@@ -345,8 +401,19 @@ func (ph *PipeHub) streamBridge(roomCtx context.Context, sender *pipeSender, rec
 		}
 	}
 
+	close(bridgeDone)
+	<-watchExited
+
+	if copyErr != nil && roomCtx.Err() != nil {
+		copyErr = newAPIError(410, "ERR_ROOM_BURNED", "room closed during transfer", false)
+	}
 	if copyErr == nil && total != sender.contentLen {
 		copyErr = io.ErrUnexpectedEOF
+	}
+	if copyErr == nil {
+		if ferr := flushPipeReceiver(recv.rc, recv.w); ferr != nil {
+			copyErr = ferr
+		}
 	}
 
 	// Clear rolling deadlines after chunk completes.
