@@ -1,15 +1,35 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/yellowdking/synctool/internal/relay"
 )
+
+func captureStdout(t *testing.T, fn func() int) (int, string) {
+	t.Helper()
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	code := fn()
+	_ = w.Close()
+	os.Stdout = orig
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	_ = r.Close()
+	return code, buf.String()
+}
 
 func TestCLIInitRotateAndHealthcheck(t *testing.T) {
 	dir := t.TempDir()
@@ -86,5 +106,118 @@ func TestCLIInitRotateAndHealthcheck(t *testing.T) {
 	}
 	if code := run([]string{"healthcheck", "--data-dir", dir, "--listen", listenAddr, "--tls", "selfsigned"}); code == 0 {
 		t.Fatal("expected healthcheck to fail against expired self-signed TLS certificate")
+	}
+}
+
+func TestCertRotateReuseKeyStageNextPromoteSANInheritanceAndCertHealthcheckSNI(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1. Initialize with explicit IP + DNS SANs.
+	code, initOut := captureStdout(t, func() int {
+		return run([]string{"init", "--data-dir", dir, "--public-host", "203.0.113.42,sync.example.com", "--listen", "127.0.0.1:54843"})
+	})
+	if code != 0 {
+		t.Fatalf("init failed: %d", code)
+	}
+	bInit, err := relay.LoadCertBundle(filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(initOut, "pin="+bInit.SPKISHA256Hex) {
+		t.Fatalf("init output missing pin: %s", initOut)
+	}
+
+	// 2. `cert-rotate --reuse-key` WITHOUT `--public-host`: MUST keep identical SPKI pin AND inherit IP+DNS SANs!
+	code, reuseOut := captureStdout(t, func() int {
+		return run([]string{"cert-rotate", "--reuse-key", "--data-dir", dir, "--listen", "127.0.0.1:54843"})
+	})
+	if code != 0 {
+		t.Fatalf("cert-rotate --reuse-key failed: %d", code)
+	}
+	bReuse, err := relay.LoadCertBundle(filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bReuse.SPKISHA256Hex != bInit.SPKISHA256Hex {
+		t.Fatalf("expected --reuse-key to preserve SPKI pin %s, got %s", bInit.SPKISHA256Hex, bReuse.SPKISHA256Hex)
+	}
+	inherited := relay.ExtractCertPublicHosts(bReuse.Leaf)
+	if !strings.Contains(inherited, "203.0.113.42") || !strings.Contains(inherited, "sync.example.com") {
+		t.Fatalf("expected cert-rotate without --public-host to inherit SANs, got %q", inherited)
+	}
+	if !strings.Contains(reuseOut, "https%3A%2F%2F203.0.113.42%3A54843") {
+		t.Fatalf("expected URI origin to inherit primary public host 203.0.113.42, got:\n%s", reuseOut)
+	}
+
+	// 3. `cert-rotate --stage-next --print-uri=false` redacts #k=; `--stage-next` emits dual-pin `pin=<cur>,<next>#k=...`.
+	rawKey, _ := os.ReadFile(filepath.Join(dir, "access.key"))
+	secretKey := strings.TrimSpace(string(rawKey))
+
+	code, redactedOut := captureStdout(t, func() int {
+		return run([]string{"cert-rotate", "--stage-next", "--print-uri=false", "--data-dir", dir})
+	})
+	if code != 0 {
+		t.Fatalf("cert-rotate --stage-next --print-uri=false failed: %d", code)
+	}
+	if strings.Contains(redactedOut, secretKey) || !strings.Contains(redactedOut, "#k=<redacted>") {
+		t.Fatalf("--print-uri=false must redact secret access key! output:\n%s", redactedOut)
+	}
+
+	code, stageOut := captureStdout(t, func() int {
+		return run([]string{"cert-rotate", "--stage-next", "--print-uri", "--data-dir", dir})
+	})
+	if code != 0 {
+		t.Fatalf("cert-rotate --stage-next failed: %d", code)
+	}
+	bStaged, err := relay.LoadCertBundle(filepath.Join(dir, "tls-next.crt"), filepath.Join(dir, "tls-next.key"))
+	if err != nil {
+		t.Fatalf("expected staged tls-next.crt/key: %v", err)
+	}
+	if bStaged.SPKISHA256Hex == bReuse.SPKISHA256Hex {
+		t.Fatal("expected staged cert to have a fresh SPKI pin")
+	}
+	// Active cert.pem MUST remain untouched before promotion!
+	bStillActive, _ := relay.LoadCertBundle(filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"))
+	if bStillActive.SPKISHA256Hex != bReuse.SPKISHA256Hex {
+		t.Fatal("--stage-next must not overwrite active cert.pem")
+	}
+	wantDualPin := "&pin=" + bReuse.SPKISHA256Hex + "," + bStaged.SPKISHA256Hex + "#k=" + secretKey
+	if !strings.Contains(stageOut, wantDualPin) {
+		t.Fatalf("expected dual-pin URI containing %q, got:\n%s", wantDualPin, stageOut)
+	}
+
+	// 4. `cert-rotate --promote-staged` atomically promotes staged cert/key and cleans up tls-next.*.
+	code, promOut := captureStdout(t, func() int {
+		return run([]string{"cert-rotate", "--promote-staged", "--data-dir", dir})
+	})
+	if code != 0 {
+		t.Fatalf("cert-rotate --promote-staged failed: %d", code)
+	}
+	bPromoted, err := relay.LoadCertBundle(filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bPromoted.SPKISHA256Hex != bStaged.SPKISHA256Hex || !strings.Contains(promOut, bStaged.SPKISHA256Hex) {
+		t.Fatalf("expected promoted cert to match staged SPKI %s, got %s", bStaged.SPKISHA256Hex, bPromoted.SPKISHA256Hex)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "tls-next.crt")); !os.IsNotExist(err) {
+		t.Fatal("expected tls-next.crt removed after promotion")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "tls-next.key")); !os.IsNotExist(err) {
+		t.Fatal("expected tls-next.key removed after promotion")
+	}
+
+	// 5. Verify --tls=cert ServerName derivation from cert SAN and --public-host.
+	certOnlyDir := t.TempDir()
+	certFile := filepath.Join(certOnlyDir, "fullchain.pem")
+	keyFile := filepath.Join(certOnlyDir, "privkey.pem")
+	if _, err := relay.GenerateSelfSignedCert("sync.domain.example", time.Now(), certFile, keyFile); err != nil {
+		t.Fatal(err)
+	}
+	if sn := relay.ResolveCertServerName("", ":54843", certFile); sn != "sync.domain.example" {
+		t.Fatalf("expected ServerName derived from cert DNS SAN sync.domain.example, got %q", sn)
+	}
+	if sn := relay.ResolveCertServerName("https://override.example.com:443", ":54843", certFile); sn != "override.example.com" {
+		t.Fatalf("expected ServerName derived from --public-host override.example.com, got %q", sn)
 	}
 }
