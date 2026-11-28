@@ -223,11 +223,36 @@ public struct ReceiveOptions: Sendable {
 
 // MARK: - Internal Wire Signaling & Spool DTOs
 
-internal struct HsM1Wire: Codable { var protoV: Int = 1, mode: Int, purpose: String, eA: String?, nA: String?, commitA: String?; enum CodingKeys: String, CodingKey { case protoV = "proto_v", mode, purpose, eA = "e_a", nA = "n_a", commitA = "commit_a" } }
-internal struct HsM2Wire: Codable { var protoV: Int = 1, mode: Int, eB: String, nB: String, macB: String?; enum CodingKeys: String, CodingKey { case protoV = "proto_v", mode, eB = "e_b", nB = "n_b", macB = "mac_b" } }
-internal struct HsM3Wire: Codable { var protoV: Int = 1, mode: Int, eA: String?, nA: String?, macA: String; enum CodingKeys: String, CodingKey { case protoV = "proto_v", mode, eA = "e_a", nA = "n_a", macA = "mac_a" } }
-internal struct HsM4Wire: Codable { var protoV: Int = 1, mode: Int, macB: String; enum CodingKeys: String, CodingKey { case protoV = "proto_v", mode, macB = "mac_b" } }
-internal struct PairBindWire: Codable { var protoV: Int = 1, op: String = "pair_bind", ct: String; enum CodingKeys: String, CodingKey { case protoV = "proto_v", op, ct } }
+internal struct HsM1Wire: Codable {
+    var protoV: Int; var mode: Int; var purpose: String; var eA: String?; var nA: String?; var commitA: String?
+    enum CodingKeys: String, CodingKey { case protoV = "proto_v", mode, purpose, eA = "e_a", nA = "n_a", commitA = "commit_a" }
+    init(protoV: Int = 1, mode: Int, purpose: String, eA: String? = nil, nA: String? = nil, commitA: String? = nil) { self.protoV = protoV; self.mode = mode; self.purpose = purpose; self.eA = eA; self.nA = nA; self.commitA = commitA }
+    init(from decoder: Decoder) throws { let c = try decoder.container(keyedBy: CodingKeys.self); protoV = try c.dec(.protoV, 1); mode = try c.decode(Int.self, forKey: .mode); purpose = try c.decode(String.self, forKey: .purpose); eA = try c.decodeIfPresent(String.self, forKey: .eA); nA = try c.decodeIfPresent(String.self, forKey: .nA); commitA = try c.decodeIfPresent(String.self, forKey: .commitA) }
+}
+internal struct HsM2Wire: Codable {
+    var protoV: Int; var mode: Int; var eB: String; var nB: String; var macB: String?
+    enum CodingKeys: String, CodingKey { case protoV = "proto_v", mode, eB = "e_b", nB = "n_b", macB = "mac_b" }
+    init(protoV: Int = 1, mode: Int, eB: String, nB: String, macB: String? = nil) { self.protoV = protoV; self.mode = mode; self.eB = eB; self.nB = nB; self.macB = macB }
+    init(from decoder: Decoder) throws { let c = try decoder.container(keyedBy: CodingKeys.self); protoV = try c.dec(.protoV, 1); mode = try c.decode(Int.self, forKey: .mode); eB = try c.decode(String.self, forKey: .eB); nB = try c.decode(String.self, forKey: .nB); macB = try c.decodeIfPresent(String.self, forKey: .macB) }
+}
+internal struct HsM3Wire: Codable {
+    var protoV: Int; var mode: Int; var eA: String?; var nA: String?; var macA: String
+    enum CodingKeys: String, CodingKey { case protoV = "proto_v", mode, eA = "e_a", nA = "n_a", macA = "mac_a" }
+    init(protoV: Int = 1, mode: Int, eA: String? = nil, nA: String? = nil, macA: String) { self.protoV = protoV; self.mode = mode; self.eA = eA; self.nA = nA; self.macA = macA }
+    init(from decoder: Decoder) throws { let c = try decoder.container(keyedBy: CodingKeys.self); protoV = try c.dec(.protoV, 1); mode = try c.decode(Int.self, forKey: .mode); eA = try c.decodeIfPresent(String.self, forKey: .eA); nA = try c.decodeIfPresent(String.self, forKey: .nA); macA = try c.decode(String.self, forKey: .macA) }
+}
+internal struct HsM4Wire: Codable {
+    var protoV: Int; var mode: Int; var macB: String
+    enum CodingKeys: String, CodingKey { case protoV = "proto_v", mode, macB = "mac_b" }
+    init(protoV: Int = 1, mode: Int, macB: String) { self.protoV = protoV; self.mode = mode; self.macB = macB }
+    init(from decoder: Decoder) throws { let c = try decoder.container(keyedBy: CodingKeys.self); protoV = try c.dec(.protoV, 1); mode = try c.decode(Int.self, forKey: .mode); macB = try c.decode(String.self, forKey: .macB) }
+}
+internal struct PairBindWire: Codable {
+    var protoV: Int; var op: String; var ct: String
+    enum CodingKeys: String, CodingKey { case protoV = "proto_v", op, ct }
+    init(protoV: Int = 1, op: String = "pair_bind", ct: String) { self.protoV = protoV; self.op = op; self.ct = ct }
+    init(from decoder: Decoder) throws { let c = try decoder.container(keyedBy: CodingKeys.self); protoV = try c.dec(.protoV, 1); op = try c.dec(.op, "pair_bind"); ct = try c.decode(String.self, forKey: .ct) }
+}
 internal struct PipeCtrlWire: Codable { var ctrlSeq: Int64, ct: String; enum CodingKeys: String, CodingKey { case ctrlSeq = "ctrl_seq", ct } }
 internal struct RoomCreateReq: Codable { var roomId: String, ttlSec: Int, initialMsgB64: String?; enum CodingKeys: String, CodingKey { case roomId = "room_id", ttlSec = "ttl_sec", initialMsgB64 = "initial_msg_b64" } }
 internal struct RoomCreateResp: Codable {
