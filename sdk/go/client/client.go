@@ -43,6 +43,15 @@ type Client struct {
 	mailboxKeys    *synccrypto.MailboxKeys
 	clockOffsetSec atomic.Int64
 
+	opMu     sync.Mutex
+	closed   bool
+	activeWG sync.WaitGroup
+	closeCtx context.Context
+	closeFn  context.CancelFunc
+
+	inFlightMu     sync.Mutex
+	inFlightMsgIDs map[string]struct{}
+
 	tempMu         sync.Mutex
 	createdMsgDirs []string
 }
@@ -153,6 +162,7 @@ type OfferReadyInfo struct {
 }
 
 // PairOptions configures Flow 1 pairing or one-shot transfers.
+// In Flow 1B (mode=2 SAS) on Responder, OnSASConfirm is mandatory and fails closed if nil or returning an error.
 type PairOptions struct {
 	Mode         int // synccrypto.ModeQROOB (1) or synccrypto.ModeCommitSAS (2)
 	Label        string
@@ -161,8 +171,12 @@ type PairOptions struct {
 	OnOfferReady func(OfferReadyInfo)
 	OnSASInput   func() (string, error)
 	OnSASDisplay func(sas6Digits string)
+	OnSASConfirm func(sas6Digits string) error
 	OnProgress   func(envelope.TransferEvent)
 }
+
+// AcceptBindOptions is an ergonomic alias for PairOptions on AcceptDeviceBind.
+type AcceptBindOptions = PairOptions
 
 // SendOptions configures Flow 2 SendToDevice.
 type SendOptions struct {
@@ -174,10 +188,17 @@ type SendOptions struct {
 }
 
 // ReceiveOptions configures Mode A or Mode B receiving.
+// In Flow 1B (mode=2 SAS) on Responder, OnSASConfirm is mandatory and fails closed if nil or returning an error.
+// AppID optionally restricts FetchParcel to parcels matching AppID (leaving other apps' parcels unburned on shared mailboxes).
 type ReceiveOptions struct {
+	AppID        string
 	OnSASDisplay func(sas6Digits string)
+	OnSASConfirm func(sas6Digits string) error
 	OnProgress   func(envelope.TransferEvent)
 }
+
+// ReceiveOneShotOptions is an ergonomic alias for ReceiveOptions on ReceiveOneShot.
+type ReceiveOneShotOptions = ReceiveOptions
 
 // ParcelHandler processes a verified, locally persisted ReceivedParcel.
 // Only after ParcelHandler returns nil does the SDK record seen_msg_ids and send signed ACK.
@@ -197,11 +218,14 @@ func New(cfg Config) (*Client, error) {
 	}
 	prof := *cfg.Relay
 	prof.Endpoint = origin
+	if err := prof.SyncPins(); err != nil {
+		return nil, err
+	}
 	if prof.RelayID == "" {
 		prof.RelayID = synccrypto.DeriveRelayID(origin)
 	}
 	if prof.TLSMode == "" {
-		if prof.SPKISHA256 != "" {
+		if len(prof.SPKIPins) > 0 {
 			prof.TLSMode = envelope.TLSModeSPKIPin
 		} else {
 			prof.TLSMode = envelope.TLSModeSystemCA
@@ -257,6 +281,7 @@ func New(cfg Config) (*Client, error) {
 		}
 	}
 
+	closeCtx, closeFn := context.WithCancel(context.Background())
 	return &Client{
 		appID:          appID,
 		deviceLabel:    label,
@@ -268,6 +293,9 @@ func New(cfg Config) (*Client, error) {
 		httpClient:     httpCli,
 		deviceKeys:     dk,
 		mailboxKeys:    mk,
+		closeCtx:       closeCtx,
+		closeFn:        closeFn,
+		inFlightMsgIDs: make(map[string]struct{}),
 	}, nil
 }
 
@@ -288,12 +316,73 @@ func defaultPlatform() string {
 	}
 }
 
-// Close wipes derived key material from memory, removes verified parcel staging dirs created by this Client,
-// and closes idle HTTP connections.
+func (c *Client) beginOp() (func(), error) {
+	if c == nil {
+		return nil, envelope.NewError(envelope.ErrCodeCancelled, false, 0, "client is nil", nil)
+	}
+	c.opMu.Lock()
+	if c.closed {
+		c.opMu.Unlock()
+		return nil, envelope.NewError(envelope.ErrCodeCancelled, false, 0, "client is closed", nil)
+	}
+	c.activeWG.Add(1)
+	c.opMu.Unlock()
+	return c.activeWG.Done, nil
+}
+
+func (c *Client) bindCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if c == nil || c.closeCtx == nil {
+		return context.WithCancel(ctx)
+	}
+	merged, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(c.closeCtx, cancel)
+	return merged, func() {
+		stop()
+		cancel()
+	}
+}
+
+func (c *Client) claimInFlightMsgID(msgID string) (func(), bool) {
+	key := strings.ToLower(strings.TrimSpace(msgID))
+	c.inFlightMu.Lock()
+	defer c.inFlightMu.Unlock()
+	if _, busy := c.inFlightMsgIDs[key]; busy {
+		return nil, false
+	}
+	c.inFlightMsgIDs[key] = struct{}{}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			c.inFlightMu.Lock()
+			delete(c.inFlightMsgIDs, key)
+			c.inFlightMu.Unlock()
+		})
+	}, true
+}
+
+// Close cancels in-flight operations, waits for active SDK calls to finish, wipes derived key material
+// from memory, removes verified parcel staging dirs created by this Client, and closes idle HTTP connections.
 func (c *Client) Close() {
 	if c == nil {
 		return
 	}
+	c.opMu.Lock()
+	if c.closed {
+		c.opMu.Unlock()
+		return
+	}
+	c.closed = true
+	closeFn := c.closeFn
+	c.opMu.Unlock()
+
+	if closeFn != nil {
+		closeFn()
+	}
+	c.activeWG.Wait()
+
 	c.tempMu.Lock()
 	dirs := c.createdMsgDirs
 	c.createdMsgDirs = nil
@@ -334,15 +423,19 @@ func (c *Client) Identity() (deviceID, label, signPKB64U, kemPKB64U, mailboxID s
 
 // RelayProfile returns a copy of the active relay profile.
 func (c *Client) RelayProfile() envelope.RelayProfile {
-	return *c.profile
+	cp := *c.profile
+	if len(c.profile.SPKIPins) > 0 {
+		cp.SPKIPins = append([]string(nil), c.profile.SPKIPins...)
+	}
+	return cp
 }
 
-// ClockOffsetSec returns the currently cached clock offset in seconds.
+// ClockOffsetSec returns the currently cached HTTP X-Sync-TS clock offset in seconds.
 func (c *Client) ClockOffsetSec() int64 {
 	return c.clockOffsetSec.Load()
 }
 
-// SetClockOffsetSec overrides the local clock offset (primarily for clock-skew testing).
+// SetClockOffsetSec overrides the HTTP X-Sync-TS clock offset (primarily for clock-skew testing).
 func (c *Client) SetClockOffsetSec(offsetSec int64) {
 	c.clockOffsetSec.Store(offsetSec)
 }
@@ -371,6 +464,12 @@ func (c *Client) checkCertRotation(expiresAt int64, recommended bool) {
 
 // Ping probes relay connectivity, profile, clock offset, and TLS cert expiration.
 func (c *Client) Ping(ctx context.Context) (*PingResult, error) {
+	done, err := c.beginOp()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+
 	start := time.Now()
 	resp, err := c.doControl(ctx, http.MethodGet, "/v1/ping", nil, reqOptions{})
 	if err != nil {
@@ -388,6 +487,16 @@ func (c *Client) Ping(ctx context.Context) (*PingResult, error) {
 
 // Capabilities fetches GET /v1/caps from the relay.
 func (c *Client) Capabilities(ctx context.Context) (*RelayCaps, error) {
+	done, err := c.beginOp()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+
+	return c.capabilitiesInternal(ctx)
+}
+
+func (c *Client) capabilitiesInternal(ctx context.Context) (*RelayCaps, error) {
 	resp, err := c.doControl(ctx, http.MethodGet, "/v1/caps", nil, reqOptions{})
 	if err != nil {
 		return nil, err
@@ -400,8 +509,6 @@ func (c *Client) Capabilities(ctx context.Context) (*RelayCaps, error) {
 	return &out, nil
 }
 
-// EnsureMailboxRegistered registers this device's blinded mailbox (PUT /v1/mailboxes/{mailbox_id}).
-// When relay runs with --spool=off, returns nil without error if spool is disabled.
 // ParseRelayFromPairURI extracts a RelayProfile if a pair URI embeds u (+ pin) + #k.
 func ParseRelayFromPairURI(raw string) (*envelope.RelayProfile, bool, error) {
 	trimmed := strings.TrimSpace(raw)
@@ -416,16 +523,20 @@ func ParseRelayFromPairURI(raw string) (*envelope.RelayProfile, bool, error) {
 		return nil, false, nil
 	}
 	tlsMode := envelope.TLSModeSystemCA
-	if offer.SPKISHA256 != "" {
+	if len(offer.SPKIPins) > 0 || offer.SPKISHA256 != "" {
 		tlsMode = envelope.TLSModeSPKIPin
 	}
-	return &envelope.RelayProfile{
+	prof := &envelope.RelayProfile{
 		RelayID:    synccrypto.DeriveRelayID(offer.Endpoint),
 		Endpoint:   offer.Endpoint,
 		AccessKey:  offer.AccessKey,
 		TLSMode:    tlsMode,
 		SPKISHA256: offer.SPKISHA256,
-	}, true, nil
+		SPKIPin:    offer.SPKIPin,
+		SPKIPins:   append([]string(nil), offer.SPKIPins...),
+	}
+	_ = prof.SyncPins()
+	return prof, true, nil
 }
 
 // ResolveDeviceByIDOrLabel finds a trusted non-revoked device by exact device_id or case-insensitive label.
@@ -445,6 +556,9 @@ func ResolveDeviceByIDOrLabel(ks envelope.KeyStore, query string) (*envelope.Dev
 	}
 	var matches []envelope.DeviceCard
 	for _, card := range cards {
+		if card.Revoked {
+			continue
+		}
 		if strings.EqualFold(card.Label, q) || strings.HasPrefix(card.DeviceID, strings.ToLower(q)) {
 			matches = append(matches, card)
 		}
