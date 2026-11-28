@@ -5,6 +5,7 @@ export declare const MAX_MANIFEST_CHUNKS: 4;
 export declare const MAX_INLINE_PAYLOAD_BYTES: 65536;
 export declare const MAX_BLOBS: 63;
 export declare const MAX_BLOB_META_BYTES: 2048;
+export declare const MAX_SPKI_PINS: 8;
 
 export declare const ErrorCode: Readonly<{
   ERR_BAD_REQUEST: 'ERR_BAD_REQUEST';
@@ -106,6 +107,7 @@ export interface ParsedRelayURI {
   origin: string;
   tlsMode: 'system_ca' | 'spki_pin';
   spkiPin: string | null;
+  spkiPins: string[];
   accessKey: string;
 }
 
@@ -117,6 +119,7 @@ export interface ParsedPairURI {
   oobSecret: string | null;
   relayOrigin: string | null;
   spkiPin: string | null;
+  spkiPins: string[];
   accessKey: string | null;
   expiresAt: number | null;
 }
@@ -170,10 +173,17 @@ export declare function canonicalizeRelayOrigin(rawUrl: string): {
   hostname: string;
   port: number;
 };
+export declare function normalizeSpkiPins(input: string | string[] | null | undefined, label?: string): string[];
+export declare function resolveConfigSpkiPins(
+  obj: { spkiPins?: string[] | null; spkiPin?: string | null },
+  label?: string,
+): string[];
 export declare function parseRelayURI(uri: string): ParsedRelayURI;
 export declare function formatRelayURI(profile: {
-  origin: string;
+  origin?: string;
+  endpoint?: string;
   spkiPin?: string | null;
+  spkiPins?: string[] | null;
   accessKey: string;
 }): string;
 export declare function parsePairURI(uri: string): ParsedPairURI;
@@ -184,6 +194,7 @@ export declare function formatPairURI(opts: {
   oobSecret?: string | null;
   relayOrigin?: string | null;
   spkiPin?: string | null;
+  spkiPins?: string[] | null;
   accessKey?: string | null;
   expiresAt?: number | null;
 }): string;

@@ -87,6 +87,12 @@ export function buildChunkAAD(msgId16, partId, blockIdx, isFinal, plaintextLen) 
  * Seal one STREAM atomic block (0..65536 B plaintext -> 16..65552 B ciphertext).
  */
 export async function sealStreamBlock(encKey32, noncePrefix7, msgId16, partId, blockIdx, isFinal, plaintextBlock) {
+  if (!Number.isInteger(blockIdx) || blockIdx < 0 || blockIdx > 0xffffffff) {
+    throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, `STREAM blockIdx out of uint32 range: ${blockIdx}`);
+  }
+  if (!isFinal && blockIdx === 0xffffffff) {
+    throw new SyncError(ErrorCode.ERR_CRYPTO_HANDSHAKE_FAILED, 'STREAM blockIdx overflow past uint32 max');
+  }
   if (plaintextBlock.length > CHUNK_PLAINTEXT_MAX) {
     throw new RangeError(`plaintext block exceeds ${CHUNK_PLAINTEXT_MAX} bytes`);
   }
@@ -102,12 +108,18 @@ export async function sealStreamBlock(encKey32, noncePrefix7, msgId16, partId, b
  * Open one STREAM atomic block (16..65552 B ciphertext -> 0..65536 B plaintext).
  */
 export async function openStreamBlock(encKey32, noncePrefix7, msgId16, partId, blockIdx, isFinal, ciphertextBlock) {
+  if (!Number.isInteger(blockIdx) || blockIdx < 0 || blockIdx > 0xffffffff) {
+    throw new SyncError(ErrorCode.ERR_STREAM_TRUNCATED, `STREAM blockIdx out of uint32 range: ${blockIdx}`);
+  }
+  if (!isFinal && blockIdx === 0xffffffff) {
+    throw new SyncError(ErrorCode.ERR_STREAM_TRUNCATED, 'STREAM blockIdx overflow past uint32 max');
+  }
   if (ciphertextBlock.length < AEAD_TAG_LEN || ciphertextBlock.length > CHUNK_CIPHERTEXT_MAX) {
     throw new SyncError(ErrorCode.ERR_CRYPTO_DECRYPT_FAILED, `invalid ciphertext block length: ${ciphertextBlock.length}`);
   }
   const plaintextLen = ciphertextBlock.length - AEAD_TAG_LEN;
   if (!isFinal && plaintextLen !== CHUNK_PLAINTEXT_MAX) {
-    throw new SyncError(ErrorCode.ERR_STREAM_TRUNCATED, `non-final STREAM ciphertext block must be ${CHUNK_CIPHERTEXT_MAX} bytes`);
+    throw new SyncError(ErrorCode.ERR_STREAM_TRUNCATED, `non-final STREAM ciphertext block must be ${CHUNK_PLAINTEXT_MAX} bytes`);
   }
   const nonce = buildChunkNonce(noncePrefix7, blockIdx, isFinal);
   const aad = buildChunkAAD(msgId16, partId, blockIdx, isFinal, plaintextLen);
@@ -116,18 +128,29 @@ export async function openStreamBlock(encKey32, noncePrefix7, msgId16, partId, b
 
 /** @param {number} plaintextLen */
 export function calcBlockCount(plaintextLen) {
+  if (!Number.isSafeInteger(plaintextLen) || plaintextLen < 0) {
+    throw new RangeError(`invalid plaintextLen: ${plaintextLen}`);
+  }
   if (plaintextLen === 0) return 1;
-  return Math.ceil(plaintextLen / CHUNK_PLAINTEXT_MAX);
+  const blocks = Math.ceil(plaintextLen / CHUNK_PLAINTEXT_MAX);
+  if (blocks > 0xffffffff) {
+    throw new RangeError(`plaintextLen exceeds STREAM uint32 block limit: ${plaintextLen}`);
+  }
+  return blocks;
 }
 
 /** @param {number} plaintextLen */
 export function calcEncryptedPartSize(plaintextLen) {
+  const blocks = calcBlockCount(plaintextLen);
   if (plaintextLen === 0) return AEAD_TAG_LEN;
-  return plaintextLen + calcBlockCount(plaintextLen) * AEAD_TAG_LEN;
+  return plaintextLen + blocks * AEAD_TAG_LEN;
 }
 
 /** @param {number} plaintextLen @param {number} blocksPerChunk */
 export function calcTransportChunkCount(plaintextLen, blocksPerChunk) {
+  if (!Number.isInteger(blocksPerChunk) || blocksPerChunk < 1) {
+    throw new RangeError(`invalid blocksPerChunk: ${blocksPerChunk}`);
+  }
   return Math.ceil(calcBlockCount(plaintextLen) / blocksPerChunk);
 }
 
@@ -154,7 +177,7 @@ export async function encryptPartBytes(encKey32, noncePrefix7, msgId16, partId, 
 
 /**
  * Decrypt concatenated ciphertext stream (or array of transport chunks) for one part_id.
- * Enforces complete final-block (is_final=0x01) authentication and rejects truncation or trailing garbage.
+ * Enforces complete final-block (is_final=0x01) authentication and hard-stops on trailing ciphertext.
  * @param {Uint8Array} encKey32
  * @param {Uint8Array} noncePrefix7
  * @param {Uint8Array} msgId16
@@ -168,19 +191,29 @@ export async function decryptPartBytes(encKey32, noncePrefix7, msgId16, partId, 
     throw new SyncError(ErrorCode.ERR_STREAM_TRUNCATED, 'encrypted part shorter than minimum 16B final block');
   }
   const blockCount = Math.ceil(full.length / CHUNK_CIPHERTEXT_MAX);
-  if (options.expectedTotalBlocks !== undefined && blockCount !== options.expectedTotalBlocks) {
-    throw new SyncError(
-      ErrorCode.ERR_STREAM_TRUNCATED,
-      `block count mismatch: got ${blockCount}, expected ${options.expectedTotalBlocks}`,
-    );
+  if (options.expectedTotalBlocks !== undefined) {
+    if (!Number.isInteger(options.expectedTotalBlocks) || options.expectedTotalBlocks < 1) {
+      throw new RangeError(`invalid expectedTotalBlocks: ${options.expectedTotalBlocks}`);
+    }
+    if (blockCount !== options.expectedTotalBlocks) {
+      throw new SyncError(
+        ErrorCode.ERR_STREAM_TRUNCATED,
+        `block count mismatch: got ${blockCount}, expected ${options.expectedTotalBlocks}`,
+      );
+    }
   }
+  const targetTotalBlocks = options.expectedTotalBlocks ?? blockCount;
   const ptParts = [];
   let sawFinal = false;
-  for (let blockIdx = 0; blockIdx < blockCount; blockIdx++) {
-    const start = blockIdx * CHUNK_CIPHERTEXT_MAX;
-    const end = Math.min(start + CHUNK_CIPHERTEXT_MAX, full.length);
-    const ctBlock = full.subarray(start, end);
-    const isFinal = blockIdx === blockCount - 1;
+  let offset = 0;
+  let blockIdx = 0;
+  while (offset < full.length) {
+    if (sawFinal || blockIdx >= targetTotalBlocks) {
+      throw new SyncError(ErrorCode.ERR_STREAM_TRUNCATED, 'trailing ciphertext after authenticated final STREAM block');
+    }
+    const end = Math.min(offset + CHUNK_CIPHERTEXT_MAX, full.length);
+    const ctBlock = full.subarray(offset, end);
+    const isFinal = blockIdx === targetTotalBlocks - 1;
     if (!isFinal && ctBlock.length !== CHUNK_CIPHERTEXT_MAX) {
       throw new SyncError(ErrorCode.ERR_STREAM_TRUNCATED, 'non-final block has unexpected length');
     }
@@ -198,8 +231,10 @@ export async function decryptPartBytes(encKey32, noncePrefix7, msgId16, partId, 
       }
       throw err;
     }
+    offset = end;
+    blockIdx++;
   }
-  if (!sawFinal) {
+  if (!sawFinal || blockIdx !== targetTotalBlocks) {
     throw new SyncError(ErrorCode.ERR_STREAM_TRUNCATED, 'stream ended without authenticated is_final=0x01 block');
   }
   return concatBytes(...ptParts);
