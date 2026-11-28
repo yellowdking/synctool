@@ -2,6 +2,7 @@
 // and unified cross-language SyncError & TransferEvent types (spec/ENVELOPE_AND_SDK.md).
 
 import { normalizeRoomId } from './crockford.js';
+import { b64uToBytes, zeroBytes } from './crypto_primitives.js';
 import {
   ErrorCode,
   SyncError,
@@ -33,6 +34,7 @@ export const MAX_MANIFEST_CHUNKS = 4;
 export const MAX_INLINE_PAYLOAD_BYTES = 65536; // 64 KiB
 export const MAX_BLOBS = 63; // part_id 0 (Manifest) + 1..63 (Blobs) = max 64 parts
 export const MAX_BLOB_META_BYTES = 2048;
+export const MAX_SPKI_PINS = 8;
 
 const UTF8_ENCODER = new TextEncoder();
 
@@ -46,7 +48,7 @@ const ALLOWED_ENCODINGS = new Set(['identity', 'gzip', 'zstd']);
 
 /**
  * Validate a decoded Manifest object strictly against spec/ENVELOPE_AND_SDK.md §2.2.
- * Returns normalized serialized UTF-8 bytes length if valid, otherwise throws SyncError(ERR_MANIFEST_INVALID).
+ * Returns normalized serialized UTF-8 bytes if valid, otherwise throws SyncError(ERR_MANIFEST_INVALID).
  * @param {any} manifest
  * @param {{ expectedMsgId?: string }} [options]
  */
@@ -148,6 +150,17 @@ export function validateManifest(manifest, options = {}) {
     if (typeof b.key !== 'string' || !B64U43_RE.test(b.key)) {
       throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, `blobs[${i}].key must be 43-char b64u (32B)`);
     }
+    let rawKey = null;
+    try {
+      rawKey = b64uToBytes(b.key);
+      if (rawKey.length !== 32) {
+        throw new Error('key not 32B');
+      }
+    } catch {
+      throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, `blobs[${i}].key must decode to 32 bytes`);
+    } finally {
+      zeroBytes(rawKey);
+    }
     if (b.encoding !== undefined && !ALLOWED_ENCODINGS.has(b.encoding)) {
       throw new SyncError(ErrorCode.ERR_MANIFEST_INVALID, `blobs[${i}].encoding is invalid`);
     }
@@ -172,7 +185,7 @@ export function validateManifest(manifest, options = {}) {
   return encoded;
 }
 
-const WIN_RESERVED_STEM_RE = /^(CON|PRN|AUX|NUL|COM[1-9\u00b9\u00b2\u00b3]|LPT[1-9\u00b9\u00b2\u00b3])$/i;
+const WIN_RESERVED_STEM_RE = /^(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9\u00b9\u00b2\u00b3]|LPT[1-9\u00b9\u00b2\u00b3])$/i;
 const BIDI_OVERRIDE_RE = /[\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/g;
 
 function truncateUtf8CodePoints(str, maxBytes) {
@@ -200,7 +213,7 @@ function truncateUtf8CodePoints(str, maxBytes) {
 
 /**
  * Sanitize untrusted display filename from Manifest to prevent path traversal, RLO spoofing,
- * UTF-8/surrogate truncation, trailing dots/spaces, and Windows reserved device names.
+ * UTF-8/surrogate truncation, trailing dots/spaces, and Windows reserved device names (including CONIN$/CONOUT$).
  * @param {string} name
  * @param {string} [fallback='attachment.bin']
  * @returns {string}
@@ -238,70 +251,299 @@ export function parcelText(text, appId) {
   };
 }
 
+function isStrictIPv4(h) {
+  const parts = h.split('.');
+  if (parts.length !== 4) return false;
+  for (const p of parts) {
+    if (!/^(?:0|[1-9]\d{0,2})$/.test(p)) return false;
+    if (Number(p) > 255) return false;
+  }
+  return true;
+}
+
+function normalizeIpv6Host(bracketedOrBare) {
+  const inner = bracketedOrBare.startsWith('[') && bracketedOrBare.endsWith(']')
+    ? bracketedOrBare.slice(1, -1).toLowerCase()
+    : bracketedOrBare.toLowerCase();
+  // WHATWG URL formats ::ffff:1.2.3.4 as ::ffff:102:304; Go netip formats it as ::ffff:1.2.3.4.
+  const mappedHexMatch = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(inner);
+  if (mappedHexMatch) {
+    const hi = parseInt(mappedHexMatch[1], 16);
+    const lo = parseInt(mappedHexMatch[2], 16);
+    const v4 = `${(hi >>> 8) & 0xff}.${hi & 0xff}.${(lo >>> 8) & 0xff}.${lo & 0xff}`;
+    return `[::ffff:${v4}]`;
+  }
+  const mappedDotMatch = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(inner);
+  if (mappedDotMatch && isStrictIPv4(mappedDotMatch[1])) {
+    return `[::ffff:${mappedDotMatch[1]}]`;
+  }
+  return `[${inner}]`;
+}
+
 /**
  * Check if hostname is a bare IPv4 or IPv6 literal.
  * @param {string} host
  * @returns {boolean}
  */
 export function isBareIP(host) {
-  if (!host) return false;
-  const h = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
-  // IPv6 literal contains ':'
-  if (h.includes(':')) return true;
-  // IPv4 literal: 4 decimal octets
-  const parts = h.split('.');
-  if (parts.length !== 4) return false;
-  return parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255);
+  if (!host || typeof host !== 'string') return false;
+  let h = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+  const pct = h.indexOf('%');
+  if (pct >= 0) h = h.slice(0, pct);
+  if (h.includes(':')) {
+    try {
+      const u = new URL(`http://[${h}]:80`);
+      return u.hostname.startsWith('[') && u.hostname.endsWith(']');
+    } catch {
+      return false;
+    }
+  }
+  return isStrictIPv4(h);
 }
 
 /**
- * Check if hostname is loopback (127.0.0.1, ::1, localhost).
+ * Check if hostname is loopback (localhost, 127.0.0.0/8, ::1, or IPv4-mapped ::ffff:127.0.0.0/8).
  * @param {string} host
  * @returns {boolean}
  */
 export function isLoopbackHost(host) {
-  const h = (host || '').toLowerCase().replace(/^\[|\]$/g, '');
-  return h === 'localhost' || h === '127.0.0.1' || h === '::1';
+  if (!host || typeof host !== 'string') return false;
+  let h = host.trim().toLowerCase();
+  if (h.includes(':') && !h.startsWith('[')) h = `[${h}]`;
+  if (h.startsWith('[') && h.endsWith(']')) {
+    try {
+      const u = new URL(`http://${h}:80`);
+      const norm = normalizeIpv6Host(u.hostname).slice(1, -1);
+      if (norm === '::1') return true;
+      if (norm.startsWith('::ffff:')) {
+        const v4 = norm.slice('::ffff:'.length);
+        return isStrictIPv4(v4) && v4.startsWith('127.');
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+  if (h === 'localhost') return true;
+  return isStrictIPv4(h) && h.startsWith('127.');
 }
 
 /**
- * Canonicalize a relay origin strictly per spec/CRYPTO_AND_AUTH.md §3.3:
- * lowercase scheme://host:port with explicit port, no path/query/fragment, no trailing slash.
+ * Canonicalize a relay origin strictly per spec/CRYPTO_AND_AUTH.md §3.3 (100% Go netip/url parity):
+ * lowercase scheme://host:port with explicit port (no leading zeros), canonical IPv6/IPv4-mapped literals,
+ * no path/query/userinfo/fragment, and zero raw-input secret echo in errors.
  * @param {string} rawUrl
  * @returns {{ origin: string, scheme: string, hostname: string, port: number }}
  */
 export function canonicalizeRelayOrigin(rawUrl) {
+  if (typeof rawUrl !== 'string') {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'invalid canonical relay origin: must be a string');
+  }
+  const trimmed = rawUrl.trim();
+  if (!trimmed) {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'invalid canonical relay origin: empty URL');
+  }
+  for (let i = 0; i < trimmed.length; i++) {
+    const c = trimmed.charCodeAt(i);
+    if (c <= 0x20 || c >= 0x7f) {
+      throw new SyncError(
+        ErrorCode.ERR_URI_INVALID,
+        'invalid canonical relay origin: contains control, whitespace, or non-ASCII characters',
+      );
+    }
+  }
+  if (trimmed.includes('#') || trimmed.includes('?')) {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'invalid canonical relay origin: must not contain query or fragment');
+  }
+
+  const schemeMatch = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/(.*)$/.exec(trimmed);
+  if (!schemeMatch) {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'invalid canonical relay origin: malformed scheme');
+  }
+  const scheme = schemeMatch[1].toLowerCase();
+  if (scheme !== 'https' && scheme !== 'http') {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'invalid canonical relay origin: unsupported scheme');
+  }
+
+  const rest = schemeMatch[2];
+  const slashIdx = rest.indexOf('/');
+  const authority = slashIdx >= 0 ? rest.slice(0, slashIdx) : rest;
+  const pathPart = slashIdx >= 0 ? rest.slice(slashIdx) : '';
+  if (pathPart !== '' && pathPart !== '/') {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'invalid canonical relay origin: must not contain path');
+  }
+  if (!authority || authority.includes('@') || authority.includes('\\') || authority.includes('%')) {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'invalid canonical relay origin: invalid authority or userinfo');
+  }
+
+  let rawHost = '';
+  let rawPort = '';
+  if (authority.startsWith('[')) {
+    const closeIdx = authority.indexOf(']');
+    if (closeIdx < 0) {
+      throw new SyncError(ErrorCode.ERR_URI_INVALID, 'invalid canonical relay origin: unclosed IPv6 bracket');
+    }
+    rawHost = authority.slice(0, closeIdx + 1);
+    const afterBracket = authority.slice(closeIdx + 1);
+    if (afterBracket !== '') {
+      if (!afterBracket.startsWith(':') || afterBracket.length === 1) {
+        throw new SyncError(ErrorCode.ERR_URI_INVALID, 'invalid canonical relay origin: empty or malformed port');
+      }
+      rawPort = afterBracket.slice(1);
+    }
+  } else {
+    const firstColon = authority.indexOf(':');
+    const lastColon = authority.lastIndexOf(':');
+    if (firstColon !== lastColon) {
+      throw new SyncError(ErrorCode.ERR_URI_INVALID, 'invalid canonical relay origin: unbracketed IPv6 literal');
+    }
+    if (firstColon >= 0) {
+      rawHost = authority.slice(0, firstColon);
+      rawPort = authority.slice(firstColon + 1);
+      if (!rawPort) {
+        throw new SyncError(ErrorCode.ERR_URI_INVALID, 'invalid canonical relay origin: empty port after colon');
+      }
+    } else {
+      rawHost = authority;
+    }
+  }
+
+  if (!rawHost) {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'invalid canonical relay origin: missing host');
+  }
+
+  let port;
+  if (rawPort === '') {
+    port = scheme === 'https' ? 443 : 80;
+  } else {
+    if (!/^\d+$/.test(rawPort)) {
+      throw new SyncError(ErrorCode.ERR_URI_INVALID, 'invalid canonical relay origin: non-numeric port');
+    }
+    port = Number(rawPort);
+    if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
+      throw new SyncError(ErrorCode.ERR_URI_INVALID, 'invalid canonical relay origin: port must be in 1..65535');
+    }
+  }
+
   let parsed;
   try {
-    parsed = new URL(rawUrl);
+    parsed = new URL(`${scheme}://${rawHost}:${port}`);
   } catch {
-    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'invalid relay URL');
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'invalid canonical relay origin: malformed host');
   }
-  const scheme = parsed.protocol.replace(/:$/, '').toLowerCase();
-  if (scheme !== 'https' && !(scheme === 'http' && isLoopbackHost(parsed.hostname))) {
+  if ((parsed.pathname && parsed.pathname !== '/') || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'invalid canonical relay origin: unexpected URL components');
+  }
+
+  let formattedHost = parsed.hostname.toLowerCase();
+  if (formattedHost.startsWith('[') && formattedHost.endsWith(']')) {
+    formattedHost = normalizeIpv6Host(formattedHost);
+  }
+  const hostname = formattedHost.startsWith('[') && formattedHost.endsWith(']')
+    ? formattedHost.slice(1, -1)
+    : formattedHost;
+
+  if (scheme === 'http' && !isLoopbackHost(formattedHost)) {
     throw new SyncError(
       ErrorCode.ERR_URI_INVALID,
-      `relay URL must use https:// (http:// only allowed for loopback), got ${scheme}://`,
+      'relay URL must use https:// (http:// only allowed for loopback)',
     );
   }
-  if ((parsed.pathname && parsed.pathname !== '/') || parsed.search || parsed.hash) {
-    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'relay URL must not contain path, query, or fragment');
-  }
-  const hostname = parsed.hostname.toLowerCase();
-  if (!hostname) {
-    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'relay URL missing hostname');
-  }
-  const port = parsed.port ? Number(parsed.port) : scheme === 'https' ? 443 : 80;
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'relay URL has invalid port');
-  }
-  const formattedHost = hostname.includes(':') && !hostname.startsWith('[') ? `[${hostname}]` : hostname;
+
   return {
     origin: `${scheme}://${formattedHost}:${port}`,
     scheme,
     hostname,
     port,
   };
+}
+
+/**
+ * Normalize and validate 1..8 SPKI SHA-256 hex pins (trimmed & lowercased, deduplicated preserving order).
+ * Accepts comma-separated string or string array. Returns `string[]` (0..8 items).
+ * @param {string | string[] | null | undefined} input
+ * @param {string} [label='pin']
+ * @returns {string[]}
+ */
+export function normalizeSpkiPins(input, label = 'pin') {
+  if (input === undefined || input === null || input === '') return [];
+  let rawItems;
+  if (Array.isArray(input)) {
+    if (input.length === 0) return [];
+    rawItems = [];
+    for (const item of input) {
+      if (typeof item !== 'string' || !item.trim()) {
+        throw new SyncError(ErrorCode.ERR_URI_INVALID, `${label} entries must be non-empty 64-hex strings`);
+      }
+      for (const sub of item.split(',')) {
+        rawItems.push(sub);
+      }
+    }
+  } else if (typeof input === 'string') {
+    const trimmed = input.trim();
+    if (!trimmed) return [];
+    rawItems = trimmed.split(',');
+  } else {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, `${label} must be a 64-hex string or array of 64-hex strings`);
+  }
+
+  if (rawItems.length < 1 || rawItems.length > MAX_SPKI_PINS) {
+    throw new SyncError(
+      ErrorCode.ERR_URI_INVALID,
+      `${label} must contain 1..${MAX_SPKI_PINS} comma-separated 64-hex SPKI pins (got ${rawItems.length})`,
+    );
+  }
+  const out = [];
+  const seen = new Set();
+  for (const part of rawItems) {
+    const norm = part.trim().toLowerCase();
+    if (!HEX64_RE.test(norm)) {
+      throw new SyncError(ErrorCode.ERR_URI_INVALID, `${label} must be 64 hexadecimal characters`);
+    }
+    if (!seen.has(norm)) {
+      seen.add(norm);
+      out.push(norm);
+    }
+  }
+  return out;
+}
+
+/**
+ * Reconcile `{ spkiPins?, spkiPin? }` from a JS config/profile object, keeping `spkiPin = spkiPins[0] ?? null` in sync.
+ * @param {{ spkiPins?: string[] | null, spkiPin?: string | null }} obj
+ * @param {string} [label='spkiPin']
+ * @returns {string[]}
+ */
+export function resolveConfigSpkiPins(obj, label = 'spkiPin') {
+  if (!obj || typeof obj !== 'object') return [];
+  const hasPinsArr = Array.isArray(obj.spkiPins) && obj.spkiPins.length > 0;
+  const hasSingle = typeof obj.spkiPin === 'string' && obj.spkiPin.trim().length > 0;
+
+  if (hasPinsArr) {
+    // Handle `{ ...singlePinParsed, spkiPin: overridePin }` or `{ ...singlePinParsed, spkiPin: null }`
+    if (obj.spkiPin === null && obj.spkiPins.length === 1) {
+      return [];
+    }
+    if (hasSingle && obj.spkiPins.length === 1) {
+      const fromSingle = normalizeSpkiPins(obj.spkiPin, label);
+      const fromArr = normalizeSpkiPins(obj.spkiPins, label);
+      if (fromSingle[0] !== fromArr[0]) {
+        return fromSingle;
+      }
+      return fromArr;
+    }
+    return normalizeSpkiPins(obj.spkiPins, label);
+  }
+  if (hasSingle) {
+    return normalizeSpkiPins(obj.spkiPin, label);
+  }
+  if (Array.isArray(obj.spkiPins) && obj.spkiPins.length === 0) {
+    return [];
+  }
+  if (obj.spkiPin !== undefined && obj.spkiPin !== null && obj.spkiPin !== '') {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, `${label} must be 64 hex chars`);
+  }
+  return [];
 }
 
 /**
@@ -315,19 +557,23 @@ function parseKV(str) {
   for (const part of str.split('&')) {
     if (!part) continue;
     const idx = part.indexOf('=');
-    if (idx < 0) {
-      map.set(decodeURIComponent(part), '');
-    } else {
-      const k = decodeURIComponent(part.slice(0, idx));
-      const v = decodeURIComponent(part.slice(idx + 1));
-      map.set(k, v);
+    try {
+      if (idx < 0) {
+        map.set(decodeURIComponent(part), '');
+      } else {
+        const k = decodeURIComponent(part.slice(0, idx));
+        const v = decodeURIComponent(part.slice(idx + 1));
+        map.set(k, v);
+      }
+    } catch {
+      throw new SyncError(ErrorCode.ERR_URI_INVALID, 'malformed percent-encoding in synctool:// URI');
     }
   }
   return map;
 }
 
 /**
- * Parse `synctool://relay?v=1&u=<origin>[&pin=<64hex>]#k=<access_key>` per spec/ENVELOPE_AND_SDK.md §3.1.
+ * Parse `synctool://relay?v=1&u=<origin>[&pin=<hex1>[,<hex2>...]]#k=<access_key>` per spec/ENVELOPE_AND_SDK.md §3.1.
  * @param {string} uri
  */
 export function parseRelayURI(uri) {
@@ -350,6 +596,10 @@ export function parseRelayURI(uri) {
   const query = parseKV(queryStr);
   const frag = parseKV(fragmentStr);
 
+  if (query.has('k') || query.has('s')) {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'access key "k" must be in #fragment, never in query string');
+  }
+
   const vStr = query.get('v') ?? '1';
   if (vStr !== '1') {
     if (/^\d+$/.test(vStr) && Number(vStr) > 1) {
@@ -365,12 +615,12 @@ export function parseRelayURI(uri) {
   }
   const { origin, scheme, hostname } = canonicalizeRelayOrigin(rawU);
 
-  const pin = query.get('pin') ?? '';
-  if (pin) {
-    if (!HEX64_RE.test(pin)) {
-      throw new SyncError(ErrorCode.ERR_URI_INVALID, 'relay URI "pin" must be 64 lowercase hex chars');
-    }
-  } else if (scheme === 'https' && isBareIP(hostname)) {
+  const rawPin = query.has('pin') ? query.get('pin') : null;
+  if (rawPin !== null && rawPin.trim() === '') {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'relay URI "pin" parameter must not be empty');
+  }
+  const spkiPins = rawPin !== null ? normalizeSpkiPins(rawPin, 'relay URI "pin"') : [];
+  if (spkiPins.length === 0 && scheme === 'https' && isBareIP(hostname)) {
     throw new SyncError(ErrorCode.ERR_URI_INVALID, 'bare IP https relay requires SPKI "pin" (insecure skip-verify is forbidden)');
   }
 
@@ -378,38 +628,37 @@ export function parseRelayURI(uri) {
   if (!accessKey || accessKey.length < 32) {
     throw new SyncError(ErrorCode.ERR_URI_INVALID, 'relay URI missing valid fragment "#k=" (min 32 chars)');
   }
-  if (query.has('k')) {
-    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'access key "k" must be in #fragment, never in query string');
-  }
 
   return {
     version: 1,
     origin,
-    tlsMode: pin ? 'spki_pin' : 'system_ca',
-    spkiPin: pin || null,
+    tlsMode: spkiPins.length > 0 ? 'spki_pin' : 'system_ca',
+    spkiPin: spkiPins[0] ?? null,
+    spkiPins,
     accessKey,
   };
 }
 
 /**
  * Serialize a RelayProfile into canonical `synctool://relay?v=1&u=...[&pin=...]#k=...`.
- * @param {{ origin: string, spkiPin?: string | null, accessKey: string }} profile
+ * @param {{ origin?: string, endpoint?: string, spkiPin?: string | null, spkiPins?: string[] | null, accessKey: string }} profile
  * @returns {string}
  */
 export function formatRelayURI(profile) {
-  const { origin, scheme, hostname } = canonicalizeRelayOrigin(profile.origin);
-  const pin = profile.spkiPin ?? '';
-  if (pin && !HEX64_RE.test(pin)) {
-    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'spkiPin must be 64 lowercase hex chars');
+  if (!profile || typeof profile !== 'object') {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'relay profile is required');
   }
-  if (!pin && scheme === 'https' && isBareIP(hostname)) {
+  const rawOrigin = profile.origin ?? profile.endpoint ?? '';
+  const { origin, scheme, hostname } = canonicalizeRelayOrigin(rawOrigin);
+  const spkiPins = resolveConfigSpkiPins(profile, 'spkiPin');
+  if (spkiPins.length === 0 && scheme === 'https' && isBareIP(hostname)) {
     throw new SyncError(ErrorCode.ERR_URI_INVALID, 'bare IP https relay requires spkiPin');
   }
   if (!profile.accessKey || profile.accessKey.length < 32) {
     throw new SyncError(ErrorCode.ERR_URI_INVALID, 'accessKey must be at least 32 chars');
   }
   let q = `v=1&u=${encodeURIComponent(origin)}`;
-  if (pin) q += `&pin=${pin}`;
+  if (spkiPins.length > 0) q += `&pin=${spkiPins.join(',')}`;
   return `synctool://relay?${q}#k=${encodeURIComponent(profile.accessKey)}`;
 }
 
@@ -484,39 +733,52 @@ export function parsePairURI(uri) {
     if (!B64U22_RE.test(oobSecret)) {
       throw new SyncError(ErrorCode.ERR_URI_INVALID, 'mode=1 requires 22-char b64u #s= (16B oob_secret)');
     }
-  } else if (oobSecret) {
+    try {
+      const oobBytes = b64uToBytes(oobSecret);
+      const len = oobBytes.length;
+      zeroBytes(oobBytes);
+      if (len !== 16) throw new Error('oob_secret length');
+    } catch {
+      throw new SyncError(ErrorCode.ERR_URI_INVALID, 'mode=1 #s= must decode to 16 bytes');
+    }
+  } else if (frag.has('s')) {
     throw new SyncError(ErrorCode.ERR_URI_INVALID, `mode=${mode} must NOT contain #s=`);
   }
 
   let relayOrigin = null;
-  let spkiPin = null;
+  let spkiPins = [];
   const rawU = query.get('u');
+  const hasPin = query.has('pin');
   const rawPin = query.get('pin') ?? '';
   if (rawU) {
     const parsed = canonicalizeRelayOrigin(rawU);
     relayOrigin = parsed.origin;
-    if (rawPin) {
-      if (!HEX64_RE.test(rawPin)) {
-        throw new SyncError(ErrorCode.ERR_URI_INVALID, 'pair URI "pin" must be 64 lowercase hex chars');
+    if (hasPin) {
+      if (!rawPin.trim()) {
+        throw new SyncError(ErrorCode.ERR_URI_INVALID, 'pair URI "pin" must not be empty');
       }
-      spkiPin = rawPin;
+      spkiPins = normalizeSpkiPins(rawPin, 'pair URI "pin"');
     } else if (parsed.scheme === 'https' && isBareIP(parsed.hostname)) {
       throw new SyncError(ErrorCode.ERR_URI_INVALID, 'bare IP https relay in pair URI requires SPKI "pin"');
     }
-  } else if (rawPin) {
+  } else if (hasPin) {
     throw new SyncError(ErrorCode.ERR_URI_INVALID, 'pair URI "pin" requires "u"');
   }
 
   let expiresAt = null;
   if (query.has('exp')) {
-    const expNum = Number(query.get('exp'));
+    const rawExp = query.get('exp') ?? '';
+    if (!/^\d+$/.test(rawExp)) {
+      throw new SyncError(ErrorCode.ERR_URI_INVALID, 'pair URI "exp" must be a positive integer unix timestamp');
+    }
+    const expNum = Number(rawExp);
     if (!Number.isSafeInteger(expNum) || expNum <= 0) {
       throw new SyncError(ErrorCode.ERR_URI_INVALID, 'pair URI "exp" must be a positive integer unix timestamp');
     }
     expiresAt = expNum;
   }
 
-  const accessKey = frag.get('k') ?? null;
+  const accessKey = frag.has('k') ? (frag.get('k') ?? '') : null;
   if (accessKey !== null && accessKey.length < 32) {
     throw new SyncError(ErrorCode.ERR_URI_INVALID, 'pair URI "#k=" access key must be >= 32 chars');
   }
@@ -528,7 +790,8 @@ export function parsePairURI(uri) {
     purpose,
     oobSecret: mode === 1 ? oobSecret : null,
     relayOrigin,
-    spkiPin,
+    spkiPin: spkiPins[0] ?? null,
+    spkiPins,
     accessKey,
     expiresAt,
   };
@@ -544,12 +807,16 @@ export function parsePairURI(uri) {
  *   oobSecret?: string | null,
  *   relayOrigin?: string | null,
  *   spkiPin?: string | null,
+ *   spkiPins?: string[] | null,
  *   accessKey?: string | null,
  *   expiresAt?: number | null,
  * }} opts
  * @returns {string}
  */
 export function formatPairURI(opts) {
+  if (!opts || typeof opts !== 'object') {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'pair URI options are required');
+  }
   const roomId = normalizeRoomId(opts.roomId);
   const mode = opts.mode;
   const purpose = opts.purpose;
@@ -570,18 +837,18 @@ export function formatPairURI(opts) {
     throw new SyncError(ErrorCode.ERR_URI_INVALID, `mode=${mode} must not include oobSecret`);
   }
 
+  const spkiPins = resolveConfigSpkiPins(opts, 'spkiPin');
   const qParts = [`r=${roomId}`, `m=${mode}`, `p=${purpose}`, 'v=1'];
   if (opts.relayOrigin) {
     const parsed = canonicalizeRelayOrigin(opts.relayOrigin);
     qParts.push(`u=${encodeURIComponent(parsed.origin)}`);
-    if (opts.spkiPin) {
-      if (!HEX64_RE.test(opts.spkiPin)) {
-        throw new SyncError(ErrorCode.ERR_URI_INVALID, 'spkiPin must be 64 lowercase hex chars');
-      }
-      qParts.push(`pin=${opts.spkiPin}`);
+    if (spkiPins.length > 0) {
+      qParts.push(`pin=${spkiPins.join(',')}`);
     } else if (parsed.scheme === 'https' && isBareIP(parsed.hostname)) {
       throw new SyncError(ErrorCode.ERR_URI_INVALID, 'bare IP https relay requires spkiPin');
     }
+  } else if (spkiPins.length > 0) {
+    throw new SyncError(ErrorCode.ERR_URI_INVALID, 'spkiPin in pair URI requires relayOrigin');
   }
   if (opts.expiresAt != null) {
     if (!Number.isSafeInteger(opts.expiresAt) || opts.expiresAt <= 0) {
@@ -594,7 +861,7 @@ export function formatPairURI(opts) {
   if (mode === 1 && opts.oobSecret) {
     fragParts.push(`s=${opts.oobSecret}`);
   }
-  if (opts.accessKey) {
+  if (opts.accessKey != null && opts.accessKey !== '') {
     if (opts.accessKey.length < 32) {
       throw new SyncError(ErrorCode.ERR_URI_INVALID, 'accessKey must be >= 32 chars');
     }
