@@ -708,6 +708,17 @@ func (m *mockRelay) handleSpoolRoutes(w http.ResponseWriter, r *http.Request, bo
 			_ = json.NewEncoder(w).Encode(map[string]any{"item_id": itemID, "burned": true})
 			return
 		}
+		if r.Method == http.MethodDelete && len(segs) == 1 {
+			if r.Header.Get(synccrypto.HeaderUploadToken) != it.uploadToken {
+				m.writeErr(w, 401, envelope.ErrCodeUnauthorizedToken, "bad upload token", nil)
+				return
+			}
+			m.mu.Lock()
+			delete(m.items, itemID)
+			m.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"item_id": itemID, "aborted": true})
+			return
+		}
 	}
 	w.WriteHeader(http.StatusNotFound)
 }
