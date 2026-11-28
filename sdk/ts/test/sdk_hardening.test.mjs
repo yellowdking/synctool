@@ -142,13 +142,15 @@ test('Security hardening: 3xx redirect block, Windows reserved names, RLO strip,
     await new Promise((resolve) => redirectSrv.close(resolve));
   }
 
-  // 6. registerMailbox() throws ERR_SPOOL_DISABLED under --spool=off, while syncMailbox() gracefully degrades
+  // 6. registerMailbox() & syncMailbox() gracefully degrade under --spool=off (strict: true throws ERR_SPOOL_DISABLED)
   const spoolOffClient = new SyncClient({
     relay: { origin: 'https://sync.example.com:443', accessKey: 'K'.repeat(43) },
     fetchImpl: async () => jsonResp(403, { error: 'ERR_SPOOL_DISABLED', retryable: false, suggest_mode: 'pipe' }),
   });
+  const gracefulReg = await spoolOffClient.registerMailbox();
+  assert.equal(gracefulReg.registered, false);
   await assert.rejects(
-    () => spoolOffClient.registerMailbox(),
+    () => spoolOffClient.registerMailbox({ strict: true }),
     (e) => e instanceof SyncError && e.code === ErrorCode.ERR_SPOOL_DISABLED,
   );
   const gracefulSync = await spoolOffClient.syncMailbox();
@@ -165,7 +167,7 @@ test('Self-healing after nano memory-spool wipe, NodeFileKeyStore, part_id=0 OOM
   try {
     const accessKey = 'N'.repeat(43);
     const relayOrigin = 'https://sync.example.com:443';
-    const serverNow = 1764246000;
+    const serverNow = Math.floor(Date.now() / 1000) - 3600;
 
     let mailboxes = new Map();
     const rooms = new Map();
@@ -307,6 +309,7 @@ test('Self-healing after nano memory-spool wipe, NodeFileKeyStore, part_id=0 OOM
     const bindB = bob.acceptDeviceBind(offeredCode, {
       preferPoll: true,
       onSASDisplay: ({ sas }) => resolveSas(sas),
+      onSASConfirm: async () => true,
     });
     await Promise.all([bindA, bindB]);
 
