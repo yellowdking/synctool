@@ -126,6 +126,7 @@ func TestFullFlowPairingSpoolResumeRevoke(t *testing.T) {
 	code := <-sasOfferCh
 	if _, err := carol.AcceptDeviceBind(ctx, code, PairOptions{
 		OnSASDisplay: func(s string) { sasDispCh <- s },
+		OnSASConfirm: func(s string) error { return nil },
 	}); err != nil {
 		t.Fatalf("Carol AcceptDeviceBind (SAS): %v", err)
 	}
