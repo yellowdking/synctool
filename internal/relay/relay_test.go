@@ -199,22 +199,44 @@ func makeValidSealedHeaderB64() string {
 }
 
 func TestProfileAutoAndConfigGuards(t *testing.T) {
-	if got := ResolveAutoProfileName(256 << 20); got != ProfileNano {
-		t.Fatalf("256MiB should resolve to nano, got %s", got)
+	if got := ResolveAutoProfileName(192 << 20); got != ProfileNano {
+		t.Fatalf("192MiB (<224MiB) should resolve to nano, got %s", got)
+	}
+	if got := ResolveAutoProfileName(224 << 20); got != ProfileStandard {
+		t.Fatalf("224MiB should resolve to standard, got %s", got)
+	}
+	if got := ResolveAutoProfileName(256 << 20); got != ProfileStandard {
+		t.Fatalf("256MiB container limit should resolve to standard (NOT nano), got %s", got)
 	}
 	if got := ResolveAutoProfileName(1024 << 20); got != ProfileStandard {
 		t.Fatalf("1GiB should resolve to standard, got %s", got)
+	}
+	if got := ResolveAutoProfileName(1536 << 20); got != ProfileMedia {
+		t.Fatalf("1536MiB should resolve to media, got %s", got)
 	}
 	if got := ResolveAutoProfileName(4096 << 20); got != ProfileMedia {
 		t.Fatalf("4GiB should resolve to media, got %s", got)
 	}
 
-	// Exact N * 65,552 B alignment across all 3 tiers.
+	// Exact N * 65,552 B alignment, MaxConnsPerIP, MaxMailboxes, MaxNonceEntries & safe GOMEMLIMIT.
 	nano, _ := PresetFor(ProfileNano)
 	std, _ := PresetFor(ProfileStandard)
 	med, _ := PresetFor(ProfileMedia)
 	if nano.MaxTransportChunkBytes != 262208 || std.MaxTransportChunkBytes != 1048832 || med.MaxTransportChunkBytes != 2097664 {
 		t.Fatalf("unexpected chunk sizes: nano=%d std=%d med=%d", nano.MaxTransportChunkBytes, std.MaxTransportChunkBytes, med.MaxTransportChunkBytes)
+	}
+	if nano.MaxConnsPerIP != 16 {
+		t.Fatalf("expected nano MaxConnsPerIP=16, got %d", nano.MaxConnsPerIP)
+	}
+	if nano.MaxMailboxes != 256 || std.MaxMailboxes != 4096 || med.MaxMailboxes != 32768 {
+		t.Fatalf("unexpected MaxMailboxes: nano=%d std=%d med=%d", nano.MaxMailboxes, std.MaxMailboxes, med.MaxMailboxes)
+	}
+	if nano.MaxNonceEntries != 16384 || std.MaxNonceEntries != 65536 || med.MaxNonceEntries != 262144 {
+		t.Fatalf("unexpected MaxNonceEntries: nano=%d std=%d med=%d", nano.MaxNonceEntries, std.MaxNonceEntries, med.MaxNonceEntries)
+	}
+	safe256 := ComputeSafeGoMemLimit(256<<20, std)
+	if safe256 < 144<<20 || safe256 > 156<<20 {
+		t.Fatalf("expected 256MiB safe GOMEMLIMIT in [144MiB, 156MiB], got %d bytes", safe256)
 	}
 
 	// Hard guard: --tls=off on non-loopback without TRUSTED_PROXIES must fail.
@@ -476,22 +498,55 @@ func TestAuth7StepPipelineStealth404ClockSkewReplayAndTrustedProxies(t *testing.
 }
 
 func TestNonceCacheBoundedEvictionAndIPExtraction(t *testing.T) {
-	nc := NewNonceCache(4, 120*time.Second)
+	if NonceCacheTTL != 125*time.Second {
+		t.Fatalf("expected NonceCacheTTL=125s, got %v", NonceCacheTTL)
+	}
+	nc := NewNonceCache(4, NonceCacheTTL)
 	now := time.Unix(1764246000, 0)
-	for i := 0; i < 6; i++ {
-		if !nc.CheckAndAdd(fmt.Sprintf("%032x", i), now) {
-			t.Fatalf("unexpected dup on %d", i)
+	for i := 0; i < 4; i++ {
+		if got := nc.CheckAndAddStatus(fmt.Sprintf("%032x", i), now); got != NonceAccepted {
+			t.Fatalf("expected NonceAccepted on %d, got %v", i, got)
 		}
 	}
 	if nc.Len() != 4 {
 		t.Fatalf("expected bounded nonce cache len 4, got %d", nc.Len())
 	}
-	// Oldest (0) was evicted, newest (5) must still trigger replay!
-	if nc.CheckAndAdd(fmt.Sprintf("%032x", 5), now) {
-		t.Fatal("expected newest nonce 5 to be detected as replay")
+	// At t+121s (<125s TTL), boundary replay MUST still be caught!
+	if got := nc.CheckAndAddStatus(fmt.Sprintf("%032x", 0), now.Add(121*time.Second)); got != NonceReplay {
+		t.Fatalf("expected boundary replay at +121s to return NonceReplay, got %v", got)
+	}
+	// When full of live nonces, fresh 5th nonce MUST return NonceCacheFull (never evict live nonce #0!).
+	if got := nc.CheckAndAddStatus(fmt.Sprintf("%032x", 4), now.Add(10*time.Second)); got != NonceCacheFull {
+		t.Fatalf("expected NonceCacheFull when all 4 entries are live, got %v", got)
+	}
+	if got := nc.CheckAndAddStatus(fmt.Sprintf("%032x", 0), now.Add(10*time.Second)); got != NonceReplay {
+		t.Fatalf("live nonce #0 must NOT be evicted when full, got %v", got)
+	}
+	// Once TTL (125s) expires, old entries are evicted and new nonces succeed.
+	if got := nc.CheckAndAddStatus(fmt.Sprintf("%032x", 4), now.Add(126*time.Second)); got != NonceAccepted {
+		t.Fatalf("expected NonceAccepted after 125s TTL expiry, got %v", got)
 	}
 
-	// Untrusted proxy must NOT honor X-Forwarded-For.
+	// Verify Server returns 429 ERR_RATE_LIMITED (Retry-After: 5) on NonceCacheFull.
+	srv, _, cli, _ := newTestServerAndClient(t, nil)
+	srv.nonces = NewNonceCache(2, NonceCacheTTL)
+	n0 := randNonceHex(t)
+	if r, _ := cli.do(http.MethodGet, "/v1/ping", reqOpts{nonce: n0}); r.StatusCode != 200 {
+		t.Fatalf("expected 1st ping 200, got %d", r.StatusCode)
+	}
+	if r, _ := cli.do(http.MethodGet, "/v1/ping", reqOpts{}); r.StatusCode != 200 {
+		t.Fatalf("expected 2nd ping 200, got %d", r.StatusCode)
+	}
+	rFull, bFull := cli.do(http.MethodGet, "/v1/ping", reqOpts{})
+	if rFull.StatusCode != 429 || rFull.Header.Get("Retry-After") != "5" || !strings.Contains(string(bFull), "ERR_RATE_LIMITED") {
+		t.Fatalf("expected 429 ERR_RATE_LIMITED + Retry-After: 5 on live full NonceCache, got %d hdr=%v body=%s", rFull.StatusCode, rFull.Header, bFull)
+	}
+	rRep, bRep := cli.do(http.MethodGet, "/v1/ping", reqOpts{nonce: n0})
+	if rRep.StatusCode != 401 || !strings.Contains(string(bRep), "ERR_REPLAY_DETECTED") {
+		t.Fatalf("expected replay of live n0 to still return 401 ERR_REPLAY_DETECTED when full, got %d %s", rRep.StatusCode, bRep)
+	}
+
+	// Untrusted proxy must NOT honor X-Forwarded-For, and trusted proxy without XFF must NOT honor CF-Connecting-IP.
 	std, _ := PresetFor(ProfileStandard)
 	g := NewIPGuard(std, nil)
 	req := httptest.NewRequest(http.MethodGet, "/v1/ping", nil)
@@ -499,6 +554,15 @@ func TestNonceCacheBoundedEvictionAndIPExtraction(t *testing.T) {
 	req.Header.Set("X-Forwarded-For", "1.2.3.4")
 	if got := g.ExtractClientIP(req); got != netip.MustParseAddr("203.0.113.5") {
 		t.Fatalf("untrusted XFF should be ignored, got %s", got)
+	}
+	proxies, _ := ParseTrustedProxies("127.0.0.1/32")
+	gTrusted := NewIPGuard(std, proxies)
+	reqNoXFF := httptest.NewRequest(http.MethodGet, "/v1/ping", nil)
+	reqNoXFF.RemoteAddr = "127.0.0.1:54321"
+	reqNoXFF.Header.Set("CF-Connecting-IP", "198.51.100.99")
+	reqNoXFF.Header.Set("X-Real-IP", "198.51.100.98")
+	if got := gTrusted.ExtractClientIP(reqNoXFF); got != netip.MustParseAddr("127.0.0.1") {
+		t.Fatalf("XFF-only default must ignore spoofed CF-Connecting-IP/X-Real-IP when XFF is absent, got %s", got)
 	}
 }
 
