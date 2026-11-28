@@ -313,7 +313,12 @@ export async function runProfileSpoolOffAndProxyScenarios({
     keyStore: new MemoryKeyStore(),
     label: 'TS-Off',
   });
-  await assert.rejects(() => tsOff.registerMailbox(), (err) => err instanceof SyncError && err.code === ErrorCode.ERR_SPOOL_DISABLED);
+  const offReg = await tsOff.registerMailbox();
+  assert.equal(offReg.registered, false);
+  await assert.rejects(
+    () => tsOff.registerMailbox({ strict: true }),
+    (err) => err instanceof SyncError && err.code === ErrorCode.ERR_SPOOL_DISABLED,
+  );
 
   // Pair Go-Off <-> TS-Off cleanly under --spool=off!
   const goPairOff = spawnCLIInteractive(cliBin, goConfigOff, ['pair', 'offer', '--mode', 'qr', '--label', 'Go-Off']);
